@@ -30,9 +30,14 @@ Read `README.md` first: architecture, phase status, and reference-camera facts
   shown against the `&mut Ui` that `eframe::App::ui()` hands you (the old
   `SidePanel`/`TopBottomPanel` + `update(ctx, ..)` are gone). Show side/edge
   panels before `CentralPanel`; each one shrinks the parent `Ui`'s cursor.
-- `tests/shader_parity.rs` shares one wgpu device via `OnceLock` and locks a
+- `tests/common/mod.rs` shares one wgpu device via `OnceLock` and locks a
   `Mutex` per render. Creating an instance per test thread segfaults llvmpipe.
   Keep new GPU tests on that helper rather than reintroducing `--test-threads=1`.
+- Export renders into `Rgba16Float` (renderable everywhere; `Rgba16Unorm` needs
+  an optional feature). Readback rows must be padded to
+  `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`. `src/bin/export.rs` is the headless
+  end-to-end check — run it on a real RW2 after touching the export path.
+- Sidecars are gitignored (`*.edit.json`). Never write anything into the `.rw2`.
 
 ## Verifying the GUI visually
 

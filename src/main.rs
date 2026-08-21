@@ -1,13 +1,22 @@
 //! raw-editor: a basic GPU-accelerated RAW editor for Panasonic RW2 files.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
+use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{AdjustParams, Uniforms};
+use raw_editor::sidecar;
 use raw_editor::widgets::ColorWheel;
+
+/// Hold this key to bypass every adjustment and see the original.
+const COMPARE_KEY: egui::Key = egui::Key::B;
+/// How long the params must sit still before the sidecar is written.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 
 fn main() -> eframe::Result {
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -24,15 +33,31 @@ fn main() -> eframe::Result {
 }
 
 type LoadResult = (PathBuf, anyhow::Result<DevelopedImage>);
+type ExportResult = anyhow::Result<PathBuf>;
 
 struct App {
     render_state: eframe::egui_wgpu::RenderState,
+    /// Live values the shader is driven from.
     params: AdjustParams,
+    /// What is currently on disk in the sidecar.
+    saved_params: AdjustParams,
+    /// Previous frame's values, used to spot edits and restart the debounce.
+    prev_params: AdjustParams,
+    dirty_since: Option<Instant>,
+
+    image: Option<Arc<DevelopedImage>>,
     current: Option<PathBuf>,
     status: String,
+
     loader_tx: mpsc::Sender<LoadResult>,
     loader_rx: mpsc::Receiver<LoadResult>,
     loading: bool,
+
+    export_tx: mpsc::Sender<ExportResult>,
+    export_rx: mpsc::Receiver<ExportResult>,
+    exporting: bool,
+    export_format: ExportFormat,
+    jpeg_quality: u8,
 }
 
 impl App {
@@ -48,14 +73,24 @@ impl App {
             .insert(ImageRenderer::new(&render_state));
 
         let (loader_tx, loader_rx) = mpsc::channel();
+        let (export_tx, export_rx) = mpsc::channel();
         let mut app = Self {
             render_state,
             params: AdjustParams::default(),
+            saved_params: AdjustParams::default(),
+            prev_params: AdjustParams::default(),
+            dirty_since: None,
+            image: None,
             current: None,
             status: "Open an .rw2: pass a path or drop a file here".into(),
             loader_tx,
             loader_rx,
             loading: false,
+            export_tx,
+            export_rx,
+            exporting: false,
+            export_format: ExportFormat::Jpeg,
+            jpeg_quality: 92,
         };
         if let Some(p) = path {
             app.start_load(p, &cc.egui_ctx);
@@ -63,7 +98,11 @@ impl App {
         Ok(app)
     }
 
+    // --- loading ---------------------------------------------------------
+
     fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // Don't lose pending edits to the file we're leaving.
+        self.flush_sidecar();
         self.loading = true;
         self.status = format!("Loading {}…", path.display());
         let tx = self.loader_tx.clone();
@@ -86,27 +125,130 @@ impl App {
                     if let Some(r) = renderer.callback_resources.get_mut::<ImageRenderer>() {
                         r.set_image(&self.render_state.device, &self.render_state.queue, &img);
                     }
-                    self.status = format!(
-                        "{} — {}x{}",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        img.width,
-                        img.height
-                    );
+                    drop(renderer);
+
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let (params, note) = match sidecar::load(&path) {
+                        Ok(Some(p)) => (p, " — edits restored"),
+                        Ok(None) => (AdjustParams::default(), ""),
+                        Err(e) => {
+                            eprintln!("sidecar: {e:#}");
+                            (AdjustParams::default(), " — sidecar unreadable, starting neutral")
+                        }
+                    };
+                    self.status = format!("{name} — {}x{}{note}", img.width, img.height);
+                    self.image = Some(Arc::new(img));
                     self.current = Some(path);
-                    self.params = AdjustParams::default();
+                    self.params = params;
+                    self.saved_params = params;
+                    self.prev_params = params;
+                    self.dirty_since = None;
                 }
                 Err(e) => self.status = format!("Failed to load {}: {e:#}", path.display()),
             }
         }
     }
 
+    // --- sidecar ---------------------------------------------------------
+
+    /// Write the sidecar once the params have been still for a moment.
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        if self.params != self.prev_params {
+            self.prev_params = self.params;
+            self.dirty_since = Some(Instant::now());
+        }
+        if self.params == self.saved_params {
+            self.dirty_since = None;
+            return;
+        }
+        let Some(since) = self.dirty_since else { return };
+        let waited = since.elapsed();
+        if waited < AUTOSAVE_DEBOUNCE {
+            // Make sure a frame happens when the debounce expires, even if the
+            // user stops moving the mouse.
+            ctx.request_repaint_after(AUTOSAVE_DEBOUNCE - waited);
+            return;
+        }
+        self.flush_sidecar();
+    }
+
+    /// Write pending edits now (also called when switching files and on exit).
+    fn flush_sidecar(&mut self) {
+        let Some(path) = self.current.clone() else { return };
+        if self.params == self.saved_params {
+            return;
+        }
+        // Neutral params mean "no edits" — drop the sidecar instead of
+        // leaving a file full of zeroes next to the raw.
+        let result = if self.params.is_neutral() {
+            sidecar::remove(&path)
+        } else {
+            sidecar::save(&path, &self.params)
+        };
+        match result {
+            Ok(()) => {
+                self.saved_params = self.params;
+                self.dirty_since = None;
+            }
+            Err(e) => self.status = format!("Sidecar save failed: {e:#}"),
+        }
+    }
+
+    // --- export ----------------------------------------------------------
+
+    fn start_export(&mut self, ctx: &egui::Context) {
+        let (Some(img), Some(raw)) = (self.image.clone(), self.current.clone()) else { return };
+        self.flush_sidecar();
+
+        let out = export::output_path(&raw, self.export_format);
+        let device = self.render_state.device.clone();
+        let queue = self.render_state.queue.clone();
+        let params = self.params;
+        let format = self.export_format;
+        let quality = self.jpeg_quality;
+        let tx = self.export_tx.clone();
+        let ctx = ctx.clone();
+
+        self.exporting = true;
+        self.status = format!("Exporting {}…", out.display());
+        std::thread::spawn(move || {
+            let rendered = match export::render_gpu(&device, &queue, &img, &params) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("GPU export failed ({e:#}) — falling back to the CPU path");
+                    export::render_cpu(&img, &params)
+                }
+            };
+            let result = export::write(&out, &rendered, format, quality).map(|()| out);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_export(&mut self) {
+        while let Ok(result) = self.export_rx.try_recv() {
+            self.exporting = false;
+            self.status = match result {
+                Ok(path) => format!("Exported {}", path.display()),
+                Err(e) => format!("Export failed: {e:#}"),
+            };
+        }
+    }
+
+    // --- ui --------------------------------------------------------------
+
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Adjust");
         ui.add_space(6.0);
-        let mut reset = false;
-        let p = &mut self.params;
-        egui::ScrollArea::vertical().show(ui, |ui| {
 
+        let mut reset = false;
+        let mut do_export = false;
+        let has_image = self.image.is_some();
+        let exporting = self.exporting;
+        let (export_format, jpeg_quality) = (&mut self.export_format, &mut self.jpeg_quality);
+        let p = &mut self.params;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
             ui.label(egui::RichText::new("Basic").strong());
             ui.add(egui::Slider::new(&mut p.exposure_ev, -5.0..=5.0).text("Exposure (EV)"));
             ui.add(egui::Slider::new(&mut p.contrast, -1.0..=1.0).text("Contrast"));
@@ -131,9 +273,40 @@ impl App {
 
             ui.add_space(12.0);
             reset = ui.button("Reset").clicked();
+            ui.label(
+                egui::RichText::new(format!("Hold {} to compare with the original", COMPARE_KEY.name()))
+                    .weak()
+                    .small(),
+            );
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Export").strong());
+            egui::ComboBox::from_id_salt("export_format")
+                .selected_text(export_format.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(export_format, ExportFormat::Jpeg, ExportFormat::Jpeg.label());
+                    ui.selectable_value(
+                        export_format,
+                        ExportFormat::Tiff16,
+                        ExportFormat::Tiff16.label(),
+                    );
+                });
+            if *export_format == ExportFormat::Jpeg {
+                ui.add(egui::Slider::new(jpeg_quality, 1..=100).text("Quality"));
+            }
+            do_export = ui
+                .add_enabled(has_image && !exporting, egui::Button::new("Export full resolution"))
+                .clicked();
+            ui.add_space(8.0);
         });
+
         if reset {
             self.params = AdjustParams::default();
+        }
+        if do_export {
+            let ctx = ui.ctx().clone();
+            self.start_export(&ctx);
         }
     }
 
@@ -168,16 +341,39 @@ impl App {
             [img_aspect / rect_aspect, 1.0]
         };
 
-        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
-            rect,
-            ImageCallback { uniforms: Uniforms::new(&self.params, scale, target_is_srgb) },
-        ));
+        // Hold-to-compare: feed the shader neutral params instead of bypassing
+        // it, so the two views differ only by the adjustments themselves.
+        let comparing = ui.ctx().input(|i| i.key_down(COMPARE_KEY));
+        let uniforms = if comparing {
+            Uniforms::passthrough(scale, target_is_srgb)
+        } else {
+            Uniforms::new(&self.params, scale, target_is_srgb)
+        };
+
+        ui.painter()
+            .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
+
+        if comparing {
+            let badge = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(12.0, 12.0),
+                egui::vec2(76.0, 24.0),
+            );
+            ui.painter().rect_filled(badge, 4.0, egui::Color32::from_black_alpha(180));
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                "BEFORE",
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_loader();
+        self.poll_export();
 
         // Load a dropped file (last one wins).
         let dropped: Option<PathBuf> = ui.ctx().input(|i| {
@@ -197,5 +393,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             self.image_panel(ui);
         });
+
+        self.autosave_tick(ui.ctx());
+    }
+
+    fn on_exit(&mut self) {
+        self.flush_sidecar();
     }
 }

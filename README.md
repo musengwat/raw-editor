@@ -28,7 +28,7 @@ export can fall back to CPU.
 - [x] Phase 1 — develop stage + display the photo
 - [x] Phase 2 — real-time core sliders (exposure, contrast, temp/tint, saturation)
 - [x] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
-- [ ] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
+- [x] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
 - [ ] Phase 5 — sharpening + noise reduction (compute passes)
 
 ## Controls
@@ -51,6 +51,29 @@ so negative highlights is the recovery/compression direction. Highlight
 the top, G and B 120° apart, so the three offsets sum to zero) and the value
 box under it moves all three channels together. Double-click a wheel to reset it.
 
+**Compare**: hold `B` to render the same frame with neutral params — the
+"before" view goes through the identical shader, so only the adjustments differ.
+
+## Persistence and export
+
+Edits are non-destructive: the RW2 is opened read-only and adjustments live in
+`<name>.rw2.edit.json` beside it. The sidecar is loaded when a file is opened,
+written 600 ms after the last change (and on file switch / app exit), and
+*deleted* when the params return to neutral rather than left behind full of
+zeroes. It is written via a temp file + rename, and missing fields fall back to
+defaults so sidecars from older builds still load.
+
+Export renders the whole image through the same WGSL shader in one offscreen
+pass into an `Rgba16Float` target, reads it back (256-byte row padding handled)
+and encodes it. JPEG takes a quality slider; TIFF is genuine 16-bit-per-channel
+RGB. Output lands next to the raw as `<stem>_edit.jpg` / `<stem>_edit.tif`, so a
+camera JPEG sitting alongside is never overwritten. `export::render_cpu` is the
+pure-Rust equivalent and is used automatically if the GPU pass fails.
+
+Because the developed image is uploaded as `rgba16float`, half-float is the
+pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16
+*significant* bits end to end.
+
 ## Reference camera
 
 Panasonic DMC-GF1: 4060×3016 sensor (4000×3000 active), GBRG Bayer, 12-bit
@@ -62,9 +85,10 @@ color matrices embedded. Test files live in `testdata/` (gitignored).
 ```
 cargo run --release -- testdata/f.rw2      # the editor GUI (path optional; drag-and-drop works)
 cargo run --release --bin probe -- f.rw2   # dump decode metadata (2nd arg = write a developed PNG)
-cargo test --release                       # develop/pipeline math + headless GPU parity tests
+cargo run --release --bin export -- f.rw2 jpg 92   # headless export using the file's sidecar
+cargo test --release                       # develop/pipeline math + headless GPU parity/export tests
 ```
 
-The GPU parity tests share a single wgpu device behind a `OnceLock` + `Mutex`
-(`tests/shader_parity.rs`), so they are safe under the default parallel test
+The GPU tests share a single wgpu device behind a `OnceLock` + `Mutex`
+(`tests/common/mod.rs`), so they are safe under the default parallel test
 runner — no `--test-threads=1` needed.

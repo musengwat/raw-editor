@@ -2,13 +2,10 @@
 //! compare every output pixel against the CPU mirror in `pipeline::apply`.
 //! Skips (with a loud message) when no wgpu adapter is available.
 //!
-//! All tests in this file share **one** wgpu instance/device, created lazily in
-//! a `OnceLock`, and take a `Mutex` around every render. Cargo runs the tests
-//! in this binary on parallel threads; building one wgpu instance per thread
-//! segfaults the software (llvmpipe) driver, so sharing + serializing is what
-//! keeps a plain `cargo test --release` green.
+//! The single shared wgpu device lives in `tests/common` — see the note there
+//! about why every GPU test must go through it.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+mod common;
 
 use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
@@ -25,38 +22,6 @@ const PIXELS: [[f32; 3]; 4] = [
     [0.01, 0.02, 0.5],
     [1.8, 1.5, 1.2],
 ];
-
-/// The process-wide GPU context. `_instance` is held so the driver stays
-/// loaded for the lifetime of the test binary.
-struct Gpu {
-    _instance: wgpu::Instance,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
-fn make_gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        force_fallback_adapter: false,
-        ..Default::default()
-    }))
-    .ok()?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
-    Some(Gpu { _instance: instance, device, queue })
-}
-
-/// Lazily built once, then locked for the duration of each GPU test.
-static GPU: OnceLock<Option<Mutex<Gpu>>> = OnceLock::new();
-
-/// `None` when this machine has no usable adapter (tests then skip loudly).
-/// Otherwise the returned guard serializes all GPU work across test threads.
-fn gpu() -> Option<MutexGuard<'static, Gpu>> {
-    let cell = GPU.get_or_init(|| make_gpu().map(Mutex::new));
-    // A panicking test would poison the mutex; recover so the rest still run.
-    cell.as_ref()
-        .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
-}
 
 fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams) -> Vec<[u8; 4]> {
     let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
@@ -159,7 +124,7 @@ fn cpu_reference(params: &AdjustParams) -> Vec<[u8; 3]> {
 }
 
 fn assert_parity(params: AdjustParams) {
-    let Some(ctx) = gpu() else {
+    let Some(ctx) = common::gpu() else {
         eprintln!("SKIP: no wgpu adapter available");
         return;
     };
