@@ -61,7 +61,29 @@ pub struct AdjustParams {
     pub gamma: [f32; 3],
     /// Resolve-style gain, per channel. Neutral = 1.
     pub gain: [f32; 3],
+
+    /// Unsharp-mask strength. 0 = off.
+    pub sharpen_amount: f32,
+    /// Gaussian sigma of the blur the unsharp mask subtracts, in source pixels.
+    pub sharpen_radius: f32,
+    /// Detail below this magnitude (linear luma) is left alone, so sharpening
+    /// does not simply amplify grain.
+    pub sharpen_threshold: f32,
+    /// Luminance noise reduction, 0..1. Edge-preserving (bilateral).
+    pub nr_luma: f32,
+    /// Colour noise reduction, 0..1. Plain blur of the chroma difference,
+    /// which is where high-ISO blotches live.
+    pub nr_chroma: f32,
 }
+
+/// Half-width of the detail neighbourhood, in source pixels. Mirrored in
+/// `shader.wgsl` as `DETAIL_R`.
+pub const DETAIL_RADIUS: i32 = 4;
+/// Spatial sigma of the noise-reduction kernel.
+pub const NR_SIGMA: f32 = 2.0;
+/// Range sigma of the bilateral weight: luminance differences much larger than
+/// this read as an edge and are not averaged across.
+pub const NR_RANGE: f32 = 0.08;
 
 impl Default for AdjustParams {
     fn default() -> Self {
@@ -78,6 +100,11 @@ impl Default for AdjustParams {
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
+            sharpen_amount: 0.0,
+            sharpen_radius: 1.0,
+            sharpen_threshold: 0.0,
+            nr_luma: 0.0,
+            nr_chroma: 0.0,
         }
     }
 }
@@ -92,7 +119,7 @@ impl AdjustParams {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The three `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 96 bytes.
+/// Total size 144 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -100,8 +127,13 @@ pub struct Uniforms {
     pub lift: [f32; 4],
     pub gamma: [f32; 4],
     pub gain: [f32; 4],
-    /// NDC half-extent of the aspect-fitted quad.
+    /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
+    /// NDC translation of the quad, used for panning when zoomed in.
+    pub offset: [f32; 2],
+    /// 1 / source texture size, so the shader can step in source pixels.
+    pub texel: [f32; 2],
+    pub _pad: [f32; 2],
     pub exposure_ev: f32,
     pub contrast: f32,
     pub temp: f32,
@@ -114,16 +146,52 @@ pub struct Uniforms {
     /// 1.0 when the render target is an sRGB format (hardware encodes);
     /// 0.0 when we must encode manually in the shader.
     pub target_is_srgb: f32,
+    pub sharpen_amount: f32,
+    pub sharpen_radius: f32,
+    pub sharpen_threshold: f32,
+    pub nr_luma: f32,
+    pub nr_chroma: f32,
+    /// WGSL rounds uniform struct sizes up to a multiple of the largest member
+    /// alignment (16, for the vec4s), so the Rust side has to match or the
+    /// buffer comes out too small.
+    pub _tail: f32,
+}
+
+/// How the image sits in the viewport, plus the source texel size the detail
+/// filters step by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    /// NDC half-extent of the quad.
+    pub scale: [f32; 2],
+    /// NDC translation, for panning when zoomed past the viewport.
+    pub offset: [f32; 2],
+    /// 1 / source texture size.
+    pub texel: [f32; 2],
+}
+
+impl View {
+    /// Aspect-fitted, unpanned.
+    pub fn fit(scale: [f32; 2], texel: [f32; 2]) -> Self {
+        Self { scale, offset: [0.0, 0.0], texel }
+    }
+
+    /// One output pixel per source pixel, filling the whole target.
+    pub fn one_to_one(texel: [f32; 2]) -> Self {
+        Self::fit([1.0, 1.0], texel)
+    }
 }
 
 impl Uniforms {
-    pub fn new(p: &AdjustParams, scale: [f32; 2], target_is_srgb: bool) -> Self {
+    pub fn new(p: &AdjustParams, view: View, target_is_srgb: bool) -> Self {
         let v4 = |a: [f32; 3]| [a[0], a[1], a[2], 0.0];
         Self {
             lift: v4(p.lift),
             gamma: v4(p.gamma),
             gain: v4(p.gain),
-            scale,
+            scale: view.scale,
+            offset: view.offset,
+            texel: view.texel,
+            _pad: [0.0, 0.0],
             exposure_ev: p.exposure_ev,
             contrast: p.contrast,
             temp: p.temp,
@@ -134,13 +202,19 @@ impl Uniforms {
             whites: p.whites,
             blacks: p.blacks,
             target_is_srgb: if target_is_srgb { 1.0 } else { 0.0 },
+            sharpen_amount: p.sharpen_amount,
+            sharpen_radius: p.sharpen_radius,
+            sharpen_threshold: p.sharpen_threshold,
+            nr_luma: p.nr_luma,
+            nr_chroma: p.nr_chroma,
+            _tail: 0.0,
         }
     }
 
     /// Uniforms that pass the image through untouched — used by the
     /// hold-to-compare "before" view and by neutral exports.
-    pub fn passthrough(scale: [f32; 2], target_is_srgb: bool) -> Self {
-        Self::new(&AdjustParams::default(), scale, target_is_srgb)
+    pub fn passthrough(view: View, target_is_srgb: bool) -> Self {
+        Self::new(&AdjustParams::default(), view, target_is_srgb)
     }
 }
 
@@ -270,10 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_96_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 96);
+    fn uniforms_layout_is_144_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
-        let u = Uniforms::passthrough([1.0, 1.0], false);
+        let u = Uniforms::passthrough(View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
         for field in [&u.lift as *const _ as usize, &u.gamma as *const _ as usize, &u.gain
             as *const _ as usize]

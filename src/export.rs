@@ -20,7 +20,8 @@ use rayon::prelude::*;
 
 use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
-use crate::pipeline::{AdjustParams, Uniforms, apply, srgb_encode};
+use crate::detail;
+use crate::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -64,8 +65,11 @@ fn to_u16(v: f32) -> u16 {
 /// Pure-CPU render of the full adjustment chain. Mirrors the shader exactly
 /// (both call the same `pipeline::apply`).
 pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
+    // Neighbourhood work first, then the per-pixel chain — same order as the
+    // shader.
+    let detailed = detail::apply(img.width, img.height, &img.data, params);
     let mut data = vec![0u16; img.width * img.height * 3];
-    data.par_chunks_mut(3).zip(img.data.par_chunks(3)).for_each(|(dst, src)| {
+    data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {
         let c = apply(params, [src[0], src[1], src[2]]);
         for i in 0..3 {
             dst[i] = to_u16(srgb_encode(c[i]));
@@ -93,8 +97,10 @@ pub fn render_gpu(
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
     let mut renderer = ImageRenderer::from_device(device, FORMAT);
     renderer.set_image(device, queue, img);
-    // scale [1,1] => the quad fills the target exactly (no aspect letterbox).
-    renderer.write_uniforms(queue, &Uniforms::new(params, [1.0, 1.0], false));
+    // One output pixel per source pixel, so the detail filters step by exactly
+    // one source texel and the export matches the 1:1 preview.
+    let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
+    renderer.write_uniforms(queue, &Uniforms::new(params, view, false));
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {

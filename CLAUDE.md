@@ -73,3 +73,22 @@ rules matter when touching it:
 Regression check for this area: develop every file in `testdata/` and confirm
 `P1050113.rw2` (ISO 100, overcast sky) renders a neutral sky while every other
 file stays byte-identical. `RAW_EDITOR_DEBUG=1` prints the per-colour decision.
+
+## Detail stage (noise reduction + sharpening)
+
+`src/detail.rs` mirrors the `detail()` function in `src/shader.wgsl`; both run
+over one 9x9 neighbourhood and share the constants in `pipeline.rs`
+(`DETAIL_RADIUS`, `NR_SIGMA`, `NR_RANGE`). Change one, change the other, and
+extend `tests/shader_parity.rs` — the detail parity tests render a 32x32 frame
+through the real shader and compare it against the CPU path pixel for pixel,
+edge clamping included.
+
+- The stage runs **before** the tone chain, on scene-referred linear data.
+- The shader early-outs when all three detail controls are zero, so the common
+  case costs nothing. Keep that guard.
+- `Uniforms` must stay a multiple of 16 bytes (WGSL rounds uniform structs up to
+  their largest member alignment); `_tail` exists only for that. The size is
+  asserted in `pipeline::tests`.
+- Detail acts on source pixels, so it cannot be judged in the fit-to-window
+  view. That is why the 1:1 zoom (Z / View menu) exists — do not remove it
+  without replacing it with something equivalent.

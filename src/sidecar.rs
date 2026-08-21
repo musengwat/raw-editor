@@ -89,6 +89,11 @@ mod tests {
             lift: [0.02, -0.01, 0.05],
             gamma: [1.15, 0.95, 1.0],
             gain: [1.05, 1.0, 0.92],
+            sharpen_amount: 1.3,
+            sharpen_radius: 1.8,
+            sharpen_threshold: 0.004,
+            nr_luma: 0.45,
+            nr_chroma: 0.7,
         };
         save(&raw, &params).unwrap();
         assert_eq!(load(&raw).unwrap().unwrap(), params);

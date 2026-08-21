@@ -13,8 +13,9 @@ DaVinci-Resolve-style color adjustments. Rust + wgpu + egui.
   camera→linear-sRGB matrix. Output: scene-referred linear RGB f32, unclamped,
   uploaded as an `rgba16float` wgpu texture.
 - **Adjust** (every slider change, GPU): one WGSL fragment shader applies
-  exposure → temp/tint → contrast → highlights/shadows → whites/blacks →
-  lift/gamma/gain → saturation → sRGB transfer. Real-time at full resolution.
+  noise reduction and sharpening → exposure → temp/tint → contrast →
+  highlights/shadows → whites/blacks → lift/gamma/gain → saturation → sRGB
+  transfer. Real-time at full resolution.
 - **Export**: full-res offscreen render → readback → JPEG / 16-bit TIFF.
 - **Persistence**: adjustment params serialized to a `<name>.rw2.edit.json`
   sidecar; the RW2 is never modified.
@@ -51,7 +52,7 @@ what it decides per colour.
 - [x] Phase 2 — real-time core sliders (exposure, contrast, temp/tint, saturation)
 - [x] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
 - [x] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
-- [ ] Phase 5 — sharpening + noise reduction (compute passes)
+- [x] Phase 5 — sharpening + noise reduction
 - [ ] Phase 6 — Malvar-He-Cutler demosaic (replaces the current bilinear)
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
@@ -77,6 +78,22 @@ so negative highlights is the recovery/compression direction. Highlight
 (`src/widgets.rs`): the circular pad writes a luma-neutral chroma offset (R at
 the top, G and B 120° apart, so the three offsets sum to zero) and the value
 box under it moves all three channels together. Double-click a wheel to reset it.
+
+**Detail**: noise reduction (luminance and colour) and sharpening, all sharing
+one 9×9 neighbourhood pass. Luminance NR is bilateral — neighbours are weighted
+by distance *and* by luminance similarity, so flat areas smooth while edges
+survive. Colour NR is a plain blur of the chroma difference, which is where the
+blotchy high-ISO noise lives and where there is no detail worth keeping.
+Sharpening is a thresholded unsharp mask on luminance; the threshold matters,
+because at zero it happily amplifies grain along with detail. On a real ISO 800
+frame, NR at 0.9 cuts pixel-to-pixel gradient by 56% while leaving local
+contrast alone.
+
+These act on *source* pixels, so they are invisible in a fit-to-window view of a
+16MP image — that view has already thrown away the frequencies they work on.
+Press **Z** (or use the *View* menu) for a 1:1 view and drag to pan; that is the
+only honest way to judge them, and it is why the zoom exists at all. Export is
+always full resolution, so what 1:1 shows is what you get.
 
 **Menu**: *File → Open…* picks a raw through the native file dialog, and
 *File → Export as JPEG… / 16-bit TIFF…* asks where to write it instead of

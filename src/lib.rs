@@ -1,3 +1,4 @@
+pub mod detail;
 pub mod develop;
 pub mod export;
 pub mod gpu;

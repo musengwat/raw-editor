@@ -10,7 +10,8 @@ mod common;
 use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
-use raw_editor::pipeline::{AdjustParams, Uniforms, apply, srgb_encode};
+use raw_editor::detail;
+use raw_editor::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
 
 const W: usize = 2;
 const H: usize = 2;
@@ -24,16 +25,28 @@ const PIXELS: [[f32; 3]; 4] = [
 ];
 
 fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams) -> Vec<[u8; 4]> {
-    let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
     let img = DevelopedImage {
         width: W,
         height: H,
         data: PIXELS.iter().flatten().copied().collect(),
     };
-    renderer.set_image(device, queue, &img);
-    renderer.write_uniforms(queue, &Uniforms::new(params, [1.0, 1.0], false));
+    render_image(device, queue, &img, params)
+}
 
-    let size = wgpu::Extent3d { width: W as u32, height: H as u32, depth_or_array_layers: 1 };
+/// Render one image through the real pipeline at 1:1 and read back sRGB bytes.
+fn render_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DevelopedImage,
+    params: &AdjustParams,
+) -> Vec<[u8; 4]> {
+    let (w, h) = (img.width, img.height);
+    let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
+    renderer.set_image(device, queue, img);
+    let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
+    renderer.write_uniforms(queue, &Uniforms::new(params, view, false));
+
+    let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target"),
         size,
@@ -47,10 +60,10 @@ fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams)
     let view = target.create_view(&Default::default());
 
     // bytes_per_row must be a multiple of 256 for texture->buffer copies.
-    let padded_row = 256usize;
+    let padded_row = (w * 4).div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: (padded_row * H) as u64,
+        size: (padded_row * h) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -87,7 +100,7 @@ fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams)
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded_row as u32),
-                rows_per_image: Some(H as u32),
+                rows_per_image: Some(h as u32),
             },
         },
         size,
@@ -99,9 +112,9 @@ fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams)
     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
     let mapped = slice.get_mapped_range().expect("map readback buffer");
-    let mut out = Vec::with_capacity(W * H);
-    for row in 0..H {
-        for col in 0..W {
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        for col in 0..w {
             let o = row * padded_row + col * 4;
             out.push([mapped[o], mapped[o + 1], mapped[o + 2], mapped[o + 3]]);
         }
@@ -233,5 +246,85 @@ fn parity_full_chain() {
         lift: [0.05, 0.0, -0.04],
         gamma: [1.1, 1.0, 0.95],
         gain: [1.05, 0.98, 1.02],
+        ..Default::default()
+    });
+}
+
+// --- Phase 5: detail (noise reduction + sharpening) ---------------------
+
+/// A 32x32 test frame with an edge, a colour patch and per-pixel noise — the
+/// three things the detail filters have to treat differently.
+fn detail_source() -> DevelopedImage {
+    let (w, h) = (32usize, 32usize);
+    let mut data = vec![0f32; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let n = if (x + y) % 2 == 0 { 0.015 } else { -0.015 };
+            let base = if x < w / 2 { 0.20 } else { 0.55 };
+            let o = (y * w + x) * 3;
+            data[o] = base + n + if y < h / 2 { 0.10 } else { 0.0 };
+            data[o + 1] = base + n;
+            data[o + 2] = base - n + if y >= h / 2 { 0.08 } else { 0.0 };
+        }
+    }
+    DevelopedImage { width: w, height: h, data }
+}
+
+/// The neighbourhood filters have to agree between `shader.wgsl::detail` and
+/// `detail::pixel`, edge clamping included.
+fn assert_detail_parity(params: AdjustParams) {
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    let img = detail_source();
+    let gpu = render_image(&ctx.device, &ctx.queue, &img, &params);
+
+    let detailed = detail::apply(img.width, img.height, &img.data, &params);
+    let mut worst = 0i32;
+    for (i, px) in detailed.chunks(3).enumerate() {
+        let c = apply(&params, [px[0], px[1], px[2]]);
+        for ch in 0..3 {
+            let want = (srgb_encode(c[ch]) * 255.0 + 0.5) as u8;
+            let got = gpu[i][ch];
+            worst = worst.max((want as i32 - got as i32).abs());
+        }
+    }
+    // One step of slack for f16 texture storage plus 8-bit quantisation.
+    assert!(worst <= 3, "detail parity off by {worst} (params {params:?})");
+}
+
+#[test]
+fn parity_noise_reduction() {
+    assert_detail_parity(AdjustParams { nr_luma: 0.8, nr_chroma: 0.6, ..Default::default() });
+}
+
+#[test]
+fn parity_sharpening() {
+    assert_detail_parity(AdjustParams {
+        sharpen_amount: 1.4,
+        sharpen_radius: 1.2,
+        sharpen_threshold: 0.004,
+        ..Default::default()
+    });
+}
+
+/// Detail plus the whole tone chain — the case most likely to expose a
+/// mismatch in where the detail stage sits in the order.
+#[test]
+fn parity_detail_with_full_chain() {
+    assert_detail_parity(AdjustParams {
+        exposure_ev: 0.4,
+        contrast: 0.25,
+        temp: 0.2,
+        saturation: 0.3,
+        highlights: -0.4,
+        shadows: 0.3,
+        nr_luma: 0.5,
+        nr_chroma: 0.7,
+        sharpen_amount: 1.0,
+        sharpen_radius: 1.5,
+        sharpen_threshold: 0.002,
+        ..Default::default()
     });
 }

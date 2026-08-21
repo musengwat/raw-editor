@@ -19,6 +19,8 @@ use raw_editor::widgets::ColorWheel;
 
 /// Hold this key to bypass every adjustment and see the original.
 const COMPARE_KEY: egui::Key = egui::Key::B;
+/// Toggles between fit-to-window and 1:1.
+const ZOOM_KEY: egui::Key = egui::Key::Z;
 /// How long the params must sit still before the sidecar is written.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 
@@ -62,6 +64,12 @@ struct App {
     exporting: bool,
     export_format: ExportFormat,
     jpeg_quality: u8,
+
+    /// 1:1 view — required to judge sharpening and noise reduction, which act
+    /// on source pixels a fit-to-window view has already thrown away.
+    zoom_100: bool,
+    /// Pan offset in NDC, only meaningful while zoomed.
+    pan: [f32; 2],
 }
 
 impl App {
@@ -95,6 +103,8 @@ impl App {
             exporting: false,
             export_format: ExportFormat::Jpeg,
             jpeg_quality: 92,
+            zoom_100: false,
+            pan: [0.0, 0.0],
         };
         if let Some(p) = path {
             app.start_load(p, &cc.egui_ctx);
@@ -299,6 +309,14 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            ui.menu_button("View", |ui| {
+                let fit = ui.selectable_label(!self.zoom_100, "Fit to window").clicked();
+                let one = ui.selectable_label(self.zoom_100, "1:1 (100%)").clicked();
+                if fit || one {
+                    self.zoom_100 = one;
+                    ui.close();
+                }
+            });
             ui.menu_button("Edit", |ui| {
                 let changed = !self.params.is_neutral();
                 if ui.add_enabled(changed, egui::Button::new("Reset adjustments")).clicked() {
@@ -342,6 +360,25 @@ impl App {
                 ColorWheel::new("Gamma", &mut p.gamma, 1.0, 0.5).show(ui);
                 ColorWheel::new("Gain", &mut p.gain, 1.0, 0.5).show(ui);
             });
+
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Detail").strong());
+            ui.add(egui::Slider::new(&mut p.nr_luma, 0.0..=1.0).text("NR luminance"));
+            ui.add(egui::Slider::new(&mut p.nr_chroma, 0.0..=1.0).text("NR colour"));
+            ui.add(egui::Slider::new(&mut p.sharpen_amount, 0.0..=3.0).text("Sharpen"));
+            ui.add(
+                egui::Slider::new(&mut p.sharpen_radius, 0.3..=3.0).text("Radius"),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.sharpen_threshold, 0.0..=0.05)
+                    .text("Threshold")
+                    .fixed_decimals(3),
+            );
+            ui.label(
+                egui::RichText::new("Detail acts on source pixels — judge it at 1:1")
+                    .weak()
+                    .small(),
+            );
 
             ui.add_space(12.0);
             reset = ui.button("Reset").clicked();
@@ -392,7 +429,7 @@ impl App {
         };
 
         let avail = ui.available_size();
-        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::drag());
         let Some([iw, ih]) = image_size else {
             ui.painter().text(
                 rect.center(),
@@ -404,22 +441,48 @@ impl App {
             return;
         };
 
-        // Aspect-fit the quad inside the callback rect (NDC scale).
-        let img_aspect = iw as f32 / ih as f32;
-        let rect_aspect = rect.width() / rect.height();
-        let scale = if img_aspect > rect_aspect {
-            [1.0, rect_aspect / img_aspect]
+        let texel = [1.0 / iw as f32, 1.0 / ih as f32];
+        // Viewport size in physical pixels — NDC [-1,1] spans exactly this.
+        let ppp = ui.ctx().pixels_per_point();
+        let (vw, vh) = (rect.width() * ppp, rect.height() * ppp);
+
+        let view = if self.zoom_100 {
+            // One source pixel per screen pixel: the quad runs off the edges
+            // and the visible part is a crop the user pans around. Without
+            // this the detail filters are invisible, because a 4592px image
+            // shown in a ~1000px viewport throws away exactly the frequencies
+            // sharpening and noise reduction act on.
+            let scale = [iw as f32 / vw, ih as f32 / vh];
+            if response.dragged() {
+                let d = response.drag_delta();
+                self.pan[0] += 2.0 * d.x * ppp / vw;
+                self.pan[1] -= 2.0 * d.y * ppp / vh;
+            }
+            // Never drag the image completely off the viewport.
+            for i in 0..2 {
+                let slack = (scale[i] - 1.0).max(0.0);
+                self.pan[i] = self.pan[i].clamp(-slack, slack);
+            }
+            raw_editor::pipeline::View { scale, offset: self.pan, texel }
         } else {
-            [img_aspect / rect_aspect, 1.0]
+            self.pan = [0.0, 0.0];
+            let img_aspect = iw as f32 / ih as f32;
+            let rect_aspect = rect.width() / rect.height();
+            let scale = if img_aspect > rect_aspect {
+                [1.0, rect_aspect / img_aspect]
+            } else {
+                [img_aspect / rect_aspect, 1.0]
+            };
+            raw_editor::pipeline::View::fit(scale, texel)
         };
 
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
         let comparing = ui.ctx().input(|i| i.key_down(COMPARE_KEY));
         let uniforms = if comparing {
-            Uniforms::passthrough(scale, target_is_srgb)
+            Uniforms::passthrough(view, target_is_srgb)
         } else {
-            Uniforms::new(&self.params, scale, target_is_srgb)
+            Uniforms::new(&self.params, view, target_is_srgb)
         };
 
         ui.painter()
@@ -446,6 +509,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_loader();
         self.poll_export();
+
+        // Z flips between fit and 1:1.
+        if ui.ctx().input(|i| i.key_pressed(ZOOM_KEY)) {
+            self.zoom_100 = !self.zoom_100;
+        }
 
         // Load a dropped file (last one wins).
         let dropped: Option<PathBuf> = ui.ctx().input(|i| {

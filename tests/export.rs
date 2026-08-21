@@ -44,6 +44,13 @@ fn params() -> AdjustParams {
         lift: [0.03, 0.0, -0.02],
         gamma: [1.1, 1.0, 0.95],
         gain: [1.05, 1.0, 0.95],
+        // Detail on too, so the export path exercises the neighbourhood stage
+        // and the GPU/CPU renders have to agree about it.
+        sharpen_amount: 1.2,
+        sharpen_radius: 1.4,
+        sharpen_threshold: 0.003,
+        nr_luma: 0.5,
+        nr_chroma: 0.6,
     }
 }
 
