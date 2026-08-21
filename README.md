@@ -95,10 +95,14 @@ Press **Z** (or use the *View* menu) for a 1:1 view and drag to pan; that is the
 only honest way to judge them, and it is why the zoom exists at all. Export is
 always full resolution, so what 1:1 shows is what you get.
 
-**Menu**: *File → Open…* picks a raw through the native file dialog, and
-*File → Export as JPEG… / 16-bit TIFF…* asks where to write it instead of
-defaulting to `<stem>_edit.<ext>` beside the raw. *Edit → Reset adjustments*
-mirrors the Reset button. Drag-and-drop still works.
+**Menu**: *File → Open…* picks a raw through the native file dialog.
+*File → Export as JPEG… / 16-bit TIFF…* and the panel's export button both ask
+where to write — every export goes through a save dialog, which also means the
+system asks before overwriting anything. *File → Batch export folder…* takes a
+folder of raws and a destination and exports every one of them using its own
+sidecar, counting progress in the status bar; a file that fails is reported and
+the rest carry on. *Edit → Reset adjustments* mirrors the Reset button.
+Drag-and-drop still works.
 
 **Compare**: hold `B` to render the same frame with neutral params — the
 "before" view goes through the identical shader, so only the adjustments differ.
@@ -175,6 +179,7 @@ where the sensor clips.
 cargo run --release -- testdata/f.rw2      # the editor GUI (path optional; drag-and-drop works)
 cargo run --release --bin probe -- f.rw2   # dump decode metadata (2nd arg = write a developed PNG)
 cargo run --release --bin export -- f.rw2 jpg 92   # headless export using the file's sidecar
+cargo run --release --bin export -- photos/ jpg 90 --out out/   # batch a whole folder
 cargo test --release                       # develop/pipeline math + headless GPU parity/export tests
 ```
 

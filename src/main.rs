@@ -39,7 +39,16 @@ fn main() -> eframe::Result {
 }
 
 type LoadResult = (PathBuf, anyhow::Result<DevelopedImage>);
-type ExportResult = anyhow::Result<PathBuf>;
+/// Messages from an export or batch-export worker.
+enum ExportMsg {
+    /// A single-file export finished.
+    Done(anyhow::Result<PathBuf>),
+    /// A batch is part way through.
+    Progress { done: usize, total: usize, name: String },
+    /// A batch finished.
+    BatchDone { ok: usize, failed: usize, dir: PathBuf },
+}
+type ExportResult = ExportMsg;
 
 struct App {
     render_state: eframe::egui_wgpu::RenderState,
@@ -210,13 +219,6 @@ impl App {
 
     // --- export ----------------------------------------------------------
 
-    /// Export to the default `<stem>_edit.<ext>` next to the raw.
-    fn start_export(&mut self, ctx: &egui::Context) {
-        let Some(raw) = self.current.clone() else { return };
-        let out = export::output_path(&raw, self.export_format);
-        self.start_export_to(ctx, out);
-    }
-
     fn start_export_to(&mut self, ctx: &egui::Context, out: PathBuf) {
         let (Some(img), Some(raw)) = (self.image.clone(), self.current.clone()) else { return };
         self.flush_sidecar();
@@ -243,19 +245,71 @@ impl App {
             let meta = raw_editor::metadata::read(&raw).ok();
             let result =
                 export::write(&out, &rendered, format, quality, meta.as_ref()).map(|()| out);
-            let _ = tx.send(result);
+            let _ = tx.send(ExportMsg::Done(result));
             ctx.request_repaint();
         });
     }
 
     fn poll_export(&mut self) {
-        while let Ok(result) = self.export_rx.try_recv() {
-            self.exporting = false;
-            self.status = match result {
-                Ok(path) => format!("Exported {}", path.display()),
-                Err(e) => format!("Export failed: {e:#}"),
-            };
+        while let Ok(msg) = self.export_rx.try_recv() {
+            match msg {
+                ExportMsg::Done(result) => {
+                    self.exporting = false;
+                    self.status = match result {
+                        Ok(path) => format!("Exported {}", path.display()),
+                        Err(e) => format!("Export failed: {e:#}"),
+                    };
+                }
+                ExportMsg::Progress { done, total, name } => {
+                    self.status = format!("Exporting {done}/{total}: {name}");
+                }
+                ExportMsg::BatchDone { ok, failed, dir } => {
+                    self.exporting = false;
+                    self.status = if failed == 0 {
+                        format!("Exported {ok} files to {}", dir.display())
+                    } else {
+                        format!("Exported {ok} to {}, {failed} failed", dir.display())
+                    };
+                }
+            }
         }
+    }
+
+    /// Export every raw in one folder using each file's own sidecar.
+    ///
+    /// Files are processed one at a time on purpose: a developed 16MP frame is
+    /// ~190 MB, and running them in parallel would spike memory for no real
+    /// gain when the GPU pass is the bottleneck anyway.
+    fn start_batch_export(&mut self, ctx: &egui::Context, files: Vec<PathBuf>, out_dir: PathBuf) {
+        let device = self.render_state.device.clone();
+        let queue = self.render_state.queue.clone();
+        let format = self.export_format;
+        let quality = self.jpeg_quality;
+        let tx = self.export_tx.clone();
+        let ctx = ctx.clone();
+
+        self.exporting = true;
+        self.status = format!("Exporting {} files…", files.len());
+        std::thread::spawn(move || {
+            let total = files.len();
+            let (mut ok, mut failed) = (0usize, 0usize);
+            for (i, path) in files.iter().enumerate() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let _ = tx.send(ExportMsg::Progress { done: i, total, name });
+                ctx.request_repaint();
+
+                // One bad file must not abandon the rest of the batch.
+                match batch_one(&device, &queue, path, &out_dir, format, quality) {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        eprintln!("batch: {} failed: {e:#}", path.display());
+                        failed += 1;
+                    }
+                }
+            }
+            let _ = tx.send(ExportMsg::BatchDone { ok, failed, dir: out_dir });
+            ctx.request_repaint();
+        });
     }
 
     // --- ui --------------------------------------------------------------
@@ -290,6 +344,36 @@ impl App {
         }
     }
 
+    /// Pick a folder of raws and a destination, then export the lot.
+    fn pick_and_batch_export(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.current.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(input) = dialog.pick_folder() else { return };
+
+        let files = match export::raw_files_in(&input) {
+            Ok(f) if !f.is_empty() => f,
+            Ok(_) => {
+                self.status = format!("No .rw2 files in {}", input.display());
+                return;
+            }
+            Err(e) => {
+                self.status = format!("Could not read {}: {e:#}", input.display());
+                return;
+            }
+        };
+
+        let Some(out_dir) = rfd::FileDialog::new()
+            .set_title(format!("Where should {} exports go?", files.len()))
+            .set_directory(&input)
+            .pick_folder()
+        else {
+            return;
+        };
+        self.start_batch_export(ctx, files, out_dir);
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
@@ -306,6 +390,10 @@ impl App {
                         ui.close();
                         self.pick_and_export(&ctx, format);
                     }
+                }
+                if ui.add_enabled(!self.exporting, egui::Button::new("Batch export folder…")).clicked() {
+                    ui.close();
+                    self.pick_and_batch_export(&ctx);
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -408,7 +496,7 @@ impl App {
                 ui.add(egui::Slider::new(jpeg_quality, 1..=100).text("Quality"));
             }
             do_export = ui
-                .add_enabled(has_image && !exporting, egui::Button::new("Export full resolution"))
+                .add_enabled(has_image && !exporting, egui::Button::new("Export full resolution…"))
                 .clicked();
             ui.add_space(8.0);
         });
@@ -417,8 +505,12 @@ impl App {
             self.params = AdjustParams::default();
         }
         if do_export {
+            // Always ask where to save: the dialog also gives us overwrite
+            // confirmation for free, which the old silent
+            // `<stem>_edit.jpg`-beside-the-raw behaviour did not.
             let ctx = ui.ctx().clone();
-            self.start_export(&ctx);
+            let format = self.export_format;
+            self.pick_and_export(&ctx, format);
         }
     }
 
@@ -546,4 +638,28 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.flush_sidecar();
     }
+}
+
+/// Develop, render and write one file of a batch.
+fn batch_one(
+    device: &eframe::wgpu::Device,
+    queue: &eframe::wgpu::Queue,
+    path: &std::path::Path,
+    out_dir: &std::path::Path,
+    format: ExportFormat,
+    quality: u8,
+) -> anyhow::Result<()> {
+    let params = sidecar::load(path)?.unwrap_or_default();
+    let raw = rawler::decode_file(path)?;
+    let img = develop(&raw)?;
+    let rendered = match export::render_gpu(device, queue, &img, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("batch: GPU render failed ({e:#}) — using the CPU path");
+            export::render_cpu(&img, &params)
+        }
+    };
+    let meta = raw_editor::metadata::read(path).ok();
+    let out = export::batch_output_path(path, Some(out_dir), format);
+    export::write(&out, &rendered, format, quality, meta.as_ref())
 }
