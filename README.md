@@ -9,9 +9,9 @@ DaVinci-Resolve-style color adjustments. Rust + wgpu + egui.
   extracts CFA sensor data + metadata (black/white levels, as-shot white
   balance, camera color matrices).
 - **Develop** (once per file, CPU, `src/develop.rs`): black-level subtract →
-  normalize → white-balance gains → demosaic → camera→linear-sRGB matrix.
-  Output: scene-referred linear RGB f32, unclamped, uploaded as an
-  `rgba16float` wgpu texture.
+  normalize → white-balance gains → demosaic → clipped-highlight handling →
+  camera→linear-sRGB matrix. Output: scene-referred linear RGB f32, unclamped,
+  uploaded as an `rgba16float` wgpu texture.
 - **Adjust** (every slider change, GPU): one WGSL fragment shader applies
   exposure → temp/tint → contrast → highlights/shadows → whites/blacks →
   lift/gamma/gain → saturation → sRGB transfer. Real-time at full resolution.
@@ -21,6 +21,28 @@ DaVinci-Resolve-style color adjustments. Rust + wgpu + egui.
 
 All shader math is mirrored in pure Rust so `cargo test` can verify it and
 export can fall back to CPU.
+
+### Clipped highlights
+
+A saturated photosite only records "at least this much", so its channel ratios
+are meaningless — and white-balance gains applied to them turn every blown area
+magenta. The develop stage therefore marks clipped photosites, and any pixel
+that touches one is forced neutral at the brightest channel's level (that
+channel is the least likely to have clipped, so it is the best luminance
+estimate left). This is the plain "clip to neutral" behaviour; true highlight
+*reconstruction* from neighbouring detail is out of scope.
+
+Finding the clipping point is the subtle part, because it is not always the
+reported white level. On Panasonic's extended low ISO (100 on a G85, below its
+base of 200) the sensor is overexposed and the result scaled back down, so the
+analog ceiling lands around raw 2880 while the file still reports 4095 —
+highlights clip without ever approaching the reported level. `saturation_levels`
+detects this from the histogram: a real ceiling is a narrow, tall plateau with
+almost nothing above it, and because saturation is a property of the sensor it
+must show up in at least two colours at nearly the same level. A single colour
+peaking alone is just a large flat bright area in the scene, and treating that
+as clipping would drain the colour out of it. Set `RAW_EDITOR_DEBUG=1` to see
+what it decides per colour.
 
 ## Status
 

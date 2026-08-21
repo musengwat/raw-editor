@@ -55,3 +55,21 @@ off = h[0] + h[19] * 12                      # header_size + ncolors*12
 mode = 'BGRX' if h[7] == 0 else 'XRGB'
 Image.frombytes('RGB', (h[4], h[5]), d[off:], 'raw', mode, h[12]).save('win.png')
 ```
+
+## Highlight clipping and white levels
+
+The reported white level is not always where a file clips. Panasonic's extended
+low ISO (100 on the G85) overexposes and scales down, so the analog ceiling sits
+near raw 2880 while the file reports 4095. `develop::saturation_levels` detects
+that from the histogram; see README for the criteria and the reasoning. Two
+rules matter when touching it:
+
+- Clipped pixels are forced neutral **after** demosaicing, never per photosite.
+  Green saturates first (its WB gain is 1.0 while red's is 2.3), so a
+  per-photosite fix trades a magenta cast for a green one.
+- Detection must be corroborated across colours. A single colour peaking alone
+  is a scene feature, not a sensor ceiling.
+
+Regression check for this area: develop every file in `testdata/` and confirm
+`P1050113.rw2` (ISO 100, overcast sky) renders a neutral sky while every other
+file stays byte-identical. `RAW_EDITOR_DEBUG=1` prints the per-colour decision.
