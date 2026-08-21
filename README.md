@@ -141,6 +141,30 @@ Because the developed image is uploaded as `rgba16float`, half-float is the
 pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16
 *significant* bits end to end.
 
+## Uploading to Immich
+
+*File → Settings…* takes an Immich server URL and API key (Immich → Account
+Settings → API Keys) and has a **Test connection** button that reports the
+server version. Once both are set, "Upload to Immich after export" sends each
+finished export; the CLI does the same with `--upload`, and refuses to run
+rather than silently skipping if nothing is configured.
+
+The upload is deliberately opt-in and always happens *after* the local file is
+written, so a server that is down or misconfigured never costs you an export —
+the failure is reported and the file stays on disk. Immich deduplicates by
+checksum, so re-uploading the same export is harmless and reports `duplicate`.
+
+Capture dates are not sent explicitly: `fileCreatedAt` is a filesystem
+timestamp, and Immich reads the real capture time from the EXIF written into the
+JPEG, so photos file under when they were shot.
+
+The API key is a credential. It lives in `config.json` in your OS config
+directory (`~/.config/raw-editor/` on Linux, `%APPDATA%` on Windows), written
+`0600` on Unix, masked in the settings dialog, redacted from `Debug`, and kept
+out of log lines and error messages — `src/immich.rs` names only the host when a
+request fails. That module is the only place in the project that touches the
+network; keep it that way.
+
 ## Windows build
 
 Every push to `master` builds the executable on a Windows runner

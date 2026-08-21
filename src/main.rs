@@ -14,6 +14,8 @@ use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{AdjustParams, Uniforms};
+use raw_editor::config::Config;
+use raw_editor::immich;
 use raw_editor::sidecar;
 use raw_editor::widgets::ColorWheel;
 
@@ -41,8 +43,8 @@ fn main() -> eframe::Result {
 type LoadResult = (PathBuf, anyhow::Result<DevelopedImage>);
 /// Messages from an export or batch-export worker.
 enum ExportMsg {
-    /// A single-file export finished.
-    Done(anyhow::Result<PathBuf>),
+    /// A single-file export finished, with an optional upload note.
+    Done(anyhow::Result<(PathBuf, Option<String>)>),
     /// A batch is part way through.
     Progress { done: usize, total: usize, name: String },
     /// A batch finished.
@@ -79,6 +81,12 @@ struct App {
     zoom_100: bool,
     /// Pan offset in NDC, only meaningful while zoomed.
     pan: [f32; 2],
+
+    config: Config,
+    show_settings: bool,
+    /// Result of the last "Test connection", shown in the settings dialog.
+    ping_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
+    ping_status: String,
 }
 
 impl App {
@@ -114,6 +122,13 @@ impl App {
             jpeg_quality: 92,
             zoom_100: false,
             pan: [0.0, 0.0],
+            config: Config::load().unwrap_or_else(|e| {
+                eprintln!("config: {e:#} — starting with defaults");
+                Config::default()
+            }),
+            show_settings: false,
+            ping_rx: None,
+            ping_status: String::new(),
         };
         if let Some(p) = path {
             app.start_load(p, &cc.egui_ctx);
@@ -230,6 +245,7 @@ impl App {
         let quality = self.jpeg_quality;
         let tx = self.export_tx.clone();
         let ctx = ctx.clone();
+        let config = self.config.clone();
 
         self.exporting = true;
         self.status = format!("Exporting {}…", out.display());
@@ -243,8 +259,8 @@ impl App {
             };
             // The camera's own metadata, read straight from the raw.
             let meta = raw_editor::metadata::read(&raw).ok();
-            let result =
-                export::write(&out, &rendered, format, quality, meta.as_ref()).map(|()| out);
+            let result = export::write(&out, &rendered, format, quality, meta.as_ref())
+                .map(|()| maybe_upload(&config, out));
             let _ = tx.send(ExportMsg::Done(result));
             ctx.request_repaint();
         });
@@ -256,7 +272,8 @@ impl App {
                 ExportMsg::Done(result) => {
                     self.exporting = false;
                     self.status = match result {
-                        Ok(path) => format!("Exported {}", path.display()),
+                        Ok((path, None)) => format!("Exported {}", path.display()),
+                        Ok((path, Some(note))) => format!("Exported {} — {note}", path.display()),
                         Err(e) => format!("Export failed: {e:#}"),
                     };
                 }
@@ -287,6 +304,7 @@ impl App {
         let quality = self.jpeg_quality;
         let tx = self.export_tx.clone();
         let ctx = ctx.clone();
+        let config = self.config.clone();
 
         self.exporting = true;
         self.status = format!("Exporting {} files…", files.len());
@@ -299,8 +317,13 @@ impl App {
                 ctx.request_repaint();
 
                 // One bad file must not abandon the rest of the batch.
-                match batch_one(&device, &queue, path, &out_dir, format, quality) {
-                    Ok(()) => ok += 1,
+                match batch_one(&device, &queue, path, &out_dir, format, quality, &config) {
+                    Ok(note) => {
+                        if let Some(note) = note {
+                            eprintln!("batch: {} — {note}", path.display());
+                        }
+                        ok += 1;
+                    }
                     Err(e) => {
                         eprintln!("batch: {} failed: {e:#}", path.display());
                         failed += 1;
@@ -310,6 +333,83 @@ impl App {
             let _ = tx.send(ExportMsg::BatchDone { ok, failed, dir: out_dir });
             ctx.request_repaint();
         });
+    }
+
+    /// Non-blocking result of the settings dialog's connection test.
+    fn poll_ping(&mut self) {
+        let Some(rx) = &self.ping_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(version)) => {
+                self.ping_status = format!("Connected — Immich {version}");
+                self.ping_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.ping_status = format!("Failed: {e:#}");
+                self.ping_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.ping_rx = None,
+        }
+    }
+
+    fn settings_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(egui::RichText::new("Immich").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Server URL");
+                    ui.text_edit_singleline(&mut self.config.immich_url);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("API key   ");
+                    // password() keeps the credential off the screen.
+                    ui.add(egui::TextEdit::singleline(&mut self.config.immich_api_key).password(true));
+                });
+                ui.label(
+                    egui::RichText::new("Immich → Account Settings → API Keys")
+                        .weak()
+                        .small(),
+                );
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let testing = self.ping_rx.is_some();
+                    let ready = self.config.immich_ready();
+                    if ui
+                        .add_enabled(ready && !testing, egui::Button::new("Test connection"))
+                        .clicked()
+                    {
+                        let (tx, rx) = mpsc::channel();
+                        let config = self.config.clone();
+                        let ctx = ui.ctx().clone();
+                        self.ping_rx = Some(rx);
+                        self.ping_status = "Testing…".into();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(immich::ping(&config));
+                            ctx.request_repaint();
+                        });
+                    }
+                    save = ui.button("Save").clicked();
+                });
+                if !self.ping_status.is_empty() {
+                    ui.label(&self.ping_status);
+                }
+            });
+
+        if save {
+            match self.config.save() {
+                Ok(()) => self.status = "Settings saved".into(),
+                Err(e) => self.status = format!("Could not save settings: {e:#}"),
+            }
+        }
+        self.show_settings = open && !save;
     }
 
     // --- ui --------------------------------------------------------------
@@ -390,6 +490,10 @@ impl App {
                         ui.close();
                         self.pick_and_export(&ctx, format);
                     }
+                }
+                if ui.button("Settings…").clicked() {
+                    ui.close();
+                    self.show_settings = true;
                 }
                 if ui.add_enabled(!self.exporting, egui::Button::new("Batch export folder…")).clicked() {
                     ui.close();
@@ -495,6 +599,14 @@ impl App {
             if *export_format == ExportFormat::Jpeg {
                 ui.add(egui::Slider::new(jpeg_quality, 1..=100).text("Quality"));
             }
+            let immich_ready = self.config.immich_ready();
+            let upload = &mut self.config.upload_after_export;
+            ui.add_enabled(
+                immich_ready,
+                egui::Checkbox::new(upload, "Upload to Immich after export"),
+            )
+            .on_disabled_hover_text("Set the Immich server and API key in File → Settings…");
+
             do_export = ui
                 .add_enabled(has_image && !exporting, egui::Button::new("Export full resolution…"))
                 .clicked();
@@ -603,6 +715,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_loader();
+        self.poll_ping();
         self.poll_export();
 
         // Z flips between fit and 1:1.
@@ -631,6 +744,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             self.image_panel(ui);
         });
+        self.settings_window(ui);
 
         self.autosave_tick(ui.ctx());
     }
@@ -648,7 +762,8 @@ fn batch_one(
     out_dir: &std::path::Path,
     format: ExportFormat,
     quality: u8,
-) -> anyhow::Result<()> {
+    config: &Config,
+) -> anyhow::Result<Option<String>> {
     let params = sidecar::load(path)?.unwrap_or_default();
     let raw = rawler::decode_file(path)?;
     let img = develop(&raw)?;
@@ -661,5 +776,20 @@ fn batch_one(
     };
     let meta = raw_editor::metadata::read(path).ok();
     let out = export::batch_output_path(path, Some(out_dir), format);
-    export::write(&out, &rendered, format, quality, meta.as_ref())
+    export::write(&out, &rendered, format, quality, meta.as_ref())?;
+    Ok(maybe_upload(config, out).1)
+}
+
+/// Upload a finished export when the user has asked for it and Immich is
+/// configured. Never fails the export: the file is already safely on disk, and
+/// losing it because a server was unreachable would be a bad trade.
+fn maybe_upload(config: &Config, out: PathBuf) -> (PathBuf, Option<String>) {
+    if !(config.upload_after_export && config.immich_ready()) {
+        return (out, None);
+    }
+    let note = match immich::upload(config, &out) {
+        Ok(result) => result.describe(),
+        Err(e) => format!("upload failed: {e:#}"),
+    };
+    (out, Some(note))
 }

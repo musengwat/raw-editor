@@ -1,12 +1,16 @@
 //! Headless full-resolution export, using the same GPU pipeline as the GUI.
 //!
 //! ```text
-//! export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR]
+//! export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR] [--upload]
 //! ```
 //!
 //! Adjustments come from each file's `<name>.rw2.edit.json` sidecar, so
 //! pointing this at a folder applies every saved edit in one go. It is also the
 //! end-to-end check that a full-size render, readback and encode really work.
+//!
+//! `--upload` sends each finished file to the Immich server configured in the
+//! app's settings; it refuses to run rather than silently skipping if that is
+//! not set up.
 
 use std::path::{Path, PathBuf};
 
@@ -17,13 +21,15 @@ use raw_editor::export::{self, ExportFormat};
 use raw_editor::metadata;
 use raw_editor::sidecar;
 
-const USAGE: &str = "usage: export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR]";
+const USAGE: &str =
+    "usage: export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR] [--upload]";
 
 struct Args {
     input: PathBuf,
     format: ExportFormat,
     quality: u8,
     out_dir: Option<PathBuf>,
+    upload: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -31,11 +37,13 @@ fn parse_args() -> Result<Args> {
     let mut format = ExportFormat::Jpeg;
     let mut quality = 92u8;
     let mut out_dir = None;
+    let mut upload = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--out" => out_dir = Some(PathBuf::from(it.next().context("--out needs a directory")?)),
+            "--upload" => upload = true,
             "jpg" | "jpeg" => format = ExportFormat::Jpeg,
             "tif" | "tiff" => format = ExportFormat::Tiff16,
             "-h" | "--help" => {
@@ -54,11 +62,27 @@ fn parse_args() -> Result<Args> {
         format,
         quality,
         out_dir,
+        upload,
     })
 }
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+
+    // Uploading only happens when asked for explicitly *and* configured.
+    let config = if args.upload {
+        let c = raw_editor::config::Config::load()?;
+        if !c.immich_ready() {
+            anyhow::bail!(
+                "--upload needs an Immich URL and API key in {}",
+                raw_editor::config::Config::path()?.display()
+            );
+        }
+        println!("upload:    {} (after each export)", c.base_url());
+        Some(c)
+    } else {
+        None
+    };
 
     let files = if args.input.is_dir() {
         let found = export::raw_files_in(&args.input)?;
@@ -88,7 +112,7 @@ fn main() -> Result<()> {
             println!("\n[{}/{}] {}", i + 1, files.len(), path.display());
         }
         // One bad file must not abandon the rest of the batch.
-        match export_one(path, &args, gpu.as_ref()) {
+        match export_one(path, &args, gpu.as_ref(), config.as_ref()) {
             Ok(out) => {
                 let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
                 println!("wrote:     {} ({:.1} MiB)", out.display(), bytes as f64 / (1024.0 * 1024.0));
@@ -110,7 +134,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn export_one(path: &Path, args: &Args, gpu: Option<&(wgpu::Device, wgpu::Queue)>) -> Result<PathBuf> {
+fn export_one(
+    path: &Path,
+    args: &Args,
+    gpu: Option<&(wgpu::Device, wgpu::Queue)>,
+    config: Option<&raw_editor::config::Config>,
+) -> Result<PathBuf> {
     let params = sidecar::load(path)?.unwrap_or_default();
     println!(
         "params:    {}",
@@ -146,6 +175,14 @@ fn export_one(path: &Path, args: &Args, gpu: Option<&(wgpu::Device, wgpu::Queue)
 
     let out = export::batch_output_path(path, args.out_dir.as_deref(), args.format);
     export::write(&out, &rendered, args.format, args.quality, meta.as_ref())?;
+
+    if let Some(config) = config {
+        // A failed upload must not lose an export that is already on disk.
+        match raw_editor::immich::upload(config, &out) {
+            Ok(r) => println!("immich:    {}", r.describe()),
+            Err(e) => eprintln!("immich:    upload failed: {e:#}"),
+        }
+    }
     Ok(out)
 }
 

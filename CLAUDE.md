@@ -92,3 +92,20 @@ edge clamping included.
 - Detail acts on source pixels, so it cannot be judged in the fit-to-window
   view. That is why the 1:1 zoom (Z / View menu) exists — do not remove it
   without replacing it with something equivalent.
+
+## Export, metadata and Immich
+
+- `src/immich.rs` is the *only* module that makes network requests. Do not add
+  HTTP anywhere else.
+- The API key must never reach a log line, an error message or the status bar.
+  `Config`'s `Debug` is hand-written to redact it, errors name only the host,
+  and there is a test asserting the key does not leak. Keep all three.
+- Uploading is opt-in and happens after the local file is written. An upload
+  failure is reported but must never fail the export.
+- The Immich contract was taken from the running server's OpenAPI document, not
+  the public guides, which are stale (they list `deviceAssetId`/`deviceId` as
+  required; 3.1.0 does not). Re-check `/api/spec.json` before changing it.
+- `tests/immich_live.rs` only runs when `RAW_EDITOR_IMMICH_TEST_URL` is set, so
+  CI never touches the network. Its useful trick: a bogus key must yield **401**
+  rather than 400, which proves the request shape without needing a credential.
+- TIFF exports carry no EXIF on purpose — see `ExportFormat::supports_metadata`.

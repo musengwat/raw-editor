@@ -1,7 +1,9 @@
+pub mod config;
 pub mod detail;
 pub mod develop;
 pub mod export;
 pub mod gpu;
+pub mod immich;
 pub mod metadata;
 pub mod pipeline;
 pub mod sidecar;
