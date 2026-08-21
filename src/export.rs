@@ -21,6 +21,7 @@ use rayon::prelude::*;
 use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
+use crate::metadata::ExportMetadata;
 use crate::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
@@ -40,6 +41,18 @@ impl ExportFormat {
             Self::Jpeg => "jpg",
             Self::Tiff16 => "tif",
         }
+    }
+
+    /// Whether we can stamp EXIF into this format after encoding.
+    ///
+    /// JPEG takes an APP1 segment, which slots into a finished file. TIFF is
+    /// different: there the EXIF IFD *is* the file's own directory, so writing
+    /// it means rebuilding `StripOffsets` and friends around image data we did
+    /// not lay out. That is a good way to corrupt a 69 MB file for a few tags,
+    /// so TIFF exports go out without metadata for now. Encoding TIFF through
+    /// the `tiff` crate directly would fix this and let us compress as well.
+    pub fn supports_metadata(self) -> bool {
+        matches!(self, Self::Jpeg)
     }
 
     pub fn label(self) -> &'static str {
@@ -193,7 +206,28 @@ pub fn render_gpu(
 }
 
 /// Encode and write `rendered` to `path`. `quality` is only used for JPEG.
-pub fn write(path: &Path, rendered: &Rendered, format: ExportFormat, quality: u8) -> Result<()> {
+/// Write the rendered image, then stamp the camera's metadata into it.
+///
+/// Metadata failure is reported but never discards the image: the file on disk
+/// is already complete and correct at that point, and losing a full-resolution
+/// export because a tag would not encode would be a bad trade.
+pub fn write(
+    path: &Path,
+    rendered: &Rendered,
+    format: ExportFormat,
+    quality: u8,
+    meta: Option<&ExportMetadata>,
+) -> Result<()> {
+    write_image(path, rendered, format, quality)?;
+    if let Some(meta) = meta.filter(|_| format.supports_metadata()) {
+        if let Err(e) = meta.write_into(path) {
+            eprintln!("warning: {} written, but metadata failed: {e:#}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn write_image(path: &Path, rendered: &Rendered, format: ExportFormat, quality: u8) -> Result<()> {
     let (w, h) = (rendered.width as u32, rendered.height as u32);
     let file = std::fs::File::create(path)
         .with_context(|| format!("creating {}", path.display()))?;

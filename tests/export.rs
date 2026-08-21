@@ -85,12 +85,12 @@ fn writes_a_readable_jpeg_and_16_bit_tiff() {
     let rendered = export::render_cpu(&fixture(), &params());
 
     let jpg = dir.join("out.jpg");
-    export::write(&jpg, &rendered, ExportFormat::Jpeg, 90).unwrap();
+    export::write(&jpg, &rendered, ExportFormat::Jpeg, 90, None).unwrap();
     let decoded = image::open(&jpg).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (W as u32, H as u32));
 
     let tif = dir.join("out.tif");
-    export::write(&tif, &rendered, ExportFormat::Tiff16, 90).unwrap();
+    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, None).unwrap();
     let file = std::io::BufReader::new(std::fs::File::open(&tif).unwrap());
     let dec = image::codecs::tiff::TiffDecoder::new(file).unwrap();
     assert_eq!(dec.dimensions(), (W as u32, H as u32));
@@ -116,8 +116,8 @@ fn jpeg_quality_changes_the_file_size() {
 
     let lo = dir.join("lo.jpg");
     let hi = dir.join("hi.jpg");
-    export::write(&lo, &rendered, ExportFormat::Jpeg, 10).unwrap();
-    export::write(&hi, &rendered, ExportFormat::Jpeg, 98).unwrap();
+    export::write(&lo, &rendered, ExportFormat::Jpeg, 10, None).unwrap();
+    export::write(&hi, &rendered, ExportFormat::Jpeg, 98, None).unwrap();
     let (lo_len, hi_len) =
         (std::fs::metadata(&lo).unwrap().len(), std::fs::metadata(&hi).unwrap().len());
     assert!(hi_len > lo_len, "q98 ({hi_len}) should be bigger than q10 ({lo_len})");
@@ -143,6 +143,62 @@ fn sidecar_round_trip_drives_the_export() {
 
     let out = export::output_path(&raw, ExportFormat::Jpeg);
     assert_eq!(out.file_name().unwrap(), "P1320071_edit.jpg");
-    export::write(&out, &b, ExportFormat::Jpeg, 92).unwrap();
+    export::write(&out, &b, ExportFormat::Jpeg, 92, None).unwrap();
     assert!(out.exists());
+}
+
+/// Metadata must actually land in the file, and must not disturb the pixels.
+#[test]
+fn metadata_is_written_into_the_export() {
+    use raw_editor::metadata::ExportMetadata;
+
+    let dir = common::scratch_dir("metadata");
+    let rendered = export::render_cpu(&fixture(), &AdjustParams::default());
+    let meta = ExportMetadata {
+        make: Some("Panasonic".into()),
+        model: Some("DMC-G85".into()),
+        lens_model: Some("LUMIX G 14-42".into()),
+        date_time_original: Some("2026:05:02 00:53:16".into()),
+        exposure_time: Some((1, 250)),
+        fnumber: Some((4, 1)),
+        iso: Some(100),
+        orientation: Some(6),
+        ..Default::default()
+    };
+
+    let jpg = dir.join("meta.jpg");
+    export::write(&jpg, &rendered, ExportFormat::Jpeg, 92, Some(&meta)).unwrap();
+
+    // Still a valid, correctly sized JPEG after the tags went in.
+    let decoded = image::open(&jpg).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (W as u32, H as u32));
+
+    let read = little_exif::metadata::Metadata::new_from_path(&jpg).expect("read back exif");
+    let dump = read.into_iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
+    for want in ["Make", "Model", "ISO", "Orientation", "ColorSpace", "Software"] {
+        assert!(dump.contains(want), "{want} did not survive the write: {dump}");
+    }
+}
+
+/// TIFF cannot take our metadata (see `ExportFormat::supports_metadata`), and
+/// must degrade quietly rather than failing the export or emitting a warning
+/// on every single write.
+#[test]
+fn tiff_export_succeeds_without_metadata() {
+    use raw_editor::metadata::ExportMetadata;
+
+    assert!(ExportFormat::Jpeg.supports_metadata());
+    assert!(!ExportFormat::Tiff16.supports_metadata());
+
+    let dir = common::scratch_dir("tiff_meta");
+    let rendered = export::render_cpu(&fixture(), &AdjustParams::default());
+    let meta = ExportMetadata { make: Some("Panasonic".into()), ..Default::default() };
+
+    let tif = dir.join("meta.tif");
+    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, Some(&meta))
+        .expect("metadata must not fail a TIFF export");
+
+    let file = std::io::BufReader::new(std::fs::File::open(&tif).unwrap());
+    let dec = image::codecs::tiff::TiffDecoder::new(file).unwrap();
+    assert_eq!(dec.color_type(), image::ColorType::Rgb16, "TIFF still 16-bit and readable");
 }

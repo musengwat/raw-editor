@@ -119,6 +119,20 @@ RGB. Output lands next to the raw as `<stem>_edit.jpg` / `<stem>_edit.tif`, so a
 camera JPEG sitting alongside is never overwritten. `export::render_cpu` is the
 pure-Rust equivalent and is used automatically if the GPU pass fails.
 
+Exported JPEGs carry the camera's own metadata, read straight from the raw:
+make, model, lens, date, exposure time, aperture, focal length, ISO,
+orientation, artist and copyright, plus `Software = raw-editor` and
+`ColorSpace = sRGB` so viewers stop guessing at the encoding. Orientation is
+passed through deliberately — the develop stage does not rotate pixels, so the
+tag is what makes a portrait frame display upright.
+
+**TIFF exports carry no metadata.** In a TIFF the EXIF IFD *is* the file's own
+directory, so writing it means rebuilding `StripOffsets` around image data we
+did not lay out — a good way to corrupt a 69 MB file for the sake of a few tags.
+Encoding TIFF through the `tiff` crate directly would fix this and allow
+compression at the same time; until then TIFF degrades quietly and the export
+still succeeds.
+
 Because the developed image is uploaded as `rgba16float`, half-float is the
 pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16
 *significant* bits end to end.

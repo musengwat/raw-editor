@@ -56,8 +56,16 @@ fn main() -> Result<()> {
         }
     };
 
+    let meta = match raw_editor::metadata::read(&path) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!("warning: no metadata from {}: {e:#}", path.display());
+            None
+        }
+    };
+
     let out = export::output_path(&path, format);
-    export::write(&out, &rendered, format, quality)?;
+    export::write(&out, &rendered, format, quality, meta.as_ref())?;
     let bytes = std::fs::metadata(&out)?.len();
     println!("wrote:     {} ({:.1} MiB)", out.display(), bytes as f64 / (1024.0 * 1024.0));
     Ok(())

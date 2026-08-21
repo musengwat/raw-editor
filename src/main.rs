@@ -218,7 +218,7 @@ impl App {
     }
 
     fn start_export_to(&mut self, ctx: &egui::Context, out: PathBuf) {
-        let (Some(img), Some(_raw)) = (self.image.clone(), self.current.clone()) else { return };
+        let (Some(img), Some(raw)) = (self.image.clone(), self.current.clone()) else { return };
         self.flush_sidecar();
 
         let device = self.render_state.device.clone();
@@ -239,7 +239,10 @@ impl App {
                     export::render_cpu(&img, &params)
                 }
             };
-            let result = export::write(&out, &rendered, format, quality).map(|()| out);
+            // The camera's own metadata, read straight from the raw.
+            let meta = raw_editor::metadata::read(&raw).ok();
+            let result =
+                export::write(&out, &rendered, format, quality, meta.as_ref()).map(|()| out);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
