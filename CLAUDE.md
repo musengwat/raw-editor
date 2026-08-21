@@ -14,6 +14,11 @@ Read `README.md` first: architecture, phase status, and reference-camera facts
   normalize time.
 - Test RW2s are in `testdata/` (gitignored — never commit raw files).
   Update README phase checkboxes + this file when behavior changes.
+- `Uniforms` is a hand-packed `#[repr(C)]` block matched by hand to the WGSL
+  `struct Uniforms`. `vec4` members must sit on 16-byte offsets, so they go
+  first; scalars pack after. A test asserts the size and the alignments — when
+  you add a param, add it to the struct, the shader, `Uniforms::new`, `apply`,
+  and update that test.
 - Run `cargo test` before every commit; commit + push each completed phase.
 
 ## Build notes

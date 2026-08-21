@@ -7,6 +7,7 @@ use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{AdjustParams, Uniforms};
+use raw_editor::widgets::ColorWheel;
 
 fn main() -> eframe::Result {
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -101,15 +102,37 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Adjust");
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+        let mut reset = false;
         let p = &mut self.params;
-        ui.add(egui::Slider::new(&mut p.exposure_ev, -5.0..=5.0).text("Exposure (EV)"));
-        ui.add(egui::Slider::new(&mut p.contrast, -1.0..=1.0).text("Contrast"));
-        ui.add(egui::Slider::new(&mut p.temp, -1.0..=1.0).text("Temp"));
-        ui.add(egui::Slider::new(&mut p.tint, -1.0..=1.0).text("Tint"));
-        ui.add(egui::Slider::new(&mut p.saturation, -1.0..=1.0).text("Saturation"));
-        ui.add_space(8.0);
-        if ui.button("Reset").clicked() {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+
+            ui.label(egui::RichText::new("Basic").strong());
+            ui.add(egui::Slider::new(&mut p.exposure_ev, -5.0..=5.0).text("Exposure (EV)"));
+            ui.add(egui::Slider::new(&mut p.contrast, -1.0..=1.0).text("Contrast"));
+            ui.add(egui::Slider::new(&mut p.temp, -1.0..=1.0).text("Temp"));
+            ui.add(egui::Slider::new(&mut p.tint, -1.0..=1.0).text("Tint"));
+            ui.add(egui::Slider::new(&mut p.saturation, -1.0..=1.0).text("Saturation"));
+
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Tonal range").strong());
+            ui.add(egui::Slider::new(&mut p.highlights, -1.0..=1.0).text("Highlights"));
+            ui.add(egui::Slider::new(&mut p.shadows, -1.0..=1.0).text("Shadows"));
+            ui.add(egui::Slider::new(&mut p.whites, -1.0..=1.0).text("Whites"));
+            ui.add(egui::Slider::new(&mut p.blacks, -1.0..=1.0).text("Blacks"));
+
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Lift / Gamma / Gain").strong());
+            ui.horizontal(|ui| {
+                ColorWheel::new("Lift", &mut p.lift, 0.0, 0.5).show(ui);
+                ColorWheel::new("Gamma", &mut p.gamma, 1.0, 0.5).show(ui);
+                ColorWheel::new("Gain", &mut p.gain, 1.0, 0.5).show(ui);
+            });
+
+            ui.add_space(12.0);
+            reset = ui.button("Reset").clicked();
+        });
+        if reset {
             self.params = AdjustParams::default();
         }
     }
@@ -168,7 +191,7 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
         });
-        egui::Panel::right("controls").min_size(260.0).show(ui, |ui| {
+        egui::Panel::right("controls").min_size(320.0).show(ui, |ui| {
             self.side_panel(ui);
         });
         egui::CentralPanel::default().show(ui, |ui| {

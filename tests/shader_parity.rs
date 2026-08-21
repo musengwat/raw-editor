@@ -191,6 +191,7 @@ fn parity_all_controls_active() {
         temp: -0.3,
         tint: 0.2,
         saturation: 0.5,
+        ..Default::default()
     });
 }
 
@@ -202,5 +203,70 @@ fn parity_extremes() {
         temp: 1.0,
         tint: -1.0,
         saturation: -1.0,
+        ..Default::default()
+    });
+}
+
+// --- Phase 3 ------------------------------------------------------------
+
+#[test]
+fn parity_tonal_ranges() {
+    assert_parity(AdjustParams {
+        highlights: -0.7,
+        shadows: 0.6,
+        whites: 0.35,
+        blacks: -0.4,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn parity_tonal_ranges_reversed() {
+    assert_parity(AdjustParams {
+        highlights: 1.0,
+        shadows: -1.0,
+        whites: -1.0,
+        blacks: 1.0,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn parity_lift_gamma_gain() {
+    assert_parity(AdjustParams {
+        lift: [0.08, -0.05, 0.12],
+        gamma: [1.2, 0.85, 1.05],
+        gain: [1.1, 1.0, 0.9],
+        ..Default::default()
+    });
+}
+
+#[test]
+fn parity_lift_gamma_gain_extremes() {
+    assert_parity(AdjustParams {
+        lift: [-0.5, 0.5, 0.0],
+        gamma: [0.5, 1.5, 1.0],
+        gain: [1.5, 0.5, 1.25],
+        ..Default::default()
+    });
+}
+
+/// Everything at once — the case most likely to expose an ordering mismatch
+/// between `fs_main` and `pipeline::apply`.
+#[test]
+fn parity_full_chain() {
+    assert_parity(AdjustParams {
+        exposure_ev: 0.5,
+        contrast: 0.3,
+        temp: 0.25,
+        tint: -0.2,
+        saturation: 0.4,
+        highlights: -0.6,
+        shadows: 0.45,
+        whites: 0.2,
+        blacks: -0.3,
+        lift: [0.05, 0.0, -0.04],
+        gamma: [1.1, 1.0, 0.95],
+        gain: [1.05, 0.98, 1.02],
     });
 }

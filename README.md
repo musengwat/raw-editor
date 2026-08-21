@@ -27,9 +27,29 @@ export can fall back to CPU.
 - [x] Phase 0 — toolchain + decode proof (`cargo run --bin probe -- file.rw2`)
 - [x] Phase 1 — develop stage + display the photo
 - [x] Phase 2 — real-time core sliders (exposure, contrast, temp/tint, saturation)
-- [ ] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
+- [x] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
 - [ ] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
 - [ ] Phase 5 — sharpening + noise reduction (compute passes)
+
+## Controls
+
+**Basic**: exposure (EV), contrast (power curve about a 0.18 pivot), temp/tint
+(opposing channel gains), saturation (luma-preserving).
+
+**Tonal range**: highlights, shadows, whites, blacks. Each drives a smooth
+`smoothstep` mask over an approximate *display-domain* luminance
+(`clamp(luma,0,1)^(1/2.2)`), so the ranges land where the eye expects rather
+than where scene-linear values sit. Highlights/shadows/whites become one
+combined exposure multiplier; blacks is an additive lift of the floor. Sign
+convention follows Lightroom's basic panel — **positive brightens that range**,
+so negative highlights is the recovery/compression direction. Highlight
+*reconstruction* of clipped channels is explicitly out of scope.
+
+**Lift / gamma / gain**: three Resolve-style colour wheels, per channel
+`out = gain * (in + lift*(1-in))^(1/gamma)`. Each wheel is a custom egui widget
+(`src/widgets.rs`): the circular pad writes a luma-neutral chroma offset (R at
+the top, G and B 120° apart, so the three offsets sum to zero) and the value
+box under it moves all three channels together. Double-click a wheel to reset it.
 
 ## Reference camera
 
