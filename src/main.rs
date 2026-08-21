@@ -1,5 +1,9 @@
 //! raw-editor: a basic GPU-accelerated RAW editor for Panasonic RW2 files.
 
+// Release builds are a GUI app: without this Windows opens a console window
+// behind it. Debug builds keep the console so stdout/stderr stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -196,11 +200,17 @@ impl App {
 
     // --- export ----------------------------------------------------------
 
+    /// Export to the default `<stem>_edit.<ext>` next to the raw.
     fn start_export(&mut self, ctx: &egui::Context) {
-        let (Some(img), Some(raw)) = (self.image.clone(), self.current.clone()) else { return };
+        let Some(raw) = self.current.clone() else { return };
+        let out = export::output_path(&raw, self.export_format);
+        self.start_export_to(ctx, out);
+    }
+
+    fn start_export_to(&mut self, ctx: &egui::Context, out: PathBuf) {
+        let (Some(img), Some(_raw)) = (self.image.clone(), self.current.clone()) else { return };
         self.flush_sidecar();
 
-        let out = export::output_path(&raw, self.export_format);
         let device = self.render_state.device.clone();
         let queue = self.render_state.queue.clone();
         let params = self.params;
@@ -236,6 +246,68 @@ impl App {
     }
 
     // --- ui --------------------------------------------------------------
+
+    /// Ask for a raw to open. The dialog blocks the UI thread while it is up,
+    /// which is the usual arrangement for a small egui app.
+    fn pick_and_open(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new().add_filter("Panasonic raw", &["rw2", "RW2"]);
+        if let Some(dir) = self.current.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.start_load(path, ctx);
+        }
+    }
+
+    /// Ask where to write an export, defaulting to the name we would have used
+    /// automatically.
+    fn pick_and_export(&mut self, ctx: &egui::Context, format: ExportFormat) {
+        let Some(raw) = self.current.clone() else { return };
+        let suggested = export::output_path(&raw, format);
+        let mut dialog = rfd::FileDialog::new().add_filter(format.label(), &[format.extension()]);
+        if let Some(dir) = suggested.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(name) = suggested.file_name().and_then(|n| n.to_str()) {
+            dialog = dialog.set_file_name(name);
+        }
+        if let Some(out) = dialog.save_file() {
+            self.export_format = format;
+            self.start_export_to(ctx, out);
+        }
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open…").clicked() {
+                    ui.close();
+                    self.pick_and_open(&ctx);
+                }
+                ui.separator();
+                let has_image = self.image.is_some() && !self.exporting;
+                for format in [ExportFormat::Jpeg, ExportFormat::Tiff16] {
+                    let label = format!("Export as {}…", format.label());
+                    if ui.add_enabled(has_image, egui::Button::new(label)).clicked() {
+                        ui.close();
+                        self.pick_and_export(&ctx, format);
+                    }
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                let changed = !self.params.is_neutral();
+                if ui.add_enabled(changed, egui::Button::new("Reset adjustments")).clicked() {
+                    self.params = AdjustParams::default();
+                    ui.close();
+                }
+            });
+        });
+    }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Adjust");
@@ -384,6 +456,9 @@ impl eframe::App for App {
             self.start_load(path, &ctx);
         }
 
+        egui::Panel::top("menu").show(ui, |ui| {
+            self.menu_bar(ui);
+        });
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
         });

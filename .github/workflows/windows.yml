@@ -1,0 +1,49 @@
+name: windows
+
+# Builds the Windows executable on a real Windows runner and attaches a
+# portable zip to the run. Cross-compiling from Linux was avoided deliberately:
+# nothing in the dependency tree compiles C, but rustc has a known crash
+# cross-compiling egui to the windows-gnu target, and a native MSVC build is
+# the thing we actually want to ship anyway.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The GPU tests ask wgpu for an adapter and skip themselves when there is
+      # none, so this is safe on a runner without a real GPU (DX12's WARP
+      # software adapter often lets them run for real).
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/raw-editor.exe dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath raw-editor-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-editor-windows-x86_64
+          path: raw-editor-windows-x86_64.zip
+          if-no-files-found: error

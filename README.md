@@ -78,6 +78,11 @@ so negative highlights is the recovery/compression direction. Highlight
 the top, G and B 120° apart, so the three offsets sum to zero) and the value
 box under it moves all three channels together. Double-click a wheel to reset it.
 
+**Menu**: *File → Open…* picks a raw through the native file dialog, and
+*File → Export as JPEG… / 16-bit TIFF…* asks where to write it instead of
+defaulting to `<stem>_edit.<ext>` beside the raw. *Edit → Reset adjustments*
+mirrors the Reset button. Drag-and-drop still works.
+
 **Compare**: hold `B` to render the same frame with neutral params — the
 "before" view goes through the identical shader, so only the adjustments differ.
 
@@ -101,11 +106,37 @@ Because the developed image is uploaded as `rgba16float`, half-float is the
 pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16
 *significant* bits end to end.
 
+## Windows build
+
+Every push to `master` builds the executable on a Windows runner
+(`.github/workflows/windows.yml`) and attaches `raw-editor-windows-x86_64.zip`
+to the run — download it from the Actions tab, unzip, double-click. It is
+portable: no installer, no runtime to install, and wgpu picks DX12 on Windows.
+`workflow_dispatch` lets you trigger a build by hand.
+
+Cross-compiling from Linux is possible in principle — nothing in the dependency
+tree compiles C, only the pure-Rust `windows-sys` and `renderdoc-sys` bindings —
+but rustc has a known crash cross-compiling egui to `x86_64-pc-windows-gnu`, and
+a native MSVC build is what we want to ship regardless.
+
+Nothing strips the binary, so expect roughly 36 MB (about 15 MB zipped). Adding
+`strip = true` and `lto = true` under `[profile.release]` would cut that
+substantially if it ever matters.
+
 ## Reference camera
 
-Panasonic DMC-GF1: 4060×3016 sensor (4000×3000 active), GBRG Bayer, 12-bit
-(whitelevel 3986; sensor values can exceed it — clamp on normalize), D65 + StdA
-color matrices embedded. Test files live in `testdata/` (gitignored).
+Two bodies are exercised by the test files in `testdata/` (gitignored):
+
+- **DMC-GF1**: 4060×3016 sensor (4000×3000 active), GBRG Bayer, black level 0,
+  reported whitelevel 3986.
+- **DMC-G85**: 4816×3464 sensor (4592×3448 active at offset 8,8), BGGR Bayer,
+  black level 128, reported whitelevel 4095 — but see *Clipped highlights*: at
+  ISO 100 it really saturates near 2880.
+
+Both embed D65 + StdA colour matrices, and on both the deprecated `xyz_to_cam`
+field is zeroed, so `RawImage::color_matrix` is the one to read. Stray samples
+above the reported whitelevel are normal (hot pixels) and are not evidence of
+where the sensor clips.
 
 ## Running
 
