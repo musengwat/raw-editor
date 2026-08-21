@@ -30,6 +30,11 @@ export can fall back to CPU.
 - [x] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
 - [x] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
 - [ ] Phase 5 — sharpening + noise reduction (compute passes)
+- [ ] Phase 6 — Malvar-He-Cutler demosaic (replaces the current bilinear)
+
+Algorithms and coefficients for phases 5 and 6, including the transposed-filter
+trap in the MHC paper's figure, are worked out in
+[`docs/phase5-6-algorithms.md`](docs/phase5-6-algorithms.md).
 
 ## Controls
 
