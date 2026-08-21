@@ -25,8 +25,8 @@ export can fall back to CPU.
 ## Status
 
 - [x] Phase 0 — toolchain + decode proof (`cargo run --bin probe -- file.rw2`)
-- [ ] Phase 1 — develop stage + display the photo
-- [ ] Phase 2 — real-time core sliders (exposure, contrast, temp/tint, saturation)
+- [x] Phase 1 — develop stage + display the photo
+- [x] Phase 2 — real-time core sliders (exposure, contrast, temp/tint, saturation)
 - [ ] Phase 3 — highlights/shadows/whites/blacks + lift/gamma/gain wheels
 - [ ] Phase 4 — JSON sidecar persistence + JPEG/TIFF export
 - [ ] Phase 5 — sharpening + noise reduction (compute passes)
@@ -40,7 +40,11 @@ color matrices embedded. Test files live in `testdata/` (gitignored).
 ## Running
 
 ```
-cargo run --release                     # the editor GUI
-cargo run --release --bin probe -- f.rw2  # dump decode metadata
-cargo test                              # develop/pipeline math tests
+cargo run --release -- testdata/f.rw2      # the editor GUI (path optional; drag-and-drop works)
+cargo run --release --bin probe -- f.rw2   # dump decode metadata (2nd arg = write a developed PNG)
+cargo test --release                       # develop/pipeline math + headless GPU parity tests
 ```
+
+The GPU parity tests share a single wgpu device behind a `OnceLock` + `Mutex`
+(`tests/shader_parity.rs`), so they are safe under the default parallel test
+runner — no `--test-threads=1` needed.
