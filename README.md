@@ -118,8 +118,12 @@ defaults so sidecars from older builds still load.
 
 Export renders the whole image through the same WGSL shader in one offscreen
 pass into an `Rgba16Float` target, reads it back (256-byte row padding handled)
-and encodes it. JPEG takes a quality slider; TIFF is genuine 16-bit-per-channel
-RGB. Output lands next to the raw as `<stem>_edit.jpg` / `<stem>_edit.tif`, so a
+and encodes it. JPEG takes a quality slider. TIFF is genuine 16-bit-per-channel
+RGB, encoded through the `tiff` crate (not `image`, which exposes neither
+compression nor extra tags) with Deflate plus a horizontal predictor — losslessly,
+which a round-trip test pins down. The predictor matters: Deflate alone managed
+only 12% on a real frame, and storing differences between neighbouring pixels
+instead took it to 25% (68.7 → 51.5 MiB). Output lands next to the raw as `<stem>_edit.jpg` / `<stem>_edit.tif`, so a
 camera JPEG sitting alongside is never overwritten. `export::render_cpu` is the
 pure-Rust equivalent and is used automatically if the GPU pass fails.
 
@@ -130,12 +134,8 @@ orientation, artist and copyright, plus `Software = raw-editor` and
 passed through deliberately — the develop stage does not rotate pixels, so the
 tag is what makes a portrait frame display upright.
 
-**TIFF exports carry no metadata.** In a TIFF the EXIF IFD *is* the file's own
-directory, so writing it means rebuilding `StripOffsets` around image data we
-did not lay out — a good way to corrupt a 69 MB file for the sake of a few tags.
-Encoding TIFF through the `tiff` crate directly would fix this and allow
-compression at the same time; until then TIFF degrades quietly and the export
-still succeeds.
+TIFFs carry the same set, written during encoding into a real EXIF sub-IFD
+rather than bolted on afterwards.
 
 Because the developed image is uploaded as `rgba16float`, half-float is the
 pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16

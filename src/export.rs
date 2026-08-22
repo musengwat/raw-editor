@@ -43,18 +43,6 @@ impl ExportFormat {
         }
     }
 
-    /// Whether we can stamp EXIF into this format after encoding.
-    ///
-    /// JPEG takes an APP1 segment, which slots into a finished file. TIFF is
-    /// different: there the EXIF IFD *is* the file's own directory, so writing
-    /// it means rebuilding `StripOffsets` and friends around image data we did
-    /// not lay out. That is a good way to corrupt a 69 MB file for a few tags,
-    /// so TIFF exports go out without metadata for now. Encoding TIFF through
-    /// the `tiff` crate directly would fix this and let us compress as well.
-    pub fn supports_metadata(self) -> bool {
-        matches!(self, Self::Jpeg)
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Jpeg => "JPEG",
@@ -218,8 +206,10 @@ pub fn write(
     quality: u8,
     meta: Option<&ExportMetadata>,
 ) -> Result<()> {
-    write_image(path, rendered, format, quality)?;
-    if let Some(meta) = meta.filter(|_| format.supports_metadata()) {
+    write_image(path, rendered, format, quality, meta)?;
+    // JPEG takes its EXIF as an APP1 segment bolted onto the finished file;
+    // TIFF already had its tags written during encoding.
+    if let Some(meta) = meta.filter(|_| format == ExportFormat::Jpeg) {
         if let Err(e) = meta.write_into(path) {
             eprintln!("warning: {} written, but metadata failed: {e:#}", path.display());
         }
@@ -227,7 +217,13 @@ pub fn write(
     Ok(())
 }
 
-fn write_image(path: &Path, rendered: &Rendered, format: ExportFormat, quality: u8) -> Result<()> {
+fn write_image(
+    path: &Path,
+    rendered: &Rendered,
+    format: ExportFormat,
+    quality: u8,
+    meta: Option<&ExportMetadata>,
+) -> Result<()> {
     let (w, h) = (rendered.width as u32, rendered.height as u32);
     let file = std::fs::File::create(path)
         .with_context(|| format!("creating {}", path.display()))?;
@@ -240,14 +236,114 @@ fn write_image(path: &Path, rendered: &Rendered, format: ExportFormat, quality: 
             image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality.clamp(1, 100))
                 .write_image(&bytes, w, h, image::ExtendedColorType::Rgb8)
         }
-        ExportFormat::Tiff16 => image::codecs::tiff::TiffEncoder::new(writer).write_image(
-            bytemuck::cast_slice(&rendered.data),
-            w,
-            h,
-            image::ExtendedColorType::Rgb16,
-        ),
+        ExportFormat::Tiff16 => {
+            // Encoded through the `tiff` crate rather than `image`, which
+            // exposes neither compression nor extra tags. Metadata is written
+            // during encoding here, not bolted on afterwards.
+            return write_tiff(path, rendered, meta);
+        }
     }
     .with_context(|| format!("encoding {}", path.display()))?;
+    Ok(())
+}
+
+/// Deflate: on 16-bit photographic data it beats LZW comfortably and every
+/// TIFF reader worth the name handles it. Balanced level — Best buys a couple
+/// of percent for a lot of time on a 70 MB image.
+const TIFF_COMPRESSION: tiff::encoder::Compression =
+    tiff::encoder::Compression::Deflate(tiff::encoder::DeflateLevel::Balanced);
+
+/// Horizontal differencing before compression. Continuous-tone images have
+/// small differences between neighbouring pixels, so storing those differences
+/// gives the compressor far more to work with — worth roughly another 20% on
+/// top of plain Deflate here, and the reason a compressed TIFF is worth having
+/// at all.
+const TIFF_PREDICTOR: tiff::tags::Predictor = tiff::tags::Predictor::Horizontal;
+
+/// Write a compressed 16-bit TIFF, with the camera metadata in a proper EXIF
+/// sub-IFD.
+///
+/// The EXIF directory has to be written *before* the image directory, because
+/// the image IFD stores a pointer to it and we can only know the offset once
+/// the sub-directory is on disk.
+fn write_tiff(path: &Path, rendered: &Rendered, meta: Option<&ExportMetadata>) -> Result<()> {
+    use tiff::encoder::{Rational, TiffEncoder, colortype};
+    use tiff::tags::Tag;
+
+    let (w, h) = (rendered.width as u32, rendered.height as u32);
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    let mut enc = TiffEncoder::new(std::io::BufWriter::new(file))
+        .with_context(|| format!("starting {}", path.display()))?
+        .with_compression(TIFF_COMPRESSION)
+        .with_predictor(TIFF_PREDICTOR);
+
+    let rat = |(n, d): (u32, u32)| Rational { n, d };
+
+    // 1. The EXIF sub-directory, if we have anything to put in it.
+    let mut exif_offset = None;
+    if let Some(m) = meta {
+        let mut dir = enc.extra_directory().context("starting the EXIF directory")?;
+        if let Some(v) = m.exposure_time {
+            dir.write_tag(Tag::Unknown(0x829a), rat(v))?;
+        }
+        if let Some(v) = m.fnumber {
+            dir.write_tag(Tag::Unknown(0x829d), rat(v))?;
+        }
+        if let Some(v) = m.iso {
+            dir.write_tag(Tag::Unknown(0x8827), v)?;
+        }
+        if let Some(v) = &m.date_time_original {
+            dir.write_tag(Tag::Unknown(0x9003), v.as_str())?;
+        }
+        if let Some(v) = m.focal_length {
+            dir.write_tag(Tag::Unknown(0x920a), rat(v))?;
+        }
+        if let Some(v) = &m.lens_make {
+            dir.write_tag(Tag::Unknown(0xa433), v.as_str())?;
+        }
+        if let Some(v) = &m.lens_model {
+            dir.write_tag(Tag::Unknown(0xa434), v.as_str())?;
+        }
+        // sRGB, so viewers stop guessing.
+        dir.write_tag(Tag::Unknown(0xa001), 1u16)?;
+        exif_offset = Some(dir.finish_with_offsets().context("writing the EXIF directory")?);
+    }
+
+    // 2. The image itself, with the baseline tags and a pointer to the above.
+    let mut image = enc
+        .new_image::<colortype::RGB16>(w, h)
+        .with_context(|| format!("encoding {}", path.display()))?;
+    {
+        let dir = image.encoder();
+        if let Some(m) = meta {
+            if let Some(v) = &m.make {
+                dir.write_tag(Tag::Make, v.as_str())?;
+            }
+            if let Some(v) = &m.model {
+                dir.write_tag(Tag::Model, v.as_str())?;
+            }
+            if let Some(v) = m.orientation {
+                dir.write_tag(Tag::Orientation, v)?;
+            }
+            if let Some(v) = &m.date_time_original {
+                dir.write_tag(Tag::Unknown(0x0132), v.as_str())?;
+            }
+            if let Some(v) = &m.artist {
+                dir.write_tag(Tag::Artist, v.as_str())?;
+            }
+            if let Some(v) = &m.copyright {
+                dir.write_tag(Tag::Copyright, v.as_str())?;
+            }
+        }
+        dir.write_tag(Tag::Software, "raw-editor")?;
+        if let Some(off) = &exif_offset {
+            dir.write_tag(Tag::ExifDirectory, off.offset)?;
+        }
+    }
+    image
+        .write_data(&rendered.data)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

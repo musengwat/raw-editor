@@ -108,4 +108,9 @@ edge clamping included.
 - `tests/immich_live.rs` only runs when `RAW_EDITOR_IMMICH_TEST_URL` is set, so
   CI never touches the network. Its useful trick: a bogus key must yield **401**
   rather than 400, which proves the request shape without needing a credential.
-- TIFF exports carry no EXIF on purpose — see `ExportFormat::supports_metadata`.
+- TIFF is encoded by `export::write_tiff` through the `tiff` crate, not `image`.
+  Metadata goes in during encoding: baseline tags in the image IFD, the rest in
+  an EXIF sub-IFD written *first* (the image IFD stores a pointer, so the offset
+  has to exist already). Compression is Deflate + horizontal predictor and must
+  stay lossless — `compressed_tiff_round_trips_exactly` asserts sample-exact
+  equality, so do not swap in anything lossy.

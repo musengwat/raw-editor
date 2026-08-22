@@ -99,8 +99,6 @@ fn writes_a_readable_jpeg_and_16_bit_tiff() {
         image::ColorType::Rgb16,
         "the TIFF must really be 16 bits per channel"
     );
-    // 3 channels x 2 bytes per sample, uncompressed.
-    assert!(std::fs::metadata(&tif).unwrap().len() as usize >= W * H * 6);
 }
 
 #[test]
@@ -180,25 +178,85 @@ fn metadata_is_written_into_the_export() {
     }
 }
 
-/// TIFF cannot take our metadata (see `ExportFormat::supports_metadata`), and
-/// must degrade quietly rather than failing the export or emitting a warning
-/// on every single write.
+/// TIFF compression must be lossless: every sample has to survive the
+/// Deflate + horizontal-predictor round trip untouched. A silent corruption
+/// here would be invisible until someone opened a 16-bit file months later.
 #[test]
-fn tiff_export_succeeds_without_metadata() {
-    use raw_editor::metadata::ExportMetadata;
+fn compressed_tiff_round_trips_exactly() {
+    let dir = common::scratch_dir("tiff_lossless");
+    let rendered = export::render_cpu(&fixture(), &params());
 
-    assert!(ExportFormat::Jpeg.supports_metadata());
-    assert!(!ExportFormat::Tiff16.supports_metadata());
-
-    let dir = common::scratch_dir("tiff_meta");
-    let rendered = export::render_cpu(&fixture(), &AdjustParams::default());
-    let meta = ExportMetadata { make: Some("Panasonic".into()), ..Default::default() };
-
-    let tif = dir.join("meta.tif");
-    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, Some(&meta))
-        .expect("metadata must not fail a TIFF export");
+    let tif = dir.join("lossless.tif");
+    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, None).unwrap();
 
     let file = std::io::BufReader::new(std::fs::File::open(&tif).unwrap());
-    let dec = image::codecs::tiff::TiffDecoder::new(file).unwrap();
-    assert_eq!(dec.color_type(), image::ColorType::Rgb16, "TIFF still 16-bit and readable");
+    let mut dec = tiff::decoder::Decoder::new(file).unwrap();
+    let img = dec.read_image().unwrap();
+    let tiff::decoder::DecodingResult::U16(samples) = img else {
+        panic!("expected 16-bit samples back");
+    };
+    assert_eq!(samples.len(), rendered.data.len(), "sample count changed");
+    assert_eq!(samples, rendered.data, "compression was not lossless");
+}
+
+/// ...and compression has to actually be doing something.
+#[test]
+fn compressed_tiff_is_smaller_than_raw_samples() {
+    let dir = common::scratch_dir("tiff_size");
+    // A smooth gradient, which is what the horizontal predictor is for.
+    let (w, h) = (256usize, 64usize);
+    let mut data = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let v = x as f32 / w as f32;
+            data.extend_from_slice(&[v, v * 0.8, v * 0.6]);
+        }
+    }
+    let img = DevelopedImage { width: w, height: h, data };
+    let rendered = export::render_cpu(&img, &AdjustParams::default());
+
+    let tif = dir.join("gradient.tif");
+    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, None).unwrap();
+
+    let uncompressed = (w * h * 6) as u64;
+    let actual = std::fs::metadata(&tif).unwrap().len();
+    assert!(
+        actual < uncompressed / 2,
+        "expected real compression: {actual} vs {uncompressed} raw"
+    );
+}
+
+/// Metadata now goes into the TIFF during encoding, in a real EXIF sub-IFD.
+#[test]
+fn tiff_carries_metadata() {
+    use raw_editor::metadata::ExportMetadata;
+
+    let dir = common::scratch_dir("tiff_meta2");
+    let rendered = export::render_cpu(&fixture(), &AdjustParams::default());
+    let meta = ExportMetadata {
+        make: Some("Panasonic".into()),
+        model: Some("DMC-G85".into()),
+        iso: Some(400),
+        exposure_time: Some((1, 250)),
+        orientation: Some(6),
+        ..Default::default()
+    };
+
+    let tif = dir.join("meta.tif");
+    export::write(&tif, &rendered, ExportFormat::Tiff16, 90, Some(&meta)).unwrap();
+
+    let file = std::io::BufReader::new(std::fs::File::open(&tif).unwrap());
+    let mut dec = tiff::decoder::Decoder::new(file).unwrap();
+    use tiff::tags::Tag;
+    assert_eq!(dec.get_tag_ascii_string(Tag::Make).unwrap(), "Panasonic");
+    assert_eq!(dec.get_tag_ascii_string(Tag::Model).unwrap(), "DMC-G85");
+    assert_eq!(dec.get_tag_ascii_string(Tag::Software).unwrap(), "raw-editor");
+    assert_eq!(dec.get_tag_u32(Tag::Orientation).unwrap(), 6);
+    // The EXIF sub-IFD must exist and be pointed at.
+    assert!(dec.get_tag_u32(Tag::ExifDirectory).unwrap() > 0, "no EXIF IFD pointer");
+
+    // ...and the image data must still decode after all that.
+    let img = dec.read_image().unwrap();
+    let tiff::decoder::DecodingResult::U16(samples) = img else { panic!("not 16-bit") };
+    assert_eq!(samples, rendered.data, "metadata disturbed the pixels");
 }
