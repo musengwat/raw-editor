@@ -59,6 +59,17 @@ what it decides per colour.
 - [x] Phase 5 — sharpening + noise reduction
 - [ ] Phase 6 — Malvar-He-Cutler demosaic (replaces the current bilinear)
 
+Infrared (the GF1 is now a full-spectrum conversion):
+
+- [x] IR-1 — white balance + matrix moved into the shader; eyedropper and
+  0.1–10× gains; Camera / Sensor RGB mode; RGB histogram, clip readout and
+  clipping overlay
+- [ ] IR-2 — 3×3 channel mixer + looks (Aerochrome classic / pink, red–blue
+  swap, IR mono); needs daylight shots through the IR Chrome filter to tune
+- [ ] IR-3 — saved looks; the converted body opens in IR mode automatically
+  (EXIF serial)
+- [ ] IR-4 — hot-spot correction (radial, then per-lens flat field)
+
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
 [`docs/phase5-6-algorithms.md`](docs/phase5-6-algorithms.md).
