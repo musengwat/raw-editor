@@ -65,6 +65,18 @@ trap in the MHC paper's figure, are worked out in
 
 ## Controls
 
+**Colour**: white balance and how camera RGB becomes working RGB — built for
+the infrared-converted GF1, useful on any file.
+*Pick neutral* (or **W**) arms an eyedropper: click something that should be
+neutral (foliage in IR, a white wall, a grey card) and it sets the gains that
+make that 9×9-pixel spot neutral, ignoring clipped pixels; Esc cancels.
+*Red gain* / *Blue gain* set the gains directly on a log scale from 0.1× to 10×
+(a camera's own white balance never takes red below 1×, which an IR frame
+under warm light needs). *As shot* returns to the camera's white balance.
+*Camera* mode applies the file's camera→sRGB matrix; *Sensor RGB* skips it,
+because a matrix calibrated for visible light scrambles hues once the sensor
+sees infrared. Temp and tint still apply on top as fine trims.
+
 **Basic**: exposure (EV), contrast (power curve about a 0.18 pivot), temp/tint
 (opposing channel gains), saturation (luma-preserving).
 

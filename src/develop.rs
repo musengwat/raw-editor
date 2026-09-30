@@ -11,7 +11,38 @@ use rawler::imgop::xyz::Illuminant;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
 
-use crate::pipeline::{Colour, ImageColour, to_working};
+use crate::pipeline::{Colour, ImageColour, WB_GAIN_MAX, WB_GAIN_MIN, to_working};
+
+/// Half-width of the eyedropper's averaging window (9x9 pixels), so one noisy
+/// pixel cannot set the white balance.
+pub const PICK_RADIUS: usize = 4;
+
+/// Why the eyedropper could not produce a white balance.
+#[derive(Debug, PartialEq)]
+pub enum PickError {
+    /// Every pixel in the window is clipped, so its colour is unknown.
+    AllClipped,
+    /// A channel is essentially black; no gain can make that neutral.
+    TooDark,
+}
+
+impl std::fmt::Display for PickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AllClipped => "that spot is blown out — pick something neutral that isn't clipped",
+            Self::TooDark => "that spot is too dark to judge — pick something brighter",
+        })
+    }
+}
+
+/// Result of a successful pick.
+#[derive(Debug, PartialEq)]
+pub struct Pick {
+    /// `[r, 1, b]`, within `WB_GAIN_MIN..=WB_GAIN_MAX`.
+    pub gains: [f32; 3],
+    /// True when the ideal gains fell outside the allowed range.
+    pub clamped: bool,
+}
 
 /// Developed image: tightly packed RGB f32, active-area size.
 pub struct DevelopedImage {
@@ -30,6 +61,39 @@ impl DevelopedImage {
     /// An image whose data is already linear sRGB (tests, synthetic input).
     pub fn linear_srgb(width: usize, height: usize, data: Vec<f32>) -> Self {
         Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB }
+    }
+
+    /// Eyedropper: white-balance gains that make the area around `(x, y)`
+    /// neutral. Averages camera RGB over a `PICK_RADIUS` window, skipping
+    /// clipped pixels (their ratios are meaningless). Neutral camera RGB stays
+    /// neutral through the matrix (its rows sum to 1), so the same gains work
+    /// in both colour modes.
+    pub fn neutral_gains(&self, x: usize, y: usize) -> Result<Pick, PickError> {
+        let r = PICK_RADIUS;
+        let mut sum = [0f64; 3];
+        let mut n = 0u32;
+        for py in y.saturating_sub(r)..(y + r + 1).min(self.height) {
+            for px in x.saturating_sub(r)..(x + r + 1).min(self.width) {
+                let i = py * self.width + px;
+                if self.clip_at(i) > 0.0 {
+                    continue;
+                }
+                for c in 0..3 {
+                    sum[c] += self.data[i * 3 + c] as f64;
+                }
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Err(PickError::AllClipped);
+        }
+        let mean = sum.map(|v| (v / n as f64) as f32);
+        if mean.iter().any(|&v| v < 1e-4) {
+            return Err(PickError::TooDark);
+        }
+        let ideal = [mean[1] / mean[0], 1.0, mean[1] / mean[2]];
+        let gains = ideal.map(|g| g.clamp(WB_GAIN_MIN, WB_GAIN_MAX));
+        Ok(Pick { gains, clamped: gains != ideal })
     }
 
     pub fn clip_at(&self, i: usize) -> f32 {
@@ -497,4 +561,67 @@ mod tests {
         let m = [[1.0f32, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 1.0, 0.0]];
         assert!(mat_inv(&m).is_none());
     }
+
+    // --- eyedropper -------------------------------------------------------
+
+    fn flat(w: usize, h: usize, rgb: [f32; 3]) -> DevelopedImage {
+        DevelopedImage::linear_srgb(w, h, (0..w * h).flat_map(|_| rgb).collect())
+    }
+
+    #[test]
+    fn eyedropper_gains_make_the_spot_neutral() {
+        // IR-ish camera RGB: red above green, blue far below.
+        let img = flat(20, 20, [0.30, 0.25, 0.11]);
+        let pick = img.neutral_gains(10, 10).unwrap();
+        assert!(!pick.clamped);
+        let col = Colour { wb: pick.gains, matrix: crate::pipeline::IDENTITY3 };
+        let out = to_working(&col, [0.30, 0.25, 0.11], 0.0);
+        for v in out {
+            assert!((v - 0.25).abs() < 1e-5, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn eyedropper_ignores_clipped_pixels() {
+        let mut img = flat(20, 20, [0.2, 0.4, 0.1]);
+        // A blown, wrongly-coloured blob covering most of the window.
+        for y in 6..14 {
+            for x in 6..14 {
+                let i = y * 20 + x;
+                img.data[i * 3..i * 3 + 3].copy_from_slice(&[0.9, 0.5, 0.9]);
+            }
+        }
+        img.clip = (0..400)
+            .map(|i| if (6..14).contains(&(i % 20)) && (6..14).contains(&(i / 20)) { 1.0 } else { 0.0 })
+            .collect();
+        let pick = img.neutral_gains(10, 10).unwrap();
+        assert!((pick.gains[0] - 2.0).abs() < 1e-5 && (pick.gains[2] - 4.0).abs() < 1e-5, "{pick:?}");
+    }
+
+    #[test]
+    fn eyedropper_refuses_all_clipped_or_black() {
+        let mut img = flat(10, 10, [0.9, 0.9, 0.9]);
+        img.clip = vec![1.0; 100];
+        assert_eq!(img.neutral_gains(5, 5), Err(PickError::AllClipped));
+        assert_eq!(flat(10, 10, [0.2, 0.2, 0.0]).neutral_gains(5, 5), Err(PickError::TooDark));
+    }
+
+    #[test]
+    fn eyedropper_clamps_to_the_slider_range_and_says_so() {
+        let pick = flat(10, 10, [0.5, 0.5, 0.01]).neutral_gains(0, 0).unwrap();
+        assert!(pick.clamped);
+        assert_eq!(pick.gains, [1.0, 1.0, WB_GAIN_MAX]);
+    }
+
+    #[test]
+    fn eyedropper_window_is_clipped_at_the_image_edge() {
+        let mut img = flat(12, 12, [0.2, 0.2, 0.2]);
+        // Only the corner window's pixels should count.
+        img.data[0..3].copy_from_slice(&[0.1, 0.2, 0.4]);
+        let far = img.neutral_gains(11, 11).unwrap();
+        assert_eq!(far.gains, [1.0, 1.0, 1.0]);
+        let corner = img.neutral_gains(0, 0).unwrap();
+        assert!(corner.gains[0] > 1.0 && corner.gains[2] < 1.0, "{corner:?}");
+    }
 }
+

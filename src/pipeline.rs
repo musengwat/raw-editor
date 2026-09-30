@@ -27,6 +27,25 @@ const BLACKS_LIFT: f32 = 0.05;
 /// Smallest gamma we will divide by, to keep `pow` finite.
 pub const MIN_GAMMA: f32 = 0.01;
 
+/// Smallest and largest white-balance gain the controls and the eyedropper
+/// allow. Far wider than any visible-light camera needs: an infrared
+/// conversion under warm light wants red well below 1 and blue several times
+/// green.
+pub const WB_GAIN_MIN: f32 = 0.1;
+pub const WB_GAIN_MAX: f32 = 10.0;
+
+/// How camera RGB becomes working RGB after white balance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColourMode {
+    /// The file's own camera→sRGB matrix — right for visible light.
+    #[default]
+    Camera,
+    /// No matrix: white-balanced sensor RGB straight through. For infrared,
+    /// where the camera matrix (calibrated for visible light) scrambles hues.
+    SensorRgb,
+}
+
 /// User-facing adjustment parameters. Serialized to the `.edit.json` sidecar.
 ///
 /// Sign convention for the tonal-range controls follows Lightroom's basic
@@ -37,6 +56,9 @@ pub const MIN_GAMMA: f32 = 0.01;
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdjustParams {
+    /// Custom white-balance gains `[r, g, b]`, green = 1. `None` = as shot.
+    pub wb_gains: Option<[f32; 3]>,
+    pub colour_mode: ColourMode,
     /// Exposure in EV stops (gain = 2^ev).
     pub exposure_ev: f32,
     /// -1..1, pivot-based power curve in linear space.
@@ -88,6 +110,8 @@ pub const NR_RANGE: f32 = 0.08;
 impl Default for AdjustParams {
     fn default() -> Self {
         Self {
+            wb_gains: None,
+            colour_mode: ColourMode::Camera,
             exposure_ev: 0.0,
             contrast: 0.0,
             temp: 0.0,
@@ -146,8 +170,14 @@ pub struct Colour {
 }
 
 impl Colour {
-    pub fn resolve(img: &ImageColour, _p: &AdjustParams) -> Self {
-        Self { wb: img.as_shot_wb, matrix: img.cam_to_srgb }
+    pub fn resolve(img: &ImageColour, p: &AdjustParams) -> Self {
+        Self {
+            wb: p.wb_gains.unwrap_or(img.as_shot_wb),
+            matrix: match p.colour_mode {
+                ColourMode::Camera => img.cam_to_srgb,
+                ColourMode::SensorRgb => IDENTITY3,
+            },
+        }
     }
 }
 
@@ -232,6 +262,21 @@ pub struct View {
 }
 
 impl View {
+    /// The source pixel under a viewport position given in NDC (x right, y
+    /// up, both -1..1), or `None` off the image. Inverse of the quad placement
+    /// in `vs_main`.
+    pub fn image_pixel(&self, ndc: [f32; 2], size: [usize; 2]) -> Option<[usize; 2]> {
+        let cx = (ndc[0] - self.offset[0]) / self.scale[0];
+        let cy = (ndc[1] - self.offset[1]) / self.scale[1];
+        if !(-1.0..=1.0).contains(&cx) || !(-1.0..=1.0).contains(&cy) {
+            return None;
+        }
+        let (u, v) = (cx * 0.5 + 0.5, 0.5 - cy * 0.5);
+        let px = ((u * size[0] as f32) as usize).min(size[0] - 1);
+        let py = ((v * size[1] as f32) as usize).min(size[1] - 1);
+        Some([px, py])
+    }
+
     /// Aspect-fitted, unpanned.
     pub fn fit(scale: [f32; 2], texel: [f32; 2]) -> Self {
         Self { scale, offset: [0.0, 0.0], texel }
@@ -591,4 +636,57 @@ mod tests {
         let out = to_working(&col, [0.2, 0.6, 1.0], 0.5);
         assert!(close(out, [0.6, 0.8, 1.0]), "{out:?}");
     }
+
+    #[test]
+    fn sensor_rgb_mode_drops_the_matrix_and_custom_wb_overrides_as_shot() {
+        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM };
+        let def = Colour::resolve(&img, &AdjustParams::default());
+        assert_eq!(def, Colour { wb: [2.0, 1.0, 1.5], matrix: CAM });
+        let p = AdjustParams {
+            wb_gains: Some([0.7, 1.0, 3.2]),
+            colour_mode: ColourMode::SensorRgb,
+            ..Default::default()
+        };
+        assert_eq!(Colour::resolve(&img, &p), Colour { wb: [0.7, 1.0, 3.2], matrix: IDENTITY3 });
+    }
+
+    #[test]
+    fn sidecars_from_before_ir1_load_as_as_shot_camera_mode() {
+        let old = r#"{"exposure_ev":0.5,"contrast":0.1}"#;
+        let p: AdjustParams = serde_json::from_str(old).unwrap();
+        assert_eq!(p.wb_gains, None);
+        assert_eq!(p.colour_mode, ColourMode::Camera);
+        assert_eq!(p.exposure_ev, 0.5);
+    }
+
+    #[test]
+    fn colour_settings_round_trip_through_json() {
+        let p = AdjustParams {
+            wb_gains: Some([0.62, 1.0, 2.4]),
+            colour_mode: ColourMode::SensorRgb,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"sensor_rgb\""), "{json}");
+        assert_eq!(serde_json::from_str::<AdjustParams>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn image_pixel_inverts_the_quad_placement() {
+        let size = [400, 300];
+        // Fit view, quad fills the viewport: corners and centre.
+        let v = View::fit([1.0, 1.0], [1.0 / 400.0, 1.0 / 300.0]);
+        assert_eq!(v.image_pixel([-1.0, 1.0], size), Some([0, 0]));
+        assert_eq!(v.image_pixel([1.0, -1.0], size), Some([399, 299]));
+        assert_eq!(v.image_pixel([0.0, 0.0], size), Some([200, 150]));
+        // Letterboxed: the band above the image is off it.
+        let v = View::fit([1.0, 0.5], [1.0 / 400.0, 1.0 / 300.0]);
+        assert_eq!(v.image_pixel([0.0, 0.75], size), None);
+        assert_eq!(v.image_pixel([0.0, 0.5], size), Some([200, 0]));
+        // Zoomed 2x and panned right by half the viewport: the viewport
+        // centre now shows the image point a quarter of the way in.
+        let v = View { scale: [2.0, 2.0], offset: [1.0, 0.0], texel: [0.0; 2] };
+        assert_eq!(v.image_pixel([0.0, 0.0], size), Some([100, 150]));
+    }
 }
+

@@ -77,6 +77,8 @@ mod tests {
         assert!(load(&raw).unwrap().is_none(), "no sidecar yet");
 
         let params = AdjustParams {
+            wb_gains: Some([0.64, 1.0, 2.35]),
+            colour_mode: crate::pipeline::ColourMode::SensorRgb,
             exposure_ev: 1.25,
             contrast: -0.4,
             temp: 0.3,

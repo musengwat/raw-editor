@@ -93,6 +93,14 @@ sRGB exactly as before. `DevelopedImage::linear_srgb` builds an identity-colour
 image for synthetic tests. Reason: an infrared-converted GF1 needs white
 balance far outside the camera's range and often no camera matrix at all.
 
+`AdjustParams.wb_gains` (`None` = as shot) and `colour_mode` are
+`#[serde(default)]`, so old sidecars load unchanged; an older binary reading a
+new sidecar silently ignores them (serde skips unknown fields) — remember that
+when a test export "ignores" a WB edit: rebuild **all** bins (`--bins`), not
+just the GUI. Eyedropper = `DevelopedImage::neutral_gains`; screen→pixel =
+`View::image_pixel`. Single-key shortcuts go through `shortcut()` in main.rs so
+they don't fire while a text field has focus.
+
 Precision note: moving the matrix after the f16 texture means strongly
 out-of-gamut colours (one channel pinned, one near zero) can differ from the
 old baked path by 1–2 8-bit levels in the near-zero channel — the matrix's big

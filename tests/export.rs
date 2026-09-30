@@ -51,6 +51,7 @@ fn params() -> AdjustParams {
         sharpen_threshold: 0.003,
         nr_luma: 0.5,
         nr_chroma: 0.6,
+        ..Default::default()
     }
 }
 

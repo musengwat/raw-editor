@@ -13,7 +13,7 @@ use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
-use raw_editor::pipeline::{AdjustParams, ImageColour, Uniforms};
+use raw_editor::pipeline::{AdjustParams, ColourMode, ImageColour, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN};
 use raw_editor::config::Config;
 use raw_editor::immich;
 use raw_editor::sidecar;
@@ -23,6 +23,15 @@ use raw_editor::widgets::ColorWheel;
 const COMPARE_KEY: egui::Key = egui::Key::B;
 /// Toggles between fit-to-window and 1:1.
 const ZOOM_KEY: egui::Key = egui::Key::Z;
+/// Arms the white-balance eyedropper; the next click on the image picks.
+const PICK_WB_KEY: egui::Key = egui::Key::W;
+
+/// Single-key shortcuts must not fire while the user is typing into a text
+/// field (the Immich settings, say).
+fn shortcut(ctx: &egui::Context, key: egui::Key, held: bool) -> bool {
+    !ctx.egui_wants_keyboard_input()
+        && ctx.input(|i| if held { i.key_down(key) } else { i.key_pressed(key) })
+}
 /// How long the params must sit still before the sidecar is written.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 
@@ -81,6 +90,9 @@ struct App {
     zoom_100: bool,
     /// Pan offset in NDC, only meaningful while zoomed.
     pan: [f32; 2],
+    /// The white-balance eyedropper is armed: the next click on the image
+    /// sets white balance from that spot.
+    picking_wb: bool,
 
     config: Config,
     show_settings: bool,
@@ -122,6 +134,7 @@ impl App {
             jpeg_quality: 92,
             zoom_100: false,
             pan: [0.0, 0.0],
+            picking_wb: false,
             config: Config::load().unwrap_or_else(|e| {
                 eprintln!("config: {e:#} — starting with defaults");
                 Config::default()
@@ -530,10 +543,42 @@ impl App {
         let mut do_export = false;
         let has_image = self.image.is_some();
         let exporting = self.exporting;
+        let as_shot = self.image.as_ref().map_or([1.0; 3], |img| img.colour.as_shot_wb);
         let (export_format, jpeg_quality) = (&mut self.export_format, &mut self.jpeg_quality);
+        let picking_wb = &mut self.picking_wb;
         let p = &mut self.params;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new("Colour").strong());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut p.colour_mode, ColourMode::Camera, "Camera")
+                    .on_hover_text("The camera's colour matrix — right for visible light");
+                ui.selectable_value(&mut p.colour_mode, ColourMode::SensorRgb, "Sensor RGB")
+                    .on_hover_text("No colour matrix — for infrared, where the camera's matrix scrambles hues");
+            });
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(has_image, |ui| {
+                    ui.toggle_value(picking_wb, format!("Pick neutral ({})", PICK_WB_KEY.name()))
+                        .on_hover_text("Then click something that should be neutral: foliage in IR, a wall, a grey card");
+                });
+                if ui.add_enabled(p.wb_gains.is_some(), egui::Button::new("As shot")).clicked() {
+                    p.wb_gains = None;
+                }
+                ui.label(if p.wb_gains.is_some() { "custom" } else { "as shot" });
+            });
+            // The sliders show the as-shot gains until one is moved.
+            let mut g = p.wb_gains.unwrap_or(as_shot);
+            let r = ui.add(
+                egui::Slider::new(&mut g[0], WB_GAIN_MIN..=WB_GAIN_MAX).logarithmic(true).text("Red gain"),
+            );
+            let b = ui.add(
+                egui::Slider::new(&mut g[2], WB_GAIN_MIN..=WB_GAIN_MAX).logarithmic(true).text("Blue gain"),
+            );
+            if r.changed() || b.changed() {
+                p.wb_gains = Some(g);
+            }
+
+            ui.add_space(10.0);
             ui.label(egui::RichText::new("Basic").strong());
             ui.add(egui::Slider::new(&mut p.exposure_ev, -5.0..=5.0).text("Exposure (EV)"));
             ui.add(egui::Slider::new(&mut p.contrast, -1.0..=1.0).text("Contrast"));
@@ -626,6 +671,66 @@ impl App {
         }
     }
 
+    /// Eyedropper armed: crosshair over the image, a hint badge, and on click
+    /// the white balance that makes that spot neutral. Esc disarms.
+    fn handle_wb_pick(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        view: raw_editor::pipeline::View,
+        size: [usize; 2],
+    ) {
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.picking_wb = false;
+            return;
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let hint = "Click something neutral  ·  Esc cancels";
+        let badge = egui::Rect::from_min_size(
+            rect.center_top() + egui::vec2(-150.0, 12.0),
+            egui::vec2(300.0, 24.0),
+        );
+        ui.painter().rect_filled(badge, 4.0, egui::Color32::from_black_alpha(180));
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            hint,
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+
+        if !response.clicked() {
+            return;
+        }
+        let (Some(pos), Some(img)) = (response.interact_pointer_pos(), self.image.clone()) else {
+            return;
+        };
+        let ndc = [
+            (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
+            1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
+        ];
+        let Some([x, y]) = view.image_pixel(ndc, size) else {
+            self.status = "Missed the image — click on the photo".into();
+            return;
+        };
+        match img.neutral_gains(x, y) {
+            Ok(pick) => {
+                self.params.wb_gains = Some(pick.gains);
+                self.picking_wb = false;
+                let [r, _, b] = pick.gains;
+                self.status = format!(
+                    "White balance from ({x}, {y}): red ×{r:.2}, blue ×{b:.2}{}",
+                    if pick.clamped { " — limited to the slider range" } else { "" }
+                );
+            }
+            // Stay armed so the user can simply click somewhere better.
+            Err(e) => self.status = format!("Can't pick there: {e}"),
+        }
+    }
+
     fn image_panel(&mut self, ui: &mut egui::Ui) {
         let (image_size, target_is_srgb) = {
             let renderer = self.render_state.renderer.read();
@@ -636,7 +741,7 @@ impl App {
         };
 
         let avail = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::drag());
+        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let Some([iw, ih]) = image_size else {
             ui.painter().text(
                 rect.center(),
@@ -685,7 +790,7 @@ impl App {
 
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
-        let comparing = ui.ctx().input(|i| i.key_down(COMPARE_KEY));
+        let comparing = shortcut(ui.ctx(), COMPARE_KEY, true);
         let colour = self.image.as_ref().map_or(ImageColour::LINEAR_SRGB, |img| img.colour);
         let uniforms = if comparing {
             Uniforms::passthrough(&colour, view, target_is_srgb)
@@ -695,6 +800,10 @@ impl App {
 
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
+
+        if self.picking_wb {
+            self.handle_wb_pick(ui, rect, &response, view, [iw, ih]);
+        }
 
         if comparing {
             let badge = egui::Rect::from_min_size(
@@ -720,7 +829,10 @@ impl eframe::App for App {
         self.poll_export();
 
         // Z flips between fit and 1:1.
-        if ui.ctx().input(|i| i.key_pressed(ZOOM_KEY)) {
+        if shortcut(ui.ctx(), PICK_WB_KEY, false) && self.image.is_some() {
+            self.picking_wb = !self.picking_wb;
+        }
+        if shortcut(ui.ctx(), ZOOM_KEY, false) {
             self.zoom_100 = !self.zoom_100;
         }
 
