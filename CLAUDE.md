@@ -101,6 +101,12 @@ just the GUI. Eyedropper = `DevelopedImage::neutral_gains`; screen→pixel =
 `View::image_pixel`. Single-key shortcuts go through `shortcut()` in main.rs so
 they don't fire while a text field has focus.
 
+Histogram (`src/histogram.rs`) runs `to_working` → `apply` on a point-sampled
+`downsample` (long side 512, ~4.5 ms per update on this box) and is recomputed
+only when params change. The clipping overlay is `Uniforms.show_clip` +
+`pipeline::clip_view` (shader twin in `fs_main`); it is a view setting, not an
+`AdjustParams` field, so it is never saved or exported.
+
 Precision note: moving the matrix after the f16 texture means strongly
 out-of-gamut colours (one channel pinned, one near zero) can differ from the
 old baked path by 1–2 8-bit levels in the near-zero channel — the matrix's big
@@ -122,7 +128,7 @@ edge clamping included.
 - The shader early-outs when all three detail controls are zero, so the common
   case costs nothing. Keep that guard.
 - `Uniforms` must stay a multiple of 16 bytes (WGSL rounds uniform structs up to
-  their largest member alignment); `_tail` exists only for that. The size is
+  their largest member alignment); the trailing `show_clip` doubles as that pad. The size is
   asserted in `pipeline::tests`.
 - Detail acts on source pixels, so it cannot be judged in the fit-to-window
   view. That is why the 1:1 zoom (Z / View menu) exists — do not remove it

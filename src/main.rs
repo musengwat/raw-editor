@@ -25,6 +25,8 @@ const COMPARE_KEY: egui::Key = egui::Key::B;
 const ZOOM_KEY: egui::Key = egui::Key::Z;
 /// Arms the white-balance eyedropper; the next click on the image picks.
 const PICK_WB_KEY: egui::Key = egui::Key::W;
+/// Toggles the clipping overlay.
+const CLIP_KEY: egui::Key = egui::Key::C;
 
 /// Single-key shortcuts must not fire while the user is typing into a text
 /// field (the Immich settings, say).
@@ -93,6 +95,13 @@ struct App {
     /// The white-balance eyedropper is armed: the next click on the image
     /// sets white balance from that spot.
     picking_wb: bool,
+    /// Clipping overlay on the image (a viewing aid; never exported).
+    show_clip: bool,
+    /// Small copy of the image the histogram is computed from.
+    preview: Option<DevelopedImage>,
+    /// Histogram and the params it was computed with, so it is only redone
+    /// when something changes.
+    histogram: Option<(AdjustParams, raw_editor::histogram::Histogram)>,
 
     config: Config,
     show_settings: bool,
@@ -135,6 +144,9 @@ impl App {
             zoom_100: false,
             pan: [0.0, 0.0],
             picking_wb: false,
+            show_clip: false,
+            preview: None,
+            histogram: None,
             config: Config::load().unwrap_or_else(|e| {
                 eprintln!("config: {e:#} — starting with defaults");
                 Config::default()
@@ -188,6 +200,10 @@ impl App {
                         }
                     };
                     self.status = format!("{name} — {}x{}{note}", img.width, img.height);
+                    self.preview =
+                        Some(raw_editor::histogram::downsample(&img, raw_editor::histogram::PREVIEW_LONG_SIDE));
+                    self.histogram = None;
+                    self.picking_wb = false;
                     self.image = Some(Arc::new(img));
                     self.current = Some(path);
                     self.params = params;
@@ -539,6 +555,21 @@ impl App {
         ui.heading("Adjust");
         ui.add_space(6.0);
 
+        // Histogram of the output as it looks now; recomputed only when the
+        // params have changed (a few ms on the 1/8-scale copy).
+        if let Some(preview) = &self.preview {
+            if self.histogram.as_ref().is_none_or(|(p, _)| *p != self.params) {
+                let h = raw_editor::histogram::compute(preview, &self.params);
+                self.histogram = Some((self.params, h));
+            }
+        }
+        if let Some((_, h)) = &self.histogram {
+            raw_editor::widgets::histogram(ui, h);
+            ui.checkbox(&mut self.show_clip, format!("Show clipping ({})", CLIP_KEY.name()))
+                .on_hover_text("Clipped pixels show which channels clipped; the rest go grey");
+            ui.add_space(8.0);
+        }
+
         let mut reset = false;
         let mut do_export = false;
         let has_image = self.image.is_some();
@@ -792,11 +823,12 @@ impl App {
         // it, so the two views differ only by the adjustments themselves.
         let comparing = shortcut(ui.ctx(), COMPARE_KEY, true);
         let colour = self.image.as_ref().map_or(ImageColour::LINEAR_SRGB, |img| img.colour);
-        let uniforms = if comparing {
+        let mut uniforms = if comparing {
             Uniforms::passthrough(&colour, view, target_is_srgb)
         } else {
             Uniforms::new(&self.params, &colour, view, target_is_srgb)
         };
+        uniforms.show_clip = if self.show_clip { 1.0 } else { 0.0 };
 
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
@@ -831,6 +863,9 @@ impl eframe::App for App {
         // Z flips between fit and 1:1.
         if shortcut(ui.ctx(), PICK_WB_KEY, false) && self.image.is_some() {
             self.picking_wb = !self.picking_wb;
+        }
+        if shortcut(ui.ctx(), CLIP_KEY, false) {
+            self.show_clip = !self.show_clip;
         }
         if shortcut(ui.ctx(), ZOOM_KEY, false) {
             self.zoom_100 = !self.zoom_100;

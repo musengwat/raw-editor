@@ -11,7 +11,9 @@ use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
-use raw_editor::pipeline::{AdjustParams, Colour, ImageColour, Uniforms, View, apply, srgb_encode};
+use raw_editor::pipeline::{
+    AdjustParams, Colour, ImageColour, Uniforms, View, apply, clip_view, srgb_encode,
+};
 
 const W: usize = 2;
 const H: usize = 2;
@@ -36,11 +38,23 @@ fn render_image(
     img: &DevelopedImage,
     params: &AdjustParams,
 ) -> Vec<[u8; 4]> {
+    render_image_with(device, queue, img, params, false)
+}
+
+fn render_image_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DevelopedImage,
+    params: &AdjustParams,
+    show_clip: bool,
+) -> Vec<[u8; 4]> {
     let (w, h) = (img.width, img.height);
     let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_image(device, queue, img);
     let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
-    renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false));
+    let mut uniforms = Uniforms::new(params, &img.colour, view, false);
+    uniforms.show_clip = if show_clip { 1.0 } else { 0.0 };
+    renderer.write_uniforms(queue, &uniforms);
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -394,5 +408,31 @@ fn parity_camera_rgb_with_detail_and_tone() {
             ..Default::default()
         },
     );
+}
+
+/// The clipping overlay must mark the same pixels, with the same channel
+/// colours, on the GPU as `pipeline::clip_view` does on the CPU.
+#[test]
+fn parity_clipping_overlay() {
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    // Red-only over white, all-three over white, and ordinary pixels.
+    let px: [[f32; 3]; 4] = [[1.6, 0.4, 0.2], [0.2, 0.3, 0.4], [1.3, 1.2, 1.1], [0.7, 0.6, 0.1]];
+    let img = DevelopedImage::linear_srgb(2, 2, px.iter().flatten().copied().collect());
+    let params = AdjustParams { exposure_ev: 0.3, ..Default::default() };
+    let gpu = render_image_with(&ctx.device, &ctx.queue, &img, &params, true);
+    for (i, p) in px.iter().enumerate() {
+        let c = clip_view(apply(&params, *p));
+        for ch in 0..3 {
+            let want = (srgb_encode(c[ch]) * 255.0 + 0.5) as u8;
+            let got = gpu[i][ch];
+            assert!(want.abs_diff(got) <= 2, "pixel {i} ch {ch}: gpu {got} cpu {want}");
+        }
+    }
+    // And it really is an overlay: pixel 0 shows pure red, pixel 2 white.
+    assert_eq!(&gpu[0][..3], &[255, 0, 0]);
+    assert_eq!(&gpu[2][..3], &[255, 255, 255]);
 }
 

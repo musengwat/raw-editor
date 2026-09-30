@@ -29,6 +29,7 @@ struct Uniforms {
     sharpen_threshold: f32,
     nr_luma: f32,
     nr_chroma: f32,
+    show_clip: f32,        // 1.0 => clipping overlay; also pads to 16 bytes
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -58,6 +59,7 @@ const BLACKS_LIFT: f32 = 0.05;
 const MIN_GAMMA: f32 = 0.01;
 
 const LUMA_709: vec3<f32> = vec3(0.2126, 0.7152, 0.0722);
+const CLIP_VIEW_DIM: f32 = 0.35;
 
 // Detail-stage constants — must match src/pipeline.rs.
 const DETAIL_R: i32 = 4;
@@ -183,6 +185,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 5. Luma-preserving saturation.
     let luma = dot(c, LUMA_709);
     c = luma + (c - luma) * (1.0 + u.saturation);
+
+    // Clipping overlay — mirrored in src/pipeline.rs::clip_view.
+    if u.show_clip > 0.5 {
+        let over = select(vec3(0.0), vec3(1.0), c >= vec3(1.0));
+        if any(over > vec3(0.0)) {
+            c = over;
+        } else {
+            c = vec3(dot(clamp(c, vec3(0.0), vec3(1.0)), LUMA_709) * CLIP_VIEW_DIM);
+        }
+    }
 
     c = clamp(c, vec3(0.0), vec3(1.0));
     if u.target_is_srgb == 0.0 {

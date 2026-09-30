@@ -77,6 +77,16 @@ under warm light needs). *As shot* returns to the camera's white balance.
 because a matrix calibrated for visible light scrambles hues once the sensor
 sees infrared. Temp and tint still apply on top as fine trims.
 
+**Histogram**: RGB, overlaid, of the output as it currently looks, with the
+percentage of pixels clipping in each channel underneath (orange once it passes
+0.1%). It is computed on the CPU from a 1/8-scale copy through the same code
+path the shader mirrors, so it tracks every control except noise reduction and
+sharpening, which a downscaled copy cannot show. Square-root scaled, and scaled
+against the tallest *interior* bin so a big clipped spike doesn't flatten the
+rest. *Show clipping* (or **C**) turns the image into a clipping map: clipped
+pixels show which channels clipped (red, yellow, white…), the rest go dim grey.
+It is a viewing aid only and never reaches an export.
+
 **Basic**: exposure (EV), contrast (power curve about a 0.18 pivot), temp/tint
 (opposing channel gains), saturation (luma-preserving).
 

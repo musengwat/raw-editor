@@ -3,6 +3,7 @@ pub mod detail;
 pub mod develop;
 pub mod export;
 pub mod gpu;
+pub mod histogram;
 pub mod immich;
 pub mod metadata;
 pub mod pipeline;

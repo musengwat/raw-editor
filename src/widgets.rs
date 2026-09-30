@@ -1,5 +1,5 @@
-//! Bespoke egui widgets. Currently just the Resolve-style colour wheel used to
-//! drive the lift / gamma / gain params.
+//! Bespoke egui widgets: the Resolve-style colour wheel used to drive the
+//! lift / gamma / gain params, and the RGB histogram.
 
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, StrokeKind, Vec2};
 
@@ -158,6 +158,49 @@ impl<'a> ColorWheel<'a> {
 
         changed
     }
+}
+
+/// Overlaid RGB histogram plus a per-channel clipped-percentage line.
+pub fn histogram(ui: &mut egui::Ui, h: &crate::histogram::Histogram) {
+    use crate::histogram::BINS;
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 80.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_gray(18));
+    let colours = [
+        Color32::from_rgba_unmultiplied(255, 70, 70, 120),
+        Color32::from_rgba_unmultiplied(70, 230, 70, 120),
+        Color32::from_rgba_unmultiplied(80, 120, 255, 140),
+    ];
+    let heights = h.heights();
+    let bin_w = rect.width() / BINS as f32;
+    // Adjoining rectangles in one mesh: no anti-aliased seams, and no gaps
+    // from snapping ~1px strokes to the pixel grid.
+    let mut mesh = egui::Mesh::default();
+    for (ch, colour) in colours.iter().enumerate() {
+        for (k, &v) in heights[ch].iter().enumerate() {
+            if v <= 0.0 {
+                continue;
+            }
+            let x0 = rect.left() + k as f32 * bin_w;
+            let top = rect.bottom() - v * (rect.height() - 2.0);
+            mesh.add_colored_rect(
+                egui::Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x0 + bin_w, rect.bottom())),
+                *colour,
+            );
+        }
+    }
+    painter.add(mesh);
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Clipped").small());
+        for (name, frac) in ["R", "G", "B"].iter().zip(h.clipped) {
+            let pct = frac * 100.0;
+            // Anything over a tenth of a percent is worth noticing.
+            let text = egui::RichText::new(format!("{name} {pct:.1}%")).small();
+            ui.label(if pct >= 0.1 { text.color(Color32::from_rgb(255, 140, 90)) } else { text.weak() });
+        }
+    });
 }
 
 #[cfg(test)]

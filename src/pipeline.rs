@@ -243,10 +243,10 @@ pub struct Uniforms {
     pub sharpen_threshold: f32,
     pub nr_luma: f32,
     pub nr_chroma: f32,
-    /// WGSL rounds uniform struct sizes up to a multiple of the largest member
-    /// alignment (16, for the vec4s), so the Rust side has to match or the
-    /// buffer comes out too small.
-    pub _tail: f32,
+    /// 1.0 = clipping overlay (see [`clip_view`]). A viewing aid, never
+    /// exported. It also happens to be the slot that pads the struct to a
+    /// multiple of 16 bytes, which WGSL requires — if it moves, add a pad.
+    pub show_clip: f32,
 }
 
 /// How the image sits in the viewport, plus the source texel size the detail
@@ -319,7 +319,7 @@ impl Uniforms {
             sharpen_threshold: p.sharpen_threshold,
             nr_luma: p.nr_luma,
             nr_chroma: p.nr_chroma,
-            _tail: 0.0,
+            show_clip: 0.0,
         }
     }
 
@@ -398,6 +398,24 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
         *v = l + (*v - l) * s;
     }
     c
+}
+
+/// Share of luminance the unclipped part of the clipping overlay keeps, so the
+/// clipped pixels stand out.
+pub const CLIP_VIEW_DIM: f32 = 0.35;
+
+/// Clipping overlay, applied to the linear output of [`apply`]. A pixel with
+/// any channel at or above white shows *which* channels clipped at full
+/// strength (red, yellow, white...); everything else becomes dimmed grey. A
+/// single warning colour would vanish into false-colour IR images, which are
+/// full of saturated reds and magentas. Mirrored in the shader.
+pub fn clip_view(c: [f32; 3]) -> [f32; 3] {
+    let over = c.map(|v| if v >= 1.0 { 1.0 } else { 0.0 });
+    if over.iter().any(|&o| o > 0.0) {
+        over
+    } else {
+        [luma(c.map(|v| v.clamp(0.0, 1.0))) * CLIP_VIEW_DIM; 3]
+    }
 }
 
 /// sRGB OETF for one linear component.
@@ -687,6 +705,15 @@ mod tests {
         // centre now shows the image point a quarter of the way in.
         let v = View { scale: [2.0, 2.0], offset: [1.0, 0.0], texel: [0.0; 2] };
         assert_eq!(v.image_pixel([0.0, 0.0], size), Some([100, 150]));
+    }
+
+    #[test]
+    fn clip_view_shows_which_channels_clipped() {
+        assert_eq!(clip_view([1.3, 0.4, 0.2]), [1.0, 0.0, 0.0]);
+        assert_eq!(clip_view([1.0, 1.2, 0.9]), [1.0, 1.0, 0.0]);
+        assert_eq!(clip_view([2.0, 2.0, 2.0]), [1.0, 1.0, 1.0]);
+        let g = clip_view([0.5, 0.5, 0.5]);
+        assert!((g[0] - 0.5 * CLIP_VIEW_DIM).abs() < 1e-6 && g[0] == g[1] && g[1] == g[2]);
     }
 }
 
