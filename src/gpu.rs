@@ -126,11 +126,13 @@ impl ImageRenderer {
         pixels
             .par_chunks_mut(4)
             .zip(img.data.par_chunks(3))
-            .for_each(|(dst, src)| {
+            .enumerate()
+            .for_each(|(i, (dst, src))| {
                 dst[0] = half::f16::from_f32(src[0]);
                 dst[1] = half::f16::from_f32(src[1]);
                 dst[2] = half::f16::from_f32(src[2]);
-                dst[3] = half::f16::ONE;
+                // Alpha carries the clip mask; see `to_working` in the shader.
+                dst[3] = half::f16::from_f32(img.clip_at(i));
             });
 
         let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };

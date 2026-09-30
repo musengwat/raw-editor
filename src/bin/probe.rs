@@ -136,7 +136,8 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let dev = develop(&raw)?;
         println!("developed:   {}x{} in {:.2?}", dev.width, dev.height, t.elapsed());
-        let px: Vec<u8> = dev.data.iter().map(|&v| srgb_encode(v)).collect();
+        let col = raw_editor::pipeline::Colour::resolve(&dev.colour, &Default::default());
+        let px: Vec<u8> = dev.working(&col).iter().map(|&v| srgb_encode(v)).collect();
         image::RgbImage::from_raw(dev.width as u32, dev.height as u32, px)
             .context("bad buffer size")?
             .save(&out_path)?;

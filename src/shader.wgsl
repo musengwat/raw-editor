@@ -3,6 +3,10 @@
 
 struct Uniforms {
     // vec4s first: WGSL uniform buffers need 16-byte alignment for them.
+    wb: vec4<f32>,         // .rgb = white-balance gains
+    m0: vec4<f32>,         // rows of the camera -> working matrix (.rgb)
+    m1: vec4<f32>,
+    m2: vec4<f32>,
     lift: vec4<f32>,       // .rgb = per-channel lift  (neutral 0)
     gamma: vec4<f32>,      // .rgb = per-channel gamma (neutral 1)
     gain: vec4<f32>,       // .rgb = per-channel gain  (neutral 1)
@@ -28,6 +32,7 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// .rgb = demosaiced camera RGB (not white balanced), .a = clip mask.
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
@@ -80,6 +85,16 @@ fn srgb_encode(v: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, v <= vec3(0.0031308));
 }
 
+// Camera RGB -> working linear RGB: white balance, clipped pixels to neutral,
+// matrix. Mirrored in src/pipeline.rs::to_working. The clip mask is filtered
+// like everything else, so it blends rather than switches.
+fn to_working(s: vec4<f32>) -> vec3<f32> {
+    var c = s.rgb * u.wb.rgb;
+    let m = max(c.r, max(c.g, c.b));
+    c = mix(c, vec3(m), s.a);
+    return vec3(dot(u.m0.rgb, c), dot(u.m1.rgb, c), dot(u.m2.rgb, c));
+}
+
 // Noise reduction and sharpening over one 9x9 neighbourhood. Mirrored in
 // src/detail.rs::pixel — keep the two in lockstep.
 //
@@ -100,9 +115,9 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
     for (var dy = -DETAIL_R; dy <= DETAIL_R; dy++) {
         for (var dx = -DETAIL_R; dx <= DETAIL_R; dx++) {
-            let s = textureSampleLevel(
+            let s = to_working(textureSampleLevel(
                 tex, samp, uv + vec2(f32(dx), f32(dy)) * u.texel, 0.0
-            ).rgb;
+            ));
             let sl = dot(s, LUMA_709);
             let d2 = f32(dx * dx + dy * dy);
 
@@ -134,7 +149,7 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var c = textureSample(tex, samp, in.uv).rgb;
+    var c = to_working(textureSample(tex, samp, in.uv));
 
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.

@@ -70,7 +70,9 @@ near raw 2880 while the file reports 4095. `develop::saturation_levels` detects
 that from the histogram; see README for the criteria and the reasoning. Two
 rules matter when touching it:
 
-- Clipped pixels are forced neutral **after** demosaicing, never per photosite.
+- Clipped pixels are flagged after demosaicing (never per photosite) and forced
+  neutral in `pipeline::to_working` / the shader's `to_working`, **after**
+  white balance. The flag rides in the texture's alpha channel.
   Green saturates first (its WB gain is 1.0 while red's is 2.3), so a
   per-photosite fix trades a magenta cast for a green one.
 - Detection must be corroborated across colours. A single colour peaking alone
@@ -79,6 +81,25 @@ rules matter when touching it:
 Regression check for this area: develop every file in `testdata/` and confirm
 `P1050113.rw2` (ISO 100, overcast sky) renders a neutral sky while every other
 file stays byte-identical. `RAW_EDITOR_DEBUG=1` prints the per-colour decision.
+
+## Camera RGB, white balance and the matrix (IR-1)
+
+The texture holds demosaiced **camera** RGB, not white balanced or matrixed;
+`DevelopedImage.colour` (`ImageColour`) carries the as-shot WB and the
+camera→sRGB matrix, and `Colour::resolve` picks what one render actually uses.
+Both the shader and the CPU path run every sample — including all 81 detail
+neighbours — through `to_working` first, so detail/tone code still sees linear
+sRGB exactly as before. `DevelopedImage::linear_srgb` builds an identity-colour
+image for synthetic tests. Reason: an infrared-converted GF1 needs white
+balance far outside the camera's range and often no camera matrix at all.
+
+Precision note: moving the matrix after the f16 texture means strongly
+out-of-gamut colours (one channel pinned, one near zero) can differ from the
+old baked path by 1–2 8-bit levels in the near-zero channel — the matrix's big
+coefficients cancel there and amplify f16 rounding. Measured on the testdata
+set: mean diff ~3/65535, neutral/ordinary colours at rounding level. Accepted.
+Regression method: export `testdata` with the previous binary and diff the
+16-bit TIFFs.
 
 ## Detail stage (noise reduction + sharpening)
 

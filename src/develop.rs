@@ -1,21 +1,50 @@
-//! Develop stage: CFA sensor data → scene-referred linear sRGB f32.
+//! Develop stage: CFA sensor data → demosaiced, scene-referred camera RGB f32.
 //!
-//! black-level subtract → normalize (clamped at whitelevel) → white-balance
-//! gains → bilinear demosaic → camera→linear-sRGB matrix. Output is unclamped
-//! (highlights may exceed 1.0 after matrixing); the GPU pipeline handles the
-//! final transfer.
+//! black-level subtract → normalize → bilinear demosaic → clip mask. White
+//! balance and the camera→sRGB matrix are *not* applied here: they travel with
+//! the image as [`ImageColour`] and are applied per pixel by
+//! `pipeline::to_working` (and its shader twin), so both can be changed live.
+//! Output is unclamped.
 
 use anyhow::{Context, Result, bail};
 use rawler::imgop::xyz::Illuminant;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
 
+use crate::pipeline::{Colour, ImageColour, to_working};
+
 /// Developed image: tightly packed RGB f32, active-area size.
 pub struct DevelopedImage {
     pub width: usize,
     pub height: usize,
-    /// width*height*3 linear sRGB samples, unclamped above 1.0.
+    /// width*height*3 camera RGB samples, normalized but not white balanced,
+    /// unclamped above 1.0.
     pub data: Vec<f32>,
+    /// width*height, 1.0 where the pixel's demosaic neighbourhood held a
+    /// saturated photosite, else 0.0. Empty means nothing clipped.
+    pub clip: Vec<f32>,
+    pub colour: ImageColour,
+}
+
+impl DevelopedImage {
+    /// An image whose data is already linear sRGB (tests, synthetic input).
+    pub fn linear_srgb(width: usize, height: usize, data: Vec<f32>) -> Self {
+        Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB }
+    }
+
+    pub fn clip_at(&self, i: usize) -> f32 {
+        self.clip.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// The whole image through [`to_working`] — the CPU path's equivalent of
+    /// what the shader does to every texture sample.
+    pub fn working(&self, col: &Colour) -> Vec<f32> {
+        let mut out = vec![0f32; self.data.len()];
+        out.par_chunks_mut(3).zip(self.data.par_chunks(3)).enumerate().for_each(|(i, (o, c))| {
+            o.copy_from_slice(&to_working(col, [c[0], c[1], c[2]], self.clip_at(i)));
+        });
+        out
+    }
 }
 
 /// Bradford-adapted sRGB D65 → XYZ D65 matrix (row-major).
@@ -62,9 +91,9 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     // white level (see `saturation_levels`).
     let sat = saturation_levels(data, raw_w, raw_h, cfa, &black, &white, &level);
 
-    // Plane of normalized, WB'd values in full-raw coordinates. Values are NOT
-    // clamped at 1.0: clipped highlights are dealt with after demosaicing, where
-    // all three channels are known.
+    // Plane of normalized values in full-raw coordinates. Values are NOT
+    // clamped at 1.0: clipped highlights are flagged after demosaicing, where
+    // all three channels are known, and made neutral after white balance.
     let mut plane = vec![0f32; raw_w * raw_h];
     plane
         .par_chunks_mut(raw_w)
@@ -75,27 +104,29 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
                 let blk = level(&black, c, 0.0);
                 let wht = level(&white, c, u16::MAX as f32).max(blk + 1.0);
                 let v = (data[row * raw_w + col] as f32 - blk) / (wht - blk);
-                out_row[col] = v.max(0.0) * wb[c.min(3)];
+                out_row[col] = v.max(0.0);
             }
         });
 
-    // Per-colour saturation expressed in the same normalized, WB'd units as
+    // Per-colour saturation expressed in the same normalized units as
     // `plane`, so the demosaic loop can spot clipped photosites cheaply.
     let sat_plane: [f32; 4] = std::array::from_fn(|c| {
         let blk = level(&black, c, 0.0);
         let wht = level(&white, c, u16::MAX as f32).max(blk + 1.0);
-        ((sat[c] - blk) / (wht - blk)) * wb[c.min(3)]
+        (sat[c] - blk) / (wht - blk)
     });
 
     // Camera → linear sRGB matrix from the D65 XYZ→cam matrix.
-    let srgb_from_cam = srgb_from_cam_matrix(raw)?;
+    let cam_to_srgb = srgb_from_cam_matrix(raw)?;
 
-    // Bilinear demosaic (3x3 neighborhood average per missing channel),
-    // then matrix to linear sRGB. Output cropped to the active area.
+    // Bilinear demosaic (3x3 neighborhood average per missing channel).
+    // Output cropped to the active area.
     let mut out = vec![0f32; aw * ah * 3];
+    let mut clip = vec![0f32; aw * ah];
     out.par_chunks_mut(aw * 3)
+        .zip(clip.par_chunks_mut(aw))
         .enumerate()
-        .for_each(|(orow, out_row)| {
+        .for_each(|(orow, (out_row, clip_row))| {
             let row = orow + ay;
             for ocol in 0..aw {
                 let col = ocol + ax;
@@ -125,26 +156,15 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
                     };
                 }
 
-                // A saturated photosite only tells us "at least this much", so
-                // its channel ratios are meaningless — white-balance gains
-                // applied to them turn blown highlights magenta. Take the
-                // brightest channel (the one least likely to have clipped) as
-                // the luminance estimate and make the pixel neutral.
-                if clipped {
-                    let m = cam[0].max(cam[1]).max(cam[2]);
-                    cam = [m; 3];
-                }
-
-                let o = ocol * 3;
-                for i in 0..3 {
-                    out_row[o + i] = srgb_from_cam[i][0] * cam[0]
-                        + srgb_from_cam[i][1] * cam[1]
-                        + srgb_from_cam[i][2] * cam[2];
-                }
+                // Flag only: making the pixel neutral has to wait until white
+                // balance is known (see `pipeline::to_working`).
+                clip_row[ocol] = if clipped { 1.0 } else { 0.0 };
+                out_row[ocol * 3..ocol * 3 + 3].copy_from_slice(&cam);
             }
         });
 
-    Ok(DevelopedImage { width: aw, height: ah, data: out })
+    let colour = ImageColour { as_shot_wb: [wb[0], wb[1], wb[2]], cam_to_srgb };
+    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour })
 }
 
 /// Detect, per CFA colour, the raw value at which this exposure actually

@@ -27,7 +27,7 @@ fn fixture() -> DevelopedImage {
             data.extend_from_slice(&[v, v * (0.5 + 0.5 * y as f32 / H as f32), v * 0.75]);
         }
     }
-    DevelopedImage { width: W, height: H, data }
+    DevelopedImage::linear_srgb(W, H, data)
 }
 
 fn params() -> AdjustParams {
@@ -109,7 +109,7 @@ fn jpeg_quality_changes_the_file_size() {
     for i in 0..64 * 64 * 3 {
         data.push(((i * 2654435761u64 as usize) % 997) as f32 / 997.0);
     }
-    let img = DevelopedImage { width: 64, height: 64, data };
+    let img = DevelopedImage::linear_srgb(64, 64, data);
     let rendered = export::render_cpu(&img, &AdjustParams::default());
 
     let lo = dir.join("lo.jpg");
@@ -212,7 +212,7 @@ fn compressed_tiff_is_smaller_than_raw_samples() {
             data.extend_from_slice(&[v, v * 0.8, v * 0.6]);
         }
     }
-    let img = DevelopedImage { width: w, height: h, data };
+    let img = DevelopedImage::linear_srgb(w, h, data);
     let rendered = export::render_cpu(&img, &AdjustParams::default());
 
     let tif = dir.join("gradient.tif");

@@ -9,10 +9,13 @@ DaVinci-Resolve-style color adjustments. Rust + wgpu + egui.
   extracts CFA sensor data + metadata (black/white levels, as-shot white
   balance, camera color matrices).
 - **Develop** (once per file, CPU, `src/develop.rs`): black-level subtract →
-  normalize → white-balance gains → demosaic → clipped-highlight handling →
-  camera→linear-sRGB matrix. Output: scene-referred linear RGB f32, unclamped,
-  uploaded as an `rgba16float` wgpu texture.
-- **Adjust** (every slider change, GPU): one WGSL fragment shader applies
+  normalize → demosaic → clip mask. Output: scene-referred *camera* RGB f32,
+  unclamped and **not** white balanced, uploaded as an `rgba16float` wgpu
+  texture with the clip mask in alpha. The file's as-shot white balance and
+  camera→sRGB matrix travel alongside as `ImageColour`.
+- **Adjust** (every slider change, GPU): one WGSL fragment shader turns every
+  texture sample into working linear RGB (white balance → clipped pixels to
+  neutral → matrix), then applies
   noise reduction and sharpening → exposure → temp/tint → contrast →
   highlights/shadows → whites/blacks → lift/gamma/gain → saturation → sRGB
   transfer. Real-time at full resolution.
@@ -28,7 +31,8 @@ export can fall back to CPU.
 A saturated photosite only records "at least this much", so its channel ratios
 are meaningless — and white-balance gains applied to them turn every blown area
 magenta. The develop stage therefore marks clipped photosites, and any pixel
-that touches one is forced neutral at the brightest channel's level (that
+that touches one is forced neutral — after white balance, in the shader, so it
+holds at any white balance — at the brightest channel's level (that
 channel is the least likely to have clipped, so it is the best luminance
 estimate left). This is the plain "clip to neutral" behaviour; true highlight
 *reconstruction* from neighbouring detail is out of scope.

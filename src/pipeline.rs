@@ -116,13 +116,75 @@ impl AdjustParams {
     }
 }
 
+/// What the raw file says about its own colour: the camera's as-shot white
+/// balance and the matrix from white-balanced camera RGB to linear sRGB.
+///
+/// The develop stage hands the GPU *camera* RGB, not yet white balanced or
+/// matrixed, so that both can be changed live — an infrared conversion needs
+/// white balance far outside anything the camera offers, and a camera matrix
+/// that means nothing once the sensor sees infrared.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageColour {
+    /// Per-channel gains, green = 1.
+    pub as_shot_wb: [f32; 3],
+    /// Row-major; row sums are 1, so white-balanced neutral stays neutral.
+    pub cam_to_srgb: [[f32; 3]; 3],
+}
+
+pub const IDENTITY3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+impl ImageColour {
+    /// For data that is already linear sRGB: unit gains, identity matrix.
+    pub const LINEAR_SRGB: Self = Self { as_shot_wb: [1.0; 3], cam_to_srgb: IDENTITY3 };
+}
+
+/// White balance and matrix as actually applied to one render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Colour {
+    pub wb: [f32; 3],
+    pub matrix: [[f32; 3]; 3],
+}
+
+impl Colour {
+    pub fn resolve(img: &ImageColour, _p: &AdjustParams) -> Self {
+        Self { wb: img.as_shot_wb, matrix: img.cam_to_srgb }
+    }
+}
+
+/// Camera RGB → working linear RGB for one pixel: white balance, then make a
+/// clipped pixel neutral, then the matrix. Mirrors `to_working` in the shader.
+///
+/// `clip` is 0..1 rather than a flag because the GPU samples the clip mask
+/// with bilinear filtering; blending keeps the edge of a blown area soft. A
+/// saturated photosite only says "at least this much", so its channel ratios
+/// are meaningless — white-balance gains applied to them turn blown highlights
+/// magenta. The brightest channel (the one least likely to have clipped) is
+/// the best luminance estimate, and neutral is the only honest colour. This
+/// has to happen *after* white balance, which is why it lives here and not in
+/// the develop stage.
+pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
+    let mut c = [cam[0] * col.wb[0], cam[1] * col.wb[1], cam[2] * col.wb[2]];
+    let m = c[0].max(c[1]).max(c[2]);
+    for v in &mut c {
+        *v += (m - *v) * clip;
+    }
+    let r = &col.matrix;
+    std::array::from_fn(|i| r[i][0] * c[0] + r[i][1] * c[1] + r[i][2] * c[2])
+}
+
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
-/// The three `vec4` members come first so they land on 16-byte offsets
+/// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 144 bytes.
+/// Total size 208 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
+    /// White-balance gains `[r, g, b, _pad]`.
+    pub wb: [f32; 4],
+    /// Rows of the camera → working matrix, each `[_, _, _, _pad]`.
+    pub m0: [f32; 4],
+    pub m1: [f32; 4],
+    pub m2: [f32; 4],
     /// `[r, g, b, _pad]`
     pub lift: [f32; 4],
     pub gamma: [f32; 4],
@@ -182,9 +244,14 @@ impl View {
 }
 
 impl Uniforms {
-    pub fn new(p: &AdjustParams, view: View, target_is_srgb: bool) -> Self {
+    pub fn new(p: &AdjustParams, img: &ImageColour, view: View, target_is_srgb: bool) -> Self {
         let v4 = |a: [f32; 3]| [a[0], a[1], a[2], 0.0];
+        let col = Colour::resolve(img, p);
         Self {
+            wb: v4(col.wb),
+            m0: v4(col.matrix[0]),
+            m1: v4(col.matrix[1]),
+            m2: v4(col.matrix[2]),
             lift: v4(p.lift),
             gamma: v4(p.gamma),
             gain: v4(p.gain),
@@ -213,8 +280,8 @@ impl Uniforms {
 
     /// Uniforms that pass the image through untouched — used by the
     /// hold-to-compare "before" view and by neutral exports.
-    pub fn passthrough(view: View, target_is_srgb: bool) -> Self {
-        Self::new(&AdjustParams::default(), view, target_is_srgb)
+    pub fn passthrough(img: &ImageColour, view: View, target_is_srgb: bool) -> Self {
+        Self::new(&AdjustParams::default(), img, view, target_is_srgb)
     }
 }
 
@@ -344,14 +411,20 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_144_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
+    fn uniforms_layout_is_208_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 208);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
-        let u = Uniforms::passthrough(View::fit([1.0, 1.0], [1.0, 1.0]), false);
+        let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
-        for field in [&u.lift as *const _ as usize, &u.gamma as *const _ as usize, &u.gain
-            as *const _ as usize]
-        {
+        for field in [
+            &u.wb as *const _ as usize,
+            &u.m0 as *const _ as usize,
+            &u.m1 as *const _ as usize,
+            &u.m2 as *const _ as usize,
+            &u.lift as *const _ as usize,
+            &u.gamma as *const _ as usize,
+            &u.gain as *const _ as usize,
+        ] {
             assert_eq!((field - base) % 16, 0);
         }
     }
@@ -473,5 +546,49 @@ mod tests {
         assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
         assert!((smoothstep(0.0, 1.0, 0.5) - 0.5).abs() < 1e-6);
         assert!((smoothstep(0.2, 0.6, 0.4) - 0.5).abs() < 1e-6);
+    }
+
+    // --- camera RGB → working RGB ---------------------------------------
+
+    /// A plausible row-normalised camera matrix (rows sum to 1).
+    const CAM: [[f32; 3]; 3] = [[1.6, -0.5, -0.1], [-0.2, 1.5, -0.3], [0.0, -0.4, 1.4]];
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    #[test]
+    fn linear_srgb_colour_is_identity() {
+        let col = Colour::resolve(&ImageColour::LINEAR_SRGB, &AdjustParams::default());
+        assert!(close(to_working(&col, [0.1, 0.5, 1.7], 0.0), [0.1, 0.5, 1.7]));
+    }
+
+    #[test]
+    fn white_balance_is_applied_before_the_matrix() {
+        let col = Colour { wb: [2.0, 1.0, 1.5], matrix: CAM };
+        let wbd = [0.2, 0.3, 0.4];
+        let expect: [f32; 3] =
+            std::array::from_fn(|i| CAM[i][0] * wbd[0] + CAM[i][1] * wbd[1] + CAM[i][2] * wbd[2]);
+        assert!(close(to_working(&col, [0.1, 0.3, 0.4 / 1.5], 0.0), expect));
+    }
+
+    #[test]
+    fn clipped_pixel_goes_neutral_whatever_the_white_balance() {
+        // Green clipped low (the extended-ISO case): unbalanced ratios would
+        // go magenta. Forced neutral after WB, and the matrix keeps it neutral.
+        for wb in [[2.3, 1.0, 1.55], [0.4, 1.0, 5.0]] {
+            let col = Colour { wb, matrix: CAM };
+            let out = to_working(&col, [0.5, 0.7, 0.45], 1.0);
+            assert!((out[0] - out[1]).abs() < 1e-5 && (out[1] - out[2]).abs() < 1e-5, "{out:?}");
+            let m = (0.5 * wb[0]).max(0.7).max(0.45 * wb[2]);
+            assert!((out[1] - m).abs() < 1e-5, "brightest channel is the level: {out:?}");
+        }
+    }
+
+    #[test]
+    fn partial_clip_blends_toward_neutral() {
+        let col = Colour { wb: [1.0; 3], matrix: IDENTITY3 };
+        let out = to_working(&col, [0.2, 0.6, 1.0], 0.5);
+        assert!(close(out, [0.6, 0.8, 1.0]), "{out:?}");
     }
 }

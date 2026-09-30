@@ -22,7 +22,7 @@ use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
 use crate::metadata::ExportMetadata;
-use crate::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
+use crate::pipeline::{AdjustParams, Colour, Uniforms, View, apply, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -68,7 +68,8 @@ fn to_u16(v: f32) -> u16 {
 pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     // Neighbourhood work first, then the per-pixel chain — same order as the
     // shader.
-    let detailed = detail::apply(img.width, img.height, &img.data, params);
+    let working = img.working(&Colour::resolve(&img.colour, params));
+    let detailed = detail::apply(img.width, img.height, &working, params);
     let mut data = vec![0u16; img.width * img.height * 3];
     data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {
         let c = apply(params, [src[0], src[1], src[2]]);
@@ -101,7 +102,7 @@ pub fn render_gpu(
     // One output pixel per source pixel, so the detail filters step by exactly
     // one source texel and the export matches the 1:1 preview.
     let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
-    renderer.write_uniforms(queue, &Uniforms::new(params, view, false));
+    renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false));
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -436,11 +437,7 @@ mod tests {
 
     #[test]
     fn cpu_render_encodes_srgb() {
-        let img = DevelopedImage {
-            width: 2,
-            height: 1,
-            data: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-        };
+        let img = DevelopedImage::linear_srgb(2, 1, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
         let r = render_cpu(&img, &AdjustParams::default());
         assert_eq!(r.data[0..3], [0, 0, 0]);
         assert_eq!(r.data[3..6], [65535, 65535, 65535]);
@@ -448,7 +445,7 @@ mod tests {
 
     #[test]
     fn cpu_render_applies_params() {
-        let img = DevelopedImage { width: 1, height: 1, data: vec![0.18, 0.18, 0.18] };
+        let img = DevelopedImage::linear_srgb(1, 1, vec![0.18, 0.18, 0.18]);
         let dark = render_cpu(&img, &AdjustParams { exposure_ev: -2.0, ..Default::default() });
         let bright = render_cpu(&img, &AdjustParams { exposure_ev: 2.0, ..Default::default() });
         assert!(dark.data[0] < 20000 && bright.data[0] > 50000, "{:?} {:?}", dark.data, bright.data);

@@ -13,7 +13,7 @@ use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
-use raw_editor::pipeline::{AdjustParams, Uniforms};
+use raw_editor::pipeline::{AdjustParams, ImageColour, Uniforms};
 use raw_editor::config::Config;
 use raw_editor::immich;
 use raw_editor::sidecar;
@@ -686,10 +686,11 @@ impl App {
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
         let comparing = ui.ctx().input(|i| i.key_down(COMPARE_KEY));
+        let colour = self.image.as_ref().map_or(ImageColour::LINEAR_SRGB, |img| img.colour);
         let uniforms = if comparing {
-            Uniforms::passthrough(view, target_is_srgb)
+            Uniforms::passthrough(&colour, view, target_is_srgb)
         } else {
-            Uniforms::new(&self.params, view, target_is_srgb)
+            Uniforms::new(&self.params, &colour, view, target_is_srgb)
         };
 
         ui.painter()

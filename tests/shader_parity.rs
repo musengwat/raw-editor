@@ -11,7 +11,7 @@ use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
-use raw_editor::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
+use raw_editor::pipeline::{AdjustParams, Colour, ImageColour, Uniforms, View, apply, srgb_encode};
 
 const W: usize = 2;
 const H: usize = 2;
@@ -25,11 +25,7 @@ const PIXELS: [[f32; 3]; 4] = [
 ];
 
 fn render_gpu(device: &wgpu::Device, queue: &wgpu::Queue, params: &AdjustParams) -> Vec<[u8; 4]> {
-    let img = DevelopedImage {
-        width: W,
-        height: H,
-        data: PIXELS.iter().flatten().copied().collect(),
-    };
+    let img = DevelopedImage::linear_srgb(W, H, PIXELS.iter().flatten().copied().collect());
     render_image(device, queue, &img, params)
 }
 
@@ -44,7 +40,7 @@ fn render_image(
     let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_image(device, queue, img);
     let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
-    renderer.write_uniforms(queue, &Uniforms::new(params, view, false));
+    renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false));
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -267,20 +263,26 @@ fn detail_source() -> DevelopedImage {
             data[o + 2] = base - n + if y >= h / 2 { 0.08 } else { 0.0 };
         }
     }
-    DevelopedImage { width: w, height: h, data }
+    DevelopedImage::linear_srgb(w, h, data)
 }
 
 /// The neighbourhood filters have to agree between `shader.wgsl::detail` and
 /// `detail::pixel`, edge clamping included.
 fn assert_detail_parity(params: AdjustParams) {
+    assert_image_parity(&detail_source(), params);
+}
+
+/// Render `img` on the GPU at 1:1 and compare with the CPU path: camera RGB →
+/// working (white balance, clip, matrix) → detail → tone chain.
+fn assert_image_parity(img: &DevelopedImage, params: AdjustParams) {
     let Some(ctx) = common::gpu() else {
         eprintln!("SKIP: no wgpu adapter available");
         return;
     };
-    let img = detail_source();
-    let gpu = render_image(&ctx.device, &ctx.queue, &img, &params);
+    let gpu = render_image(&ctx.device, &ctx.queue, img, &params);
 
-    let detailed = detail::apply(img.width, img.height, &img.data, &params);
+    let working = img.working(&Colour::resolve(&img.colour, &params));
+    let detailed = detail::apply(img.width, img.height, &working, &params);
     let mut worst = 0i32;
     for (i, px) in detailed.chunks(3).enumerate() {
         let c = apply(&params, [px[0], px[1], px[2]]);
@@ -328,3 +330,69 @@ fn parity_detail_with_full_chain() {
         ..Default::default()
     });
 }
+
+// --- IR-1: white balance, clip mask and matrix on the GPU -----------------
+
+/// Camera-RGB frame with a real white balance and matrix, a fully clipped
+/// block, and a half-weight clip column (what bilinear filtering produces at
+/// the edge of a blown area). Values are what a sensor sees before WB: green
+/// highest, red and blue lower.
+fn camera_source() -> DevelopedImage {
+    let (w, h) = (24usize, 24usize);
+    let mut img = detail_source();
+    img = DevelopedImage::linear_srgb(w, h, {
+        let mut d = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * 32 + x) * 3;
+                let s = &img.data[o..o + 3];
+                d.extend_from_slice(&[s[0] * 0.45, s[1] * 0.9, s[2] * 0.6]);
+            }
+        }
+        d
+    });
+    img.clip = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            if (4..10).contains(&x) && (4..10).contains(&y) {
+                1.0
+            } else if x == 16 {
+                0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    img.colour = ImageColour {
+        as_shot_wb: [2.1, 1.0, 1.6],
+        cam_to_srgb: [[1.7, -0.55, -0.15], [-0.25, 1.45, -0.2], [0.02, -0.5, 1.48]],
+    };
+    img
+}
+
+#[test]
+fn parity_camera_rgb_white_balance_and_clip() {
+    assert_image_parity(&camera_source(), AdjustParams::default());
+}
+
+/// The detail stage reads neighbours through the same camera→working step, so
+/// clipped neighbours and the matrix must agree inside the 9x9 window too.
+#[test]
+fn parity_camera_rgb_with_detail_and_tone() {
+    assert_image_parity(
+        &camera_source(),
+        AdjustParams {
+            exposure_ev: 0.3,
+            contrast: 0.2,
+            saturation: 0.25,
+            highlights: -0.5,
+            nr_luma: 0.6,
+            nr_chroma: 0.7,
+            sharpen_amount: 1.2,
+            sharpen_radius: 1.3,
+            sharpen_threshold: 0.003,
+            ..Default::default()
+        },
+    );
+}
+
