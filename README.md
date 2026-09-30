@@ -159,7 +159,8 @@ timestamp, and Immich reads the real capture time from the EXIF written into the
 JPEG, so photos file under when they were shot.
 
 The API key is a credential. It lives in `config.json` in your OS config
-directory (`~/.config/raw-editor/` on Linux, `%APPDATA%` on Windows), written
+directory (`~/.config/raw-editor/` on Linux, `%APPDATA%` on Windows,
+`~/Library/Application Support/raw-editor/` on macOS), written
 `0600` on Unix, masked in the settings dialog, redacted from `Debug`, and kept
 out of log lines and error messages — `src/immich.rs` names only the host when a
 request fails. That module is the only place in the project that touches the
@@ -173,14 +174,47 @@ to the run — download it from the Actions tab, unzip, double-click. It is
 portable: no installer, no runtime to install, and wgpu picks DX12 on Windows.
 `workflow_dispatch` lets you trigger a build by hand.
 
-Cross-compiling from Linux is possible in principle — nothing in the dependency
-tree compiles C, only the pure-Rust `windows-sys` and `renderdoc-sys` bindings —
-but rustc has a known crash cross-compiling egui to `x86_64-pc-windows-gnu`, and
-a native MSVC build is what we want to ship regardless.
+Cross-compiling from Linux was avoided: rustc has a known crash cross-compiling
+egui to `x86_64-pc-windows-gnu`, and a native MSVC build is what we want to ship
+regardless. (The GUI stack is pure Rust, but `ring` — pulled in by `ureq`'s TLS
+for the Immich upload — compiles C, so any cross build needs a C cross-compiler.)
 
 Nothing strips the binary, so expect roughly 36 MB (about 15 MB zipped). Adding
 `strip = true` and `lto = true` under `[profile.release]` would cut that
 substantially if it ever matters.
+
+## macOS build
+
+Every push to `master` also builds a universal `raw-editor.app` (Intel + Apple
+Silicon) on a macOS runner (`.github/workflows/macos.yml`) and attaches
+`raw-editor-macos-universal.zip` to the run. It targets **macOS 10.13 High
+Sierra or later**, so it runs on any 2012-or-newer Intel MacBook Air; wgpu
+renders through Metal, which is also why nothing older works — pre-2012 Macs
+have no Metal GPU, and supporting them would mean an OpenGL path for the whole
+shader pipeline.
+
+GitHub has no Intel macOS runners any more, so the Intel slice is cross-built on
+Apple Silicon (Apple's toolchain does that natively) and its tests run under
+Rosetta when the runner has it. All the packaging lives in
+`packaging/macos/bundle.sh`, which also works by hand on a Mac. It refuses to
+produce a bundle unless the binary is universal and the Intel slice really
+targets 10.13 — without `MACOSX_DEPLOYMENT_TARGET` the binary silently inherits
+the build machine's macOS version and won't launch on an old one.
+
+**First launch.** The app is ad-hoc signed, not signed with an Apple developer
+ID, so Gatekeeper blocks a plain double-click. Unzip it, move `raw-editor.app`
+to Applications, then **right-click → Open → Open** once; after that it opens
+normally. (On macOS 15 and later: try to open it, then *System Settings →
+Privacy & Security → Open Anyway*.) Alternatively
+`xattr -dr com.apple.quarantine /Applications/raw-editor.app`.
+
+**Opening files.** Use *File → Open…* or drag a `.rw2` onto the window.
+Double-clicking a raw in Finder, *Open With*, or dropping onto the Dock icon do
+**not** work: macOS delivers those as an Apple Event, which winit (under eframe)
+doesn't expose, so the app deliberately doesn't claim `.rw2` files at all.
+
+Everything works offline except the Immich upload, whose server URL (in
+settings) needs to be reachable from wherever the laptop is.
 
 ## Reference camera
 

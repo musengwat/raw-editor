@@ -38,6 +38,12 @@ Read `README.md` first: architecture, phase status, and reference-camera facts
   `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`. `src/bin/export.rs` is the headless
   end-to-end check — run it on a real RW2 after touching the export path.
 - Sidecars are gitignored (`*.edit.json`). Never write anything into the `.rw2`.
+- macOS: `packaging/macos/bundle.sh` builds the universal `.app` (CI runs it).
+  Keep `MACOSX_DEPLOYMENT_TARGET=10.13` — the target is a 2012+ Intel MacBook
+  Air. File dialogs (rfd) must stay on the UI thread; macOS requires it. There
+  is no Mac here: `cargo check --target x86_64-apple-darwin` works from Linux
+  only with stub `CC_x86_64_apple_darwin`/`AR_x86_64_apple_darwin` scripts,
+  because `ring` compiles C and there's no Apple clang.
 
 ## Verifying the GUI visually
 

@@ -1,0 +1,51 @@
+name: macos
+
+# Builds a universal raw-editor.app (Intel + Apple Silicon) targeting macOS
+# 10.13, so it runs on a 2012-or-later Intel MacBook Air. GitHub no longer has
+# Intel macOS runners, so the Intel slice is cross-built on an Apple Silicon
+# runner; Apple's toolchain does that natively. All the packaging lives in
+# packaging/macos/bundle.sh so it can be run by hand on a Mac too.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      # GPU tests skip themselves when wgpu finds no adapter, as on Windows.
+      - name: Test (Apple Silicon)
+        run: cargo test --release
+
+      # The Intel slice is the one that matters for the MacBook Air. Run its
+      # tests too when the runner has Rosetta; say so plainly when it does not.
+      - name: Test (Intel, under Rosetta)
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            cargo test --release --target x86_64-apple-darwin
+          else
+            echo "::warning::Rosetta not available; Intel tests skipped"
+          fi
+
+      - name: Build and package
+        run: packaging/macos/bundle.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: raw-editor-macos-universal
+          path: dist/raw-editor-macos-universal.zip
+          if-no-files-found: error
