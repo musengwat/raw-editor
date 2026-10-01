@@ -40,19 +40,22 @@ pub fn downsample(img: &DevelopedImage, long_side: usize) -> DevelopedImage {
             }
         }
     }
-    DevelopedImage { width: w, height: h, data, clip, colour: img.colour }
+    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone() }
 }
 
 pub fn compute(img: &DevelopedImage, p: &AdjustParams) -> Histogram {
     let col = Colour::resolve(&img.colour, p);
+    // Optics are evaluated at the small copy's own pixel centres, a fraction
+    // of a source pixel off the point-sampled positions — invisible in a
+    // histogram.
+    let optics = img.optics(p);
     let n = img.width * img.height;
     let (bins, over) = (0..n)
         .into_par_iter()
         .fold(
             || (Box::new([[0u32; BINS]; 3]), [0u32; 3]),
             |(mut bins, mut over), i| {
-                let cam = [img.data[i * 3], img.data[i * 3 + 1], img.data[i * 3 + 2]];
-                let c = apply(p, to_working(&col, cam, img.clip_at(i)));
+                let c = apply(p, to_working(&col, img.camera_rgb(&optics, i), img.clip_at(i)));
                 for ch in 0..3 {
                     let b = (srgb_encode(c[ch]) * (BINS - 1) as f32 + 0.5) as usize;
                     bins[ch][b.min(BINS - 1)] += 1;

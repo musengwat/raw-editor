@@ -65,6 +65,13 @@ enum ExportMsg {
 }
 type ExportResult = ExportMsg;
 
+/// A flat-field change for a lens, requested from the side panel.
+enum OpticsAction {
+    /// Make (or replace) the lens's flat field from the open photo.
+    Make(String),
+    Remove(String),
+}
+
 /// A change to saved looks requested from the side panel, applied after the
 /// panel closure has released its borrows.
 enum LookAction {
@@ -212,7 +219,8 @@ impl App {
         while let Ok((path, result)) = self.loader_rx.try_recv() {
             self.loading = false;
             match result {
-                Ok((img, camera)) => {
+                Ok((mut img, camera)) => {
+                    img.flat = self.config.flat_for(camera.lens.as_deref());
                     let mut renderer = self.render_state.renderer.write();
                     if let Some(r) = renderer.callback_resources.get_mut::<ImageRenderer>() {
                         r.set_image(&self.render_state.device, &self.render_state.queue, &img);
@@ -220,9 +228,8 @@ impl App {
                     drop(renderer);
 
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let serial = camera.serial.as_deref();
-                    let (baseline, _) = sidecar::baseline(&self.config, serial);
-                    let (params, note) = match sidecar::initial(&path, &self.config, serial) {
+                    let (baseline, _) = sidecar::baseline(&self.config, &camera);
+                    let (params, note) = match sidecar::initial(&path, &self.config, &camera) {
                         Ok((p, Origin::Sidecar)) => (p, " — edits restored".to_string()),
                         Ok((p, Origin::BodyLook(name))) => (p, format!(" — this camera starts in \"{name}\"")),
                         Ok((p, Origin::Neutral)) => (p, String::new()),
@@ -620,6 +627,9 @@ impl App {
         let body_look = serial.as_ref().and_then(|s| self.config.body_looks.get(s).cloned());
         let look_name = &mut self.look_name;
         let mut look_action: Option<LookAction> = None;
+        let lens = self.camera.lens.clone();
+        let has_flat = lens.as_ref().is_some_and(|l| self.config.flat_fields.contains_key(l));
+        let mut optics_action: Option<OpticsAction> = None;
         let p = &mut self.params;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -787,6 +797,47 @@ impl App {
                     .small(),
             );
 
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Optics").strong());
+            ui.add(egui::Slider::new(&mut p.hotspot_amount, 0.0..=2.0).text("Hot spot"))
+                .on_hover_text("How much brighter the lens's central hot spot is than its surroundings; 0 = off");
+            ui.add_enabled_ui(p.hotspot_amount > 0.0, |ui| {
+                ui.add(egui::Slider::new(&mut p.hotspot_radius, 0.05..=1.0).text("Spot radius"));
+                ui.add(egui::Slider::new(&mut p.hotspot_centre[0], 0.0..=1.0).text("Spot X"));
+                ui.add(egui::Slider::new(&mut p.hotspot_centre[1], 0.0..=1.0).text("Spot Y"));
+                egui::CollapsingHeader::new("Spot colour").show(ui, |ui| {
+                    for (i, name) in ["Red", "Green", "Blue"].iter().enumerate() {
+                        ui.add(egui::Slider::new(&mut p.hotspot_balance[i], 0.0..=2.0).text(*name));
+                    }
+                });
+            });
+            match &lens {
+                Some(lens) => {
+                    ui.add_enabled(has_flat, egui::Checkbox::new(&mut p.flat_field, format!("Flat field ({lens})")))
+                        .on_hover_text("Divides out this lens's hot spot, vignetting and colour shading")
+                        .on_disabled_hover_text("No flat field for this lens yet");
+                    ui.horizontal(|ui| {
+                        let label = if has_flat { "Replace from this photo" } else { "Make from this photo" };
+                        if ui
+                            .add_enabled(has_image, egui::Button::new(label))
+                            .on_hover_text(
+                                "Use this photo as the lens's flat field: an evenly lit wall or overcast sky, \
+                                 defocused, same lens, filter and aperture, nothing blown out",
+                            )
+                            .clicked()
+                        {
+                            optics_action = Some(OpticsAction::Make(lens.clone()));
+                        }
+                        if has_flat && ui.button("Remove").clicked() {
+                            optics_action = Some(OpticsAction::Remove(lens.clone()));
+                        }
+                    });
+                }
+                None => {
+                    ui.label(egui::RichText::new("Lens unknown — flat fields need the lens model").weak().small());
+                }
+            }
+
             ui.add_space(12.0);
             reset = ui.button("Reset").clicked();
             ui.label(
@@ -831,6 +882,9 @@ impl App {
         if let Some(action) = look_action {
             self.apply_look_action(action);
         }
+        if let Some(action) = optics_action {
+            self.apply_optics_action(action);
+        }
         if do_export {
             // Always ask where to save: the dialog also gives us overwrite
             // confirmation for free, which the old silent
@@ -838,6 +892,44 @@ impl App {
             let ctx = ui.ctx().clone();
             let format = self.export_format;
             self.pick_and_export(&ctx, format);
+        }
+    }
+
+    fn apply_optics_action(&mut self, action: OpticsAction) {
+        let Some(img) = self.image.as_mut() else { return };
+        let flat = match &action {
+            OpticsAction::Make(lens) => match raw_editor::flatfield::FlatField::from_image(img, lens) {
+                Ok(ff) => {
+                    self.config.flat_fields.insert(lens.clone(), ff.clone());
+                    self.status = format!("Flat field saved for {lens} — now applied to photos taken with it");
+                    Some(Arc::new(ff))
+                }
+                Err(e) => {
+                    self.status = format!("Can't use this photo as a flat field: {e:#}");
+                    return;
+                }
+            },
+            OpticsAction::Remove(lens) => {
+                self.config.flat_fields.remove(lens);
+                self.status = format!("Flat field for {lens} removed");
+                None
+            }
+        };
+        // The open photo picks the change up at once: re-upload it with the
+        // new (or no) flat field. `make_mut` only copies if an export holds it.
+        Arc::make_mut(img).flat = flat.clone();
+        if let Some(preview) = &mut self.preview {
+            preview.flat = flat;
+        }
+        self.histogram = None;
+        let mut renderer = self.render_state.renderer.write();
+        if let Some(r) = renderer.callback_resources.get_mut::<ImageRenderer>() {
+            r.set_image(&self.render_state.device, &self.render_state.queue, img);
+        }
+        drop(renderer);
+        self.baseline = sidecar::baseline(&self.config, &self.camera).0;
+        if let Err(e) = self.config.save() {
+            self.status = format!("Couldn't save settings: {e:#}");
         }
     }
 
@@ -862,7 +954,7 @@ impl App {
             }
         }
         // The open photo's no-sidecar baseline may have changed with it.
-        self.baseline = sidecar::baseline(&self.config, self.camera.serial.as_deref()).0;
+        self.baseline = sidecar::baseline(&self.config, &self.camera).0;
         if let Err(e) = self.config.save() {
             self.status = format!("Couldn't save settings: {e:#}");
         }
@@ -913,7 +1005,7 @@ impl App {
             self.status = "Missed the image — click on the photo".into();
             return;
         };
-        match img.neutral_gains(x, y) {
+        match img.neutral_gains(x, y, &self.params) {
             Ok(pick) => {
                 self.params.wb_gains = Some(pick.gains);
                 self.picking_wb = false;
@@ -1078,10 +1170,11 @@ fn batch_one(
     quality: u8,
     config: &Config,
 ) -> anyhow::Result<Option<String>> {
-    let serial = raw_editor::metadata::camera_ids(path).ok().and_then(|ids| ids.serial);
-    let (params, _) = sidecar::initial(path, config, serial.as_deref())?;
+    let ids = raw_editor::metadata::camera_ids(path).unwrap_or_default();
+    let (params, _) = sidecar::initial(path, config, &ids)?;
     let raw = rawler::decode_file(path)?;
-    let img = develop(&raw)?;
+    let mut img = develop(&raw)?;
+    img.flat = config.flat_for(ids.lens.as_deref());
     let rendered = match export::render_gpu(device, queue, &img, &params) {
         Ok(r) => r,
         Err(e) => {

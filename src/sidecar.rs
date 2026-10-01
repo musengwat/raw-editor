@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::metadata::CameraIds;
 use crate::pipeline::AdjustParams;
 
 /// Where a photo's starting adjustments came from.
@@ -19,27 +20,28 @@ pub enum Origin {
     Neutral,
 }
 
-/// What opening `raw` with no sidecar gives: neutral, or the look assigned to
-/// its camera body (`serial`). Also the baseline the GUI compares against to
-/// decide whether a sidecar is needed at all.
-pub fn baseline(config: &Config, serial: Option<&str>) -> (AdjustParams, Origin) {
-    match config.body_look(serial) {
+/// What opening a photo with no sidecar gives: neutral, or the look assigned
+/// to its camera body, with the flat field on if its lens has one. Also the
+/// baseline the GUI compares against to decide whether a sidecar is needed.
+pub fn baseline(config: &Config, ids: &CameraIds) -> (AdjustParams, Origin) {
+    let mut p = AdjustParams::default();
+    p.flat_field = config.flat_for(ids.lens.as_deref()).is_some();
+    match config.body_look(ids.serial.as_deref()) {
         Some(look) => {
-            let mut p = AdjustParams::default();
             look.apply(&mut p);
             (p, Origin::BodyLook(look.name))
         }
-        None => (AdjustParams::default(), Origin::Neutral),
+        None => (p, Origin::Neutral),
     }
 }
 
 /// The adjustments a photo opens (or batch-exports) with: its sidecar if it
 /// has one, otherwise [`baseline`]. Shared by the GUI, the batch export and
 /// the CLI so all three agree.
-pub fn initial(raw: &Path, config: &Config, serial: Option<&str>) -> Result<(AdjustParams, Origin)> {
+pub fn initial(raw: &Path, config: &Config, ids: &CameraIds) -> Result<(AdjustParams, Origin)> {
     Ok(match load(raw)? {
         Some(p) => (p, Origin::Sidecar),
-        None => baseline(config, serial),
+        None => baseline(config, ids),
     })
 }
 
@@ -133,6 +135,11 @@ mod tests {
             sharpen_threshold: 0.004,
             nr_luma: 0.45,
             nr_chroma: 0.7,
+            hotspot_amount: 0.6,
+            hotspot_radius: 0.22,
+            hotspot_centre: [0.48, 0.55],
+            hotspot_balance: [1.0, 0.7, 0.4],
+            flat_field: true,
         };
         save(&raw, &params).unwrap();
         assert_eq!(load(&raw).unwrap().unwrap(), params);
@@ -170,10 +177,11 @@ mod tests {
         let mut config = Config::default();
         config.body_looks.insert("F92".into(), "Red–blue swap".into());
 
-        assert_eq!(initial(&raw, &config, Some("XEL")).unwrap(), (AdjustParams::default(), Origin::Neutral));
-        assert_eq!(initial(&raw, &config, None).unwrap().1, Origin::Neutral);
+        let body = |s: &str| CameraIds { serial: Some(s.into()), lens: None };
+        assert_eq!(initial(&raw, &config, &body("XEL")).unwrap(), (AdjustParams::default(), Origin::Neutral));
+        assert_eq!(initial(&raw, &config, &CameraIds::default()).unwrap().1, Origin::Neutral);
 
-        let (p, origin) = initial(&raw, &config, Some("F92")).unwrap();
+        let (p, origin) = initial(&raw, &config, &body("F92")).unwrap();
         assert_eq!(origin, Origin::BodyLook("Red–blue swap".into()));
         assert_eq!(p.mixer, [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]);
         assert_eq!(p.colour_mode, crate::pipeline::ColourMode::SensorRgb);
@@ -181,6 +189,19 @@ mod tests {
         // A sidecar always wins — including a neutral one, which is how a
         // single photo opts out of its body's look.
         save(&raw, &AdjustParams::default()).unwrap();
-        assert_eq!(initial(&raw, &config, Some("F92")).unwrap(), (AdjustParams::default(), Origin::Sidecar));
+        assert_eq!(initial(&raw, &config, &body("F92")).unwrap(), (AdjustParams::default(), Origin::Sidecar));
+    }
+
+    #[test]
+    fn a_lens_with_a_flat_field_starts_with_it_on() {
+        let mut config = Config::default();
+        let lens = "LUMIX G 20/F1.7";
+        config.flat_fields.insert(
+            lens.into(),
+            crate::flatfield::FlatField { lens: lens.into(), width: 1, height: 1, gains: vec![[1.0; 3]] },
+        );
+        let ids = |l: &str| CameraIds { serial: None, lens: Some(l.into()) };
+        assert!(baseline(&config, &ids(lens)).0.flat_field);
+        assert!(!baseline(&config, &ids("LUMIX G VARIO 7-14/F4.0")).0.flat_field);
     }
 }

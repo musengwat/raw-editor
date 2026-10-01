@@ -101,6 +101,19 @@ pub struct AdjustParams {
     /// Colour noise reduction, 0..1. Plain blur of the chroma difference,
     /// which is where high-ISO blotches live.
     pub nr_chroma: f32,
+
+    /// Radial hot-spot correction (IR-4): how much brighter the centre of the
+    /// spot is than its surroundings, 0 = off, 1 = twice as bright.
+    pub hotspot_amount: f32,
+    /// Gaussian radius of the spot, as a fraction of the half-diagonal.
+    pub hotspot_radius: f32,
+    /// Spot centre in image coordinates (0..1, y down).
+    pub hotspot_centre: [f32; 2],
+    /// Per-channel weight of `hotspot_amount` — IR hot spots are usually
+    /// coloured. Neutral = 1.
+    pub hotspot_balance: [f32; 3],
+    /// Apply the flat field saved for this photo's lens, if there is one.
+    pub flat_field: bool,
 }
 
 /// Half-width of the detail neighbourhood, in source pixels. Mirrored in
@@ -135,6 +148,11 @@ impl Default for AdjustParams {
             sharpen_threshold: 0.0,
             nr_luma: 0.0,
             nr_chroma: 0.0,
+            hotspot_amount: 0.0,
+            hotspot_radius: 0.3,
+            hotspot_centre: [0.5, 0.5],
+            hotspot_balance: [1.0; 3],
+            flat_field: false,
         }
     }
 }
@@ -194,6 +212,8 @@ pub fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
 
 /// Camera RGB → working linear RGB for one pixel: white balance, then make a
 /// clipped pixel neutral, then the matrix. Mirrors `to_working` in the shader.
+/// `cam` must already carry the optics gain (`flatfield::Optics`), which the
+/// shader applies at the top of its `to_working`.
 ///
 /// `clip` is 0..1 rather than a flag because the GPU samples the clip mask
 /// with bilinear filtering; blending keeps the edge of a blown area soft. A
@@ -216,7 +236,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 208 bytes.
+/// Total size 240 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -230,6 +250,11 @@ pub struct Uniforms {
     pub lift: [f32; 4],
     pub gamma: [f32; 4],
     pub gain: [f32; 4],
+    /// Hot-spot strength per channel in `.rgb`, Gaussian radius in `.a`.
+    pub hotspot: [f32; 4],
+    /// Hot-spot centre (uv) in `.xy`, image aspect (w/h) in `.z`, flat field
+    /// on (1.0) / off in `.w`.
+    pub optics: [f32; 4],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -311,6 +336,17 @@ impl Uniforms {
             lift: v4(p.lift),
             gamma: v4(p.gamma),
             gain: v4(p.gain),
+            hotspot: {
+                let a = crate::flatfield::hotspot_amounts(p);
+                [a[0], a[1], a[2], p.hotspot_radius.max(crate::flatfield::MIN_HOTSPOT_RADIUS)]
+            },
+            optics: [
+                p.hotspot_centre[0],
+                p.hotspot_centre[1],
+                // texel = 1 / size, so texel.y / texel.x = width / height.
+                view.texel[1] / view.texel[0],
+                if p.flat_field { 1.0 } else { 0.0 },
+            ],
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -485,8 +521,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_208_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 208);
+    fn uniforms_layout_is_240_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 240);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -498,6 +534,8 @@ mod tests {
             &u.lift as *const _ as usize,
             &u.gamma as *const _ as usize,
             &u.gain as *const _ as usize,
+            &u.hotspot as *const _ as usize,
+            &u.optics as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
         }

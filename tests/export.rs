@@ -261,3 +261,72 @@ fn tiff_carries_metadata() {
     let tiff::decoder::DecodingResult::U16(samples) = img else { panic!("not 16-bit") };
     assert_eq!(samples, rendered.data, "metadata disturbed the pixels");
 }
+
+/// IR-4 end to end on a real 12 MP file: build a flat field from a frame and
+/// export that same frame with it through the GPU path. The frame is a busy
+/// indoor scene, not a real flat frame, so gains get clamped and blended across
+/// hard edges and it cannot come out perfectly even (that property is tested on
+/// smooth synthetic shading in `flatfield::tests`). What it does prove at full
+/// size: the variation drops sharply, and the GPU and CPU exports agree with a
+/// flat field bound. Skips without testdata.
+#[test]
+fn flat_field_on_a_real_frame_through_the_gpu_export() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/ir/P1320167.rw2");
+    if !path.exists() {
+        eprintln!("SKIP: testdata not present");
+        return;
+    }
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    let raw = rawler::decode_file(&path).unwrap();
+    let mut img = raw_editor::develop::develop(&raw).unwrap();
+    let ff = raw_editor::flatfield::FlatField::from_image(&img, "LUMIX G 20/F1.7").unwrap();
+    img.flat = Some(std::sync::Arc::new(ff));
+
+    // Dark enough that nothing renders clipped; cells holding clipped source
+    // pixels are skipped (they are forced neutral, not shaded).
+    let base = AdjustParams { exposure_ev: -2.0, ..Default::default() };
+    let spread = |p: &AdjustParams| -> f64 {
+        let out = export::render_gpu(&ctx.device, &ctx.queue, &img, p).unwrap();
+        let (gw, gh) = (16, 12);
+        let mut means = Vec::new();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (x0, x1) = (gx * out.width / gw, (gx + 1) * out.width / gw);
+                let (y0, y1) = (gy * out.height / gh, (gy + 1) * out.height / gh);
+                let (mut sum, mut n, mut clipped) = (0f64, 0usize, false);
+                for y in (y0..y1).step_by(4) {
+                    for x in (x0..x1).step_by(4) {
+                        let i = y * out.width + x;
+                        clipped |= img.clip_at(i) > 0.0;
+                        let g = out.data[i * 3 + 1] as f64 / 65535.0;
+                        // sRGB decode, green channel as the level.
+                        sum += if g <= 0.04045 { g / 12.92 } else { ((g + 0.055) / 1.055).powf(2.4) };
+                        n += 1;
+                    }
+                }
+                if !clipped {
+                    means.push(sum / n as f64);
+                }
+            }
+        }
+        assert!(means.len() > 100, "too few unclipped cells: {}", means.len());
+        let mean = means.iter().sum::<f64>() / means.len() as f64;
+        (means.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / means.len() as f64).sqrt() / mean
+    };
+    let on = AdjustParams { flat_field: true, ..base };
+    let without = spread(&base);
+    let with = spread(&on);
+    eprintln!("cell spread (coefficient of variation): without {without:.3}, with {with:.3}");
+    assert!(without > 0.5, "the scene itself should be uneven: {without:.3}");
+    assert!(with < without / 4.0, "flat field only took {without:.3} down to {with:.3}");
+
+    let gpu = export::render_gpu(&ctx.device, &ctx.queue, &img, &on).unwrap();
+    let cpu = export::render_cpu(&img, &on);
+    let worst = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    let mean = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b) as f64).sum::<f64>() / gpu.data.len() as f64;
+    eprintln!("GPU vs CPU with flat field: mean {mean:.1}, worst {worst} (of 65535)");
+    assert!(mean < 64.0 && worst < 1024, "GPU and CPU disagree: mean {mean:.1}, worst {worst}");
+}

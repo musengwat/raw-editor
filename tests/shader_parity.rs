@@ -12,7 +12,7 @@ use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
 use raw_editor::pipeline::{ColourMode, 
-    AdjustParams, Colour, ImageColour, Uniforms, View, apply, clip_view, srgb_encode,
+    AdjustParams, ImageColour, Uniforms, View, apply, clip_view, srgb_encode,
 };
 
 const W: usize = 2;
@@ -295,7 +295,7 @@ fn assert_image_parity(img: &DevelopedImage, params: AdjustParams) {
     };
     let gpu = render_image(&ctx.device, &ctx.queue, img, &params);
 
-    let working = img.working(&Colour::resolve(&img.colour, &params));
+    let working = img.working(&params);
     let detailed = detail::apply(img.width, img.height, &working, &params);
     let mut worst = 0i32;
     for (i, px) in detailed.chunks(3).enumerate() {
@@ -429,6 +429,80 @@ fn parity_channel_mixer_looks() {
     assert_image_parity(
         &camera_source(),
         AdjustParams { mixer: [[1.2, -0.4, 0.3], [0.1, 0.6, 0.2], [-0.2, 0.5, 0.9]], ..Default::default() },
+    );
+}
+
+// --- IR-4: hot spot and flat field --------------------------------------
+
+/// A flat field with real structure: brighter gain towards one corner and a
+/// coloured bump, so bilinear sampling and per-channel gains both show.
+fn test_flat() -> raw_editor::flatfield::FlatField {
+    let (w, h) = (6usize, 5usize);
+    let gains = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            [0.7 + 0.12 * x, 1.0 + 0.05 * y, 1.3 - 0.06 * x - 0.04 * y]
+                .map(|v| half::f16::from_f32(v).to_f32())
+        })
+        .collect();
+    raw_editor::flatfield::FlatField { lens: "test".into(), width: w, height: h, gains }
+}
+
+#[test]
+fn parity_hotspot() {
+    // Off-centre, coloured, on a non-square image — exercises the aspect
+    // handling and the per-channel balance.
+    let mut img = camera_source();
+    img = DevelopedImage { width: 24, height: 24, ..img };
+    for p in [
+        AdjustParams { hotspot_amount: 0.8, hotspot_radius: 0.25, ..Default::default() },
+        AdjustParams {
+            hotspot_amount: 1.5,
+            hotspot_radius: 0.15,
+            hotspot_centre: [0.3, 0.65],
+            hotspot_balance: [1.0, 0.6, 0.2],
+            ..Default::default()
+        },
+    ] {
+        assert_image_parity(&img, p);
+    }
+    assert_image_parity(&detail_source(), AdjustParams { hotspot_amount: 1.0, hotspot_centre: [0.8, 0.2], ..Default::default() });
+}
+
+#[test]
+fn parity_flat_field() {
+    let mut img = camera_source();
+    img.flat = Some(std::sync::Arc::new(test_flat()));
+    assert_image_parity(&img, AdjustParams { flat_field: true, ..Default::default() });
+    // Switched off, the bound flat field must have no effect at all.
+    assert_image_parity(&img, AdjustParams::default());
+}
+
+/// Optics + detail: the 9x9 neighbourhood reads past the image edge, where
+/// the shader must clamp the optics position just as the CPU clamps pixels.
+/// (Checked by deleting that clamp from the shader: this test then fails.)
+#[test]
+fn parity_optics_with_detail_at_the_edges() {
+    let mut img = detail_source();
+    img.flat = Some(std::sync::Arc::new(test_flat()));
+    assert_image_parity(
+        &img,
+        AdjustParams {
+            flat_field: true,
+            // Tight, strong and coloured, centred on a corner, so the optics
+            // change steeply across the out-of-image neighbours.
+            hotspot_amount: 3.0,
+            hotspot_radius: 0.06,
+            hotspot_centre: [0.0, 1.0],
+            hotspot_balance: [1.0, 0.3, 0.0],
+            nr_luma: 0.7,
+            nr_chroma: 1.0,
+            // Strong, wide sharpening magnifies any disagreement in the far
+            // neighbours, which is where the clamp matters.
+            sharpen_amount: 3.0,
+            sharpen_radius: 2.5,
+            ..Default::default()
+        },
     );
 }
 

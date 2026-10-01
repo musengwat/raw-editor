@@ -74,7 +74,11 @@ Infrared (the GF1 is now a full-spectrum conversion):
   to photos with no sidecar of their own. The serial identifies the *body*,
   not the conversion, so the GF1's pre-conversion shots also open in its IR
   look — Reset on such a photo saves a neutral sidecar and opts it out
-- [ ] IR-4 — hot-spot correction (radial, then per-lens flat field)
+- [x] IR-4 — hot-spot correction: a radial model (amount, radius, centre,
+  per-channel colour) plus a per-lens flat field made from one evenly lit,
+  defocused frame (*Optics → Make from this photo*). A lens with a flat field
+  opens with it on. Not yet tried on a real IR hot spot — none of the test
+  shots has one
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in

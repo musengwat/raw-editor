@@ -1,5 +1,5 @@
-//! Persistent settings: the Immich connection, saved looks and which look each
-//! camera body starts in.
+//! Persistent settings: the Immich connection, saved looks, which look each
+//! camera body starts in, and a flat field per lens.
 //!
 //! The API key is a credential. It is stored `0600` on Unix, redacted from
 //! `Debug`, and must never reach a log line, an error message or the status
@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::flatfield::FlatField;
 use crate::looks::Look;
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -26,6 +27,8 @@ pub struct Config {
     /// Body serial → name of the look a photo from that body starts in when
     /// it has no sidecar yet (e.g. the IR-converted GF1 → an Aerochrome look).
     pub body_looks: std::collections::BTreeMap<String, String>,
+    /// Lens model → flat field made from a reference shot with that lens.
+    pub flat_fields: std::collections::BTreeMap<String, FlatField>,
 }
 
 /// Redacts the key, so a stray `{:?}` cannot leak it.
@@ -37,6 +40,7 @@ impl std::fmt::Debug for Config {
             .field("upload_after_export", &self.upload_after_export)
             .field("looks", &self.looks.iter().map(|l| &l.name).collect::<Vec<_>>())
             .field("body_looks", &self.body_looks)
+            .field("flat_fields", &self.flat_fields.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -68,6 +72,11 @@ impl Config {
     /// The look a photo from this body starts in, if one is set and still exists.
     pub fn body_look(&self, serial: Option<&str>) -> Option<Look> {
         self.find_look(self.body_looks.get(serial?)?)
+    }
+
+    /// The flat field for a lens, if one has been made.
+    pub fn flat_for(&self, lens: Option<&str>) -> Option<std::sync::Arc<FlatField>> {
+        self.flat_fields.get(lens?).cloned().map(std::sync::Arc::new)
     }
 
     /// Save a look, replacing any saved look with the same name.
@@ -235,5 +244,16 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"immich_url":"https://x.org","upload_after_export":true}"#).unwrap();
         assert!(c.looks.is_empty() && c.body_looks.is_empty());
         assert!(c.upload_after_export);
+    }
+
+    #[test]
+    fn flat_fields_are_found_by_lens() {
+        let mut c = Config::default();
+        let ff = FlatField { lens: "LUMIX G 20/F1.7".into(), width: 1, height: 1, gains: vec![[1.5; 3]] };
+        c.flat_fields.insert(ff.lens.clone(), ff);
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.flat_for(Some("LUMIX G 20/F1.7")).unwrap().gains, vec![[1.5; 3]]);
+        assert!(c.flat_for(Some("LUMIX G VARIO 7-14/F4.0")).is_none());
+        assert!(c.flat_for(None).is_none());
     }
 }

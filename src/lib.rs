@@ -2,6 +2,7 @@ pub mod config;
 pub mod detail;
 pub mod develop;
 pub mod export;
+pub mod flatfield;
 pub mod gpu;
 pub mod histogram;
 pub mod immich;

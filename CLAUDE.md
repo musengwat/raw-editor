@@ -176,6 +176,39 @@ metadata tells pre- from post-conversion files.
 The CLI honours body looks too. To test without touching the real settings,
 point `XDG_CONFIG_HOME` at a scratch directory.
 
+## Optics: hot spot and flat field (IR-4)
+
+Both are a position-dependent gain on **camera RGB, before white balance**:
+`optics()` at the top of the shader's `to_working(s, uv)`, mirrored by
+`flatfield::Optics::gain` and applied on the CPU through
+`DevelopedImage::camera_rgb` / `working(&params)` — so the histogram, the
+eyedropper and CPU export all see it. `Colour` alone no longer describes a
+render; that is why `working` takes `AdjustParams`.
+
+- The flat field is a coarse grid (32 cells on the long side) of per-channel
+  gains = frame mean / cell mean, f16-rounded so CPU and GPU agree, uploaded
+  as a small rgba16float texture on binding 3 and sampled with the image's
+  linear clamp sampler. `FlatField::sample` mirrors that filtering (texel
+  centres at `(i + 0.5) / n`). No extra blur on top of cell averaging: one 3x3
+  pass left 5.6% of a tight hot spot behind, against 1.9% without.
+- Flat fields live in `Config.flat_fields` keyed by lens (maker-note
+  `LensType`); `DevelopedImage.flat` carries the one for the open photo (set by
+  the caller, since it comes from settings). `sidecar::baseline` turns
+  `flat_field` on for a lens that has one.
+- The shader clamps the optics `uv` to the outermost texel centres: the detail
+  stage samples past the edge, where the CPU mirror clamps the *pixel*.
+  `parity_optics_with_detail_at_the_edges` catches a missing clamp (43 levels
+  off without it, 1 with) — it needed strong, wide sharpening to do so; with
+  mild settings the error hid inside the 3-level tolerance.
+- Uniforms grew two vec4s (`hotspot`, `optics`) to 240 bytes.
+- `tests/export.rs::flat_field_on_a_real_frame_through_the_gpu_export` runs a
+  12 MP real file with a flat field through GPU and CPU export (they agree to
+  ~6/65535 mean, 45 worst).
+
+Screenshot note: a window taller than ~800 px came back from `xwd` at 24 bits
+per pixel, which the decode recipe above (32-bit) turns into a grey, striped,
+narrowed image. Check `h[11]` (bits per pixel) before assuming a broken UI.
+
 ## Detail stage (noise reduction + sharpening)
 
 `src/detail.rs` mirrors the `detail()` function in `src/shader.wgsl`; both run

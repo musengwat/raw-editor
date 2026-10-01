@@ -10,6 +10,8 @@ struct Uniforms {
     lift: vec4<f32>,       // .rgb = per-channel lift  (neutral 0)
     gamma: vec4<f32>,      // .rgb = per-channel gamma (neutral 1)
     gain: vec4<f32>,       // .rgb = per-channel gain  (neutral 1)
+    hotspot: vec4<f32>,    // .rgb = hot-spot strength per channel, .a = radius
+    optics: vec4<f32>,     // .xy = hot-spot centre (uv), .z = aspect w/h, .w = flat field on
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -36,6 +38,8 @@ struct Uniforms {
 // .rgb = demosaiced camera RGB (not white balanced), .a = clip mask.
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+// Lens flat field: camera-RGB gains on a coarse grid (1x1 white when none).
+@group(0) @binding(3) var flat_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -87,11 +91,32 @@ fn srgb_encode(v: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, v <= vec3(0.0031308));
 }
 
-// Camera RGB -> working linear RGB: white balance, clipped pixels to neutral,
-// matrix. Mirrored in src/pipeline.rs::to_working. The clip mask is filtered
-// like everything else, so it blends rather than switches.
-fn to_working(s: vec4<f32>) -> vec3<f32> {
-    var c = s.rgb * u.wb.rgb;
+// Flat field and radial hot-spot gain at a texture position. Mirrored in
+// src/flatfield.rs::Optics::gain. `uv` is clamped to the outermost texel
+// centres first: the detail stage samples past the edge, where the texture
+// clamps, and the CPU mirror clamps the pixel — so must the position.
+fn optics(uv_in: vec2<f32>) -> vec3<f32> {
+    let uv = clamp(uv_in, 0.5 * u.texel, vec2(1.0) - 0.5 * u.texel);
+    var k = vec3(1.0);
+    if u.optics.w > 0.5 {
+        k = textureSampleLevel(flat_tex, samp, uv, 0.0).rgb;
+    }
+    if any(u.hotspot.rgb != vec3(0.0)) {
+        let aspect = u.optics.z;
+        let hd = 0.5 * sqrt(aspect * aspect + 1.0);
+        let d = (uv - u.optics.xy) * vec2(aspect, 1.0) / hd;
+        let g = exp(-dot(d, d) / (2.0 * u.hotspot.a * u.hotspot.a));
+        k = k / (vec3(1.0) + u.hotspot.rgb * g);
+    }
+    return k;
+}
+
+// Camera RGB -> working linear RGB: optics, white balance, clipped pixels to
+// neutral, matrix. Mirrored in src/pipeline.rs::to_working (plus
+// DevelopedImage::camera_rgb for the optics). The clip mask is filtered like
+// everything else, so it blends rather than switches.
+fn to_working(s: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
+    var c = s.rgb * optics(uv) * u.wb.rgb;
     let m = max(c.r, max(c.g, c.b));
     c = mix(c, vec3(m), s.a);
     return vec3(dot(u.m0.rgb, c), dot(u.m1.rgb, c), dot(u.m2.rgb, c));
@@ -117,9 +142,8 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
     for (var dy = -DETAIL_R; dy <= DETAIL_R; dy++) {
         for (var dx = -DETAIL_R; dx <= DETAIL_R; dx++) {
-            let s = to_working(textureSampleLevel(
-                tex, samp, uv + vec2(f32(dx), f32(dy)) * u.texel, 0.0
-            ));
+            let suv = uv + vec2(f32(dx), f32(dy)) * u.texel;
+            let s = to_working(textureSampleLevel(tex, samp, suv, 0.0), suv);
             let sl = dot(s, LUMA_709);
             let d2 = f32(dx * dx + dy * dy);
 
@@ -151,7 +175,7 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var c = to_working(textureSample(tex, samp, in.uv));
+    var c = to_working(textureSample(tex, samp, in.uv), in.uv);
 
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.

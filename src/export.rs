@@ -22,7 +22,7 @@ use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
 use crate::metadata::ExportMetadata;
-use crate::pipeline::{AdjustParams, Colour, Uniforms, View, apply, srgb_encode};
+use crate::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -68,7 +68,7 @@ fn to_u16(v: f32) -> u16 {
 pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     // Neighbourhood work first, then the per-pixel chain — same order as the
     // shader.
-    let working = img.working(&Colour::resolve(&img.colour, params));
+    let working = img.working(params);
     let detailed = detail::apply(img.width, img.height, &working, params);
     let mut data = vec![0u16; img.width * img.height * 3];
     data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {

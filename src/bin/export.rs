@@ -150,8 +150,8 @@ fn export_one(
     settings: &raw_editor::config::Config,
     config: Option<&raw_editor::config::Config>,
 ) -> Result<PathBuf> {
-    let serial = metadata::camera_ids(path).ok().and_then(|ids| ids.serial);
-    let (params, origin) = sidecar::initial(path, settings, serial.as_deref())?;
+    let ids = metadata::camera_ids(path).unwrap_or_default();
+    let (params, origin) = sidecar::initial(path, settings, &ids)?;
     match origin {
         sidecar::Origin::Sidecar => println!("params:    {params:?}"),
         sidecar::Origin::BodyLook(name) => println!("params:    no sidecar; camera look \"{name}\""),
@@ -160,8 +160,15 @@ fn export_one(
 
     let t = std::time::Instant::now();
     let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
-    let img = develop(&raw)?;
+    let mut img = develop(&raw)?;
     println!("developed: {}x{} in {:.2?}", img.width, img.height, t.elapsed());
+    img.flat = settings.flat_for(ids.lens.as_deref());
+    if params.flat_field {
+        match &img.flat {
+            Some(_) => println!("optics:    flat field for {}", ids.lens.as_deref().unwrap_or("?")),
+            None => println!("optics:    flat field on, but none saved for this lens"),
+        }
+    }
 
     let t = std::time::Instant::now();
     let rendered = match gpu {

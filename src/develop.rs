@@ -11,7 +11,8 @@ use rawler::imgop::xyz::Illuminant;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
 
-use crate::pipeline::{Colour, ImageColour, WB_GAIN_MAX, WB_GAIN_MIN, to_working};
+use crate::flatfield::{FlatField, Optics};
+use crate::pipeline::{AdjustParams, Colour, ImageColour, WB_GAIN_MAX, WB_GAIN_MIN, to_working};
 
 /// Half-width of the eyedropper's averaging window (9x9 pixels), so one noisy
 /// pixel cannot set the white balance.
@@ -45,6 +46,7 @@ pub struct Pick {
 }
 
 /// Developed image: tightly packed RGB f32, active-area size.
+#[derive(Clone)]
 pub struct DevelopedImage {
     pub width: usize,
     pub height: usize,
@@ -55,20 +57,27 @@ pub struct DevelopedImage {
     /// saturated photosite, else 0.0. Empty means nothing clipped.
     pub clip: Vec<f32>,
     pub colour: ImageColour,
+    /// The flat field saved for this photo's lens, if any. Set by whoever
+    /// opened the file (it comes from the settings, keyed by lens); used only
+    /// when `AdjustParams::flat_field` is on.
+    pub flat: Option<std::sync::Arc<FlatField>>,
 }
 
 impl DevelopedImage {
     /// An image whose data is already linear sRGB (tests, synthetic input).
     pub fn linear_srgb(width: usize, height: usize, data: Vec<f32>) -> Self {
-        Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB }
+        Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB, flat: None }
     }
 
     /// Eyedropper: white-balance gains that make the area around `(x, y)`
     /// neutral. Averages camera RGB over a `PICK_RADIUS` window, skipping
     /// clipped pixels (their ratios are meaningless). Neutral camera RGB stays
     /// neutral through the matrix (its rows sum to 1), so the same gains work
-    /// in both colour modes.
-    pub fn neutral_gains(&self, x: usize, y: usize) -> Result<Pick, PickError> {
+    /// in both colour modes. The optics correction in `p` comes first, as it
+    /// does in the pipeline, so a pick inside a coloured hot spot is judged
+    /// on corrected colour.
+    pub fn neutral_gains(&self, x: usize, y: usize, p: &AdjustParams) -> Result<Pick, PickError> {
+        let optics = self.optics(p);
         let r = PICK_RADIUS;
         let mut sum = [0f64; 3];
         let mut n = 0u32;
@@ -78,8 +87,9 @@ impl DevelopedImage {
                 if self.clip_at(i) > 0.0 {
                     continue;
                 }
+                let k = optics.gain_at(px, py, self.width, self.height);
                 for c in 0..3 {
-                    sum[c] += self.data[i * 3 + c] as f64;
+                    sum[c] += (self.data[i * 3 + c] * k[c]) as f64;
                 }
                 n += 1;
             }
@@ -100,12 +110,29 @@ impl DevelopedImage {
         self.clip.get(i).copied().unwrap_or(0.0)
     }
 
-    /// The whole image through [`to_working`] — the CPU path's equivalent of
-    /// what the shader does to every texture sample.
-    pub fn working(&self, col: &Colour) -> Vec<f32> {
+    /// Optics correction (flat field + hot spot) for one render of this image.
+    pub fn optics(&self, p: &AdjustParams) -> Optics<'_> {
+        Optics::new(p, self.flat.as_deref(), self.width, self.height)
+    }
+
+    /// Camera RGB of pixel `i` with the optics gain applied.
+    pub fn camera_rgb(&self, optics: &Optics, i: usize) -> [f32; 3] {
+        let c = [self.data[i * 3], self.data[i * 3 + 1], self.data[i * 3 + 2]];
+        if optics.is_identity() {
+            return c;
+        }
+        let k = optics.gain_at(i % self.width, i / self.width, self.width, self.height);
+        [c[0] * k[0], c[1] * k[1], c[2] * k[2]]
+    }
+
+    /// The whole image through optics and [`to_working`] — the CPU path's
+    /// equivalent of what the shader does to every texture sample.
+    pub fn working(&self, p: &AdjustParams) -> Vec<f32> {
+        let col = Colour::resolve(&self.colour, p);
+        let optics = self.optics(p);
         let mut out = vec![0f32; self.data.len()];
-        out.par_chunks_mut(3).zip(self.data.par_chunks(3)).enumerate().for_each(|(i, (o, c))| {
-            o.copy_from_slice(&to_working(col, [c[0], c[1], c[2]], self.clip_at(i)));
+        out.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
+            o.copy_from_slice(&to_working(&col, self.camera_rgb(&optics, i), self.clip_at(i)));
         });
         out
     }
@@ -190,7 +217,7 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     let (out, clip) = demosaic(&mosaic, (ax, ay, aw, ah), Demosaic::Mhc);
 
     let colour = ImageColour { as_shot_wb: [wb[0], wb[1], wb[2]], cam_to_srgb };
-    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour })
+    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None })
 }
 
 /// Demosaic algorithm.
@@ -720,7 +747,7 @@ mod tests {
     fn eyedropper_gains_make_the_spot_neutral() {
         // IR-ish camera RGB: red above green, blue far below.
         let img = flat(20, 20, [0.30, 0.25, 0.11]);
-        let pick = img.neutral_gains(10, 10).unwrap();
+        let pick = img.neutral_gains(10, 10, &AdjustParams::default()).unwrap();
         assert!(!pick.clamped);
         let col = Colour { wb: pick.gains, matrix: crate::pipeline::IDENTITY3 };
         let out = to_working(&col, [0.30, 0.25, 0.11], 0.0);
@@ -742,7 +769,7 @@ mod tests {
         img.clip = (0..400)
             .map(|i| if (6..14).contains(&(i % 20)) && (6..14).contains(&(i / 20)) { 1.0 } else { 0.0 })
             .collect();
-        let pick = img.neutral_gains(10, 10).unwrap();
+        let pick = img.neutral_gains(10, 10, &AdjustParams::default()).unwrap();
         assert!((pick.gains[0] - 2.0).abs() < 1e-5 && (pick.gains[2] - 4.0).abs() < 1e-5, "{pick:?}");
     }
 
@@ -750,13 +777,13 @@ mod tests {
     fn eyedropper_refuses_all_clipped_or_black() {
         let mut img = flat(10, 10, [0.9, 0.9, 0.9]);
         img.clip = vec![1.0; 100];
-        assert_eq!(img.neutral_gains(5, 5), Err(PickError::AllClipped));
-        assert_eq!(flat(10, 10, [0.2, 0.2, 0.0]).neutral_gains(5, 5), Err(PickError::TooDark));
+        assert_eq!(img.neutral_gains(5, 5, &AdjustParams::default()), Err(PickError::AllClipped));
+        assert_eq!(flat(10, 10, [0.2, 0.2, 0.0]).neutral_gains(5, 5, &AdjustParams::default()), Err(PickError::TooDark));
     }
 
     #[test]
     fn eyedropper_clamps_to_the_slider_range_and_says_so() {
-        let pick = flat(10, 10, [0.5, 0.5, 0.01]).neutral_gains(0, 0).unwrap();
+        let pick = flat(10, 10, [0.5, 0.5, 0.01]).neutral_gains(0, 0, &AdjustParams::default()).unwrap();
         assert!(pick.clamped);
         assert_eq!(pick.gains, [1.0, 1.0, WB_GAIN_MAX]);
     }
@@ -766,9 +793,9 @@ mod tests {
         let mut img = flat(12, 12, [0.2, 0.2, 0.2]);
         // Only the corner window's pixels should count.
         img.data[0..3].copy_from_slice(&[0.1, 0.2, 0.4]);
-        let far = img.neutral_gains(11, 11).unwrap();
+        let far = img.neutral_gains(11, 11, &AdjustParams::default()).unwrap();
         assert_eq!(far.gains, [1.0, 1.0, 1.0]);
-        let corner = img.neutral_gains(0, 0).unwrap();
+        let corner = img.neutral_gains(0, 0, &AdjustParams::default()).unwrap();
         assert!(corner.gains[0] > 1.0 && corner.gains[2] < 1.0, "{corner:?}");
     }
 
