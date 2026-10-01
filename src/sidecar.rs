@@ -5,7 +5,43 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::config::Config;
 use crate::pipeline::AdjustParams;
+
+/// Where a photo's starting adjustments came from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Origin {
+    /// Its own sidecar.
+    Sidecar,
+    /// No sidecar; its camera body is set to start in this look.
+    BodyLook(String),
+    /// No sidecar and no body look: neutral.
+    Neutral,
+}
+
+/// What opening `raw` with no sidecar gives: neutral, or the look assigned to
+/// its camera body (`serial`). Also the baseline the GUI compares against to
+/// decide whether a sidecar is needed at all.
+pub fn baseline(config: &Config, serial: Option<&str>) -> (AdjustParams, Origin) {
+    match config.body_look(serial) {
+        Some(look) => {
+            let mut p = AdjustParams::default();
+            look.apply(&mut p);
+            (p, Origin::BodyLook(look.name))
+        }
+        None => (AdjustParams::default(), Origin::Neutral),
+    }
+}
+
+/// The adjustments a photo opens (or batch-exports) with: its sidecar if it
+/// has one, otherwise [`baseline`]. Shared by the GUI, the batch export and
+/// the CLI so all three agree.
+pub fn initial(raw: &Path, config: &Config, serial: Option<&str>) -> Result<(AdjustParams, Origin)> {
+    Ok(match load(raw)? {
+        Some(p) => (p, Origin::Sidecar),
+        None => baseline(config, serial),
+    })
+}
 
 /// Suffix appended to the *full* raw filename, so `P1320071.rw2` pairs with
 /// `P1320071.rw2.edit.json` (keeping the raw extension visible avoids
@@ -126,5 +162,25 @@ mod tests {
         let raw = scratch("malformed");
         std::fs::write(sidecar_path(&raw), "{ not json").unwrap();
         assert!(load(&raw).is_err());
+    }
+
+    #[test]
+    fn initial_params_prefer_sidecar_then_body_look_then_neutral() {
+        let raw = scratch("initial");
+        let mut config = Config::default();
+        config.body_looks.insert("F92".into(), "Red–blue swap".into());
+
+        assert_eq!(initial(&raw, &config, Some("XEL")).unwrap(), (AdjustParams::default(), Origin::Neutral));
+        assert_eq!(initial(&raw, &config, None).unwrap().1, Origin::Neutral);
+
+        let (p, origin) = initial(&raw, &config, Some("F92")).unwrap();
+        assert_eq!(origin, Origin::BodyLook("Red–blue swap".into()));
+        assert_eq!(p.mixer, [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]);
+        assert_eq!(p.colour_mode, crate::pipeline::ColourMode::SensorRgb);
+
+        // A sidecar always wins — including a neutral one, which is how a
+        // single photo opts out of its body's look.
+        save(&raw, &AdjustParams::default()).unwrap();
+        assert_eq!(initial(&raw, &config, Some("F92")).unwrap(), (AdjustParams::default(), Origin::Sidecar));
     }
 }

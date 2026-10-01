@@ -5,7 +5,9 @@
 //! ```
 //!
 //! Adjustments come from each file's `<name>.rw2.edit.json` sidecar, so
-//! pointing this at a folder applies every saved edit in one go. It is also the
+//! pointing this at a folder applies every saved edit in one go. A file with
+//! no sidecar starts in its camera body's look, if one is set in the app's
+//! settings — exactly what the GUI would show. It is also the
 //! end-to-end check that a full-size render, readback and encode really work.
 //!
 //! `--upload` sends each finished file to the Immich server configured in the
@@ -69,9 +71,16 @@ fn parse_args() -> Result<Args> {
 fn main() -> Result<()> {
     let args = parse_args()?;
 
+    // Settings supply the per-body looks; a broken settings file must not stop
+    // an export, so fall back to defaults (no body looks) with a warning.
+    let settings = raw_editor::config::Config::load().unwrap_or_else(|e| {
+        eprintln!("warning:   settings unreadable ({e:#}); no camera looks applied");
+        Default::default()
+    });
+
     // Uploading only happens when asked for explicitly *and* configured.
     let config = if args.upload {
-        let c = raw_editor::config::Config::load()?;
+        let c = settings.clone();
         if !c.immich_ready() {
             anyhow::bail!(
                 "--upload needs an Immich URL and API key in {}",
@@ -112,7 +121,7 @@ fn main() -> Result<()> {
             println!("\n[{}/{}] {}", i + 1, files.len(), path.display());
         }
         // One bad file must not abandon the rest of the batch.
-        match export_one(path, &args, gpu.as_ref(), config.as_ref()) {
+        match export_one(path, &args, gpu.as_ref(), &settings, config.as_ref()) {
             Ok(out) => {
                 let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
                 println!("wrote:     {} ({:.1} MiB)", out.display(), bytes as f64 / (1024.0 * 1024.0));
@@ -138,13 +147,16 @@ fn export_one(
     path: &Path,
     args: &Args,
     gpu: Option<&(wgpu::Device, wgpu::Queue)>,
+    settings: &raw_editor::config::Config,
     config: Option<&raw_editor::config::Config>,
 ) -> Result<PathBuf> {
-    let params = sidecar::load(path)?.unwrap_or_default();
-    println!(
-        "params:    {}",
-        if params == Default::default() { "neutral (no sidecar)".into() } else { format!("{params:?}") }
-    );
+    let serial = metadata::camera_ids(path).ok().and_then(|ids| ids.serial);
+    let (params, origin) = sidecar::initial(path, settings, serial.as_deref())?;
+    match origin {
+        sidecar::Origin::Sidecar => println!("params:    {params:?}"),
+        sidecar::Origin::BodyLook(name) => println!("params:    no sidecar; camera look \"{name}\""),
+        sidecar::Origin::Neutral => println!("params:    neutral (no sidecar)"),
+    }
 
     let t = std::time::Instant::now();
     let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;

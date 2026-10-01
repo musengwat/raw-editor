@@ -1,4 +1,5 @@
-//! Persistent settings, currently just the Immich connection.
+//! Persistent settings: the Immich connection, saved looks and which look each
+//! camera body starts in.
 //!
 //! The API key is a credential. It is stored `0600` on Unix, redacted from
 //! `Debug`, and must never reach a log line, an error message or the status
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::looks::Look;
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -18,6 +21,11 @@ pub struct Config {
     pub immich_api_key: String,
     /// Whether a finished export is uploaded. Off unless deliberately enabled.
     pub upload_after_export: bool,
+    /// Looks the user has saved, by name.
+    pub looks: Vec<Look>,
+    /// Body serial → name of the look a photo from that body starts in when
+    /// it has no sidecar yet (e.g. the IR-converted GF1 → an Aerochrome look).
+    pub body_looks: std::collections::BTreeMap<String, String>,
 }
 
 /// Redacts the key, so a stray `{:?}` cannot leak it.
@@ -27,6 +35,8 @@ impl std::fmt::Debug for Config {
             .field("immich_url", &self.immich_url)
             .field("immich_api_key", &self.redacted())
             .field("upload_after_export", &self.upload_after_export)
+            .field("looks", &self.looks.iter().map(|l| &l.name).collect::<Vec<_>>())
+            .field("body_looks", &self.body_looks)
             .finish()
     }
 }
@@ -45,6 +55,33 @@ impl Config {
     /// Base URL without a trailing slash, so joining paths is predictable.
     pub fn base_url(&self) -> &str {
         self.immich_url.trim().trim_end_matches('/')
+    }
+
+    /// Every look by name: saved looks first, so a saved look can shadow a
+    /// built-in of the same name.
+    pub fn find_look(&self, name: &str) -> Option<Look> {
+        self.looks.iter().find(|l| l.name == name).cloned().or_else(|| {
+            crate::looks::builtin().into_iter().find(|l| l.name == name)
+        })
+    }
+
+    /// The look a photo from this body starts in, if one is set and still exists.
+    pub fn body_look(&self, serial: Option<&str>) -> Option<Look> {
+        self.find_look(self.body_looks.get(serial?)?)
+    }
+
+    /// Save a look, replacing any saved look with the same name.
+    pub fn save_look(&mut self, look: Look) {
+        match self.looks.iter_mut().find(|l| l.name == look.name) {
+            Some(existing) => *existing = look,
+            None => self.looks.push(look),
+        }
+    }
+
+    /// Delete a saved look, and any body that started in it.
+    pub fn delete_look(&mut self, name: &str) {
+        self.looks.retain(|l| l.name != name);
+        self.body_looks.retain(|_, v| v != name);
     }
 
     pub fn path() -> Result<PathBuf> {
@@ -101,6 +138,7 @@ mod tests {
             immich_url: "https://photos.example.org".into(),
             immich_api_key: "super-secret-key-value".into(),
             upload_after_export: true,
+            ..Default::default()
         };
         let text = format!("{c:?}");
         assert!(!text.contains("super-secret"), "the key leaked into Debug: {text}");
@@ -131,6 +169,7 @@ mod tests {
             immich_url: "https://photos.example.org".into(),
             immich_api_key: "k".into(),
             upload_after_export: true,
+            ..Default::default()
         };
         let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert!(back == c);
@@ -141,5 +180,60 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let c: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    // --- looks (IR-3) ---------------------------------------------------
+
+    fn look(name: &str, sat: f32) -> Look {
+        let p = crate::pipeline::AdjustParams { saturation: sat, ..Default::default() };
+        Look::from_params(name, &p)
+    }
+
+    #[test]
+    fn saving_a_look_replaces_one_with_the_same_name() {
+        let mut c = Config::default();
+        c.save_look(look("Mine", 0.1));
+        c.save_look(look("Other", 0.2));
+        c.save_look(look("Mine", 0.5));
+        assert_eq!(c.looks.len(), 2);
+        assert_eq!(c.find_look("Mine").unwrap().saturation, Some(0.5));
+    }
+
+    #[test]
+    fn find_look_prefers_saved_then_builtin() {
+        let mut c = Config::default();
+        assert!(c.find_look("Aerochrome classic").unwrap().saturation.is_none(), "built-in");
+        c.save_look(look("Aerochrome classic", 0.4));
+        assert_eq!(c.find_look("Aerochrome classic").unwrap().saturation, Some(0.4));
+        assert!(c.find_look("nope").is_none());
+    }
+
+    #[test]
+    fn body_look_resolves_by_serial_and_survives_a_round_trip() {
+        let mut c = Config::default();
+        c.save_look(look("GF1 IR", 0.3));
+        c.body_looks.insert("F921004200220".into(), "GF1 IR".into());
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.body_look(Some("F921004200220")).unwrap().name, "GF1 IR");
+        assert!(c.body_look(Some("XEL2112060047")).is_none());
+        assert!(c.body_look(None).is_none());
+    }
+
+    #[test]
+    fn deleting_a_look_unassigns_it_from_bodies() {
+        let mut c = Config::default();
+        c.save_look(look("GF1 IR", 0.3));
+        c.body_looks.insert("F92".into(), "GF1 IR".into());
+        c.body_looks.insert("XEL".into(), "Red–blue swap".into());
+        c.delete_look("GF1 IR");
+        assert!(c.looks.is_empty());
+        assert_eq!(c.body_looks.len(), 1, "{:?}", c.body_looks);
+    }
+
+    #[test]
+    fn config_from_before_ir3_loads_without_looks() {
+        let c: Config = serde_json::from_str(r#"{"immich_url":"https://x.org","upload_after_export":true}"#).unwrap();
+        assert!(c.looks.is_empty() && c.body_looks.is_empty());
+        assert!(c.upload_after_export);
     }
 }

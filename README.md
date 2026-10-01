@@ -69,8 +69,11 @@ Infrared (the GF1 is now a full-spectrum conversion):
 - [x] IR-2 — 3×3 channel mixer + looks (Aerochrome classic / pink, red–blue
   swap, IR mono). The looks are derived from what the sensor sees behind an
   IR Chrome filter, **not yet tuned** against daylight shots through it
-- [ ] IR-3 — saved looks; the converted body opens in IR mode automatically
-  (EXIF serial)
+- [x] IR-3 — saved looks (in the settings file); a camera body can be set to
+  start in a look, keyed by the serial in Panasonic's maker note. It applies
+  to photos with no sidecar of their own. The serial identifies the *body*,
+  not the conversion, so the GF1's pre-conversion shots also open in its IR
+  look — Reset on such a photo saves a neutral sidecar and opts it out
 - [ ] IR-4 — hot-spot correction (radial, then per-lens flat field)
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter

@@ -16,7 +16,9 @@ use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{AdjustParams, ColourMode, IDENTITY3, ImageColour, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN};
 use raw_editor::config::Config;
 use raw_editor::immich;
-use raw_editor::sidecar;
+use raw_editor::looks::Look;
+use raw_editor::metadata::CameraIds;
+use raw_editor::sidecar::{self, Origin};
 use raw_editor::widgets::ColorWheel;
 
 /// Hold this key to bypass every adjustment and see the original.
@@ -51,7 +53,7 @@ fn main() -> eframe::Result {
     )
 }
 
-type LoadResult = (PathBuf, anyhow::Result<DevelopedImage>);
+type LoadResult = (PathBuf, anyhow::Result<(DevelopedImage, CameraIds)>);
 /// Messages from an export or batch-export worker.
 enum ExportMsg {
     /// A single-file export finished, with an optional upload note.
@@ -63,12 +65,29 @@ enum ExportMsg {
 }
 type ExportResult = ExportMsg;
 
+/// A change to saved looks requested from the side panel, applied after the
+/// panel closure has released its borrows.
+enum LookAction {
+    Save(Look),
+    Delete(String),
+    /// Body serial, look name.
+    Assign(String, String),
+    Unassign(String),
+}
+
 struct App {
     render_state: eframe::egui_wgpu::RenderState,
     /// Live values the shader is driven from.
     params: AdjustParams,
     /// What is currently on disk in the sidecar.
     saved_params: AdjustParams,
+    /// What this photo opens with when it has no sidecar: neutral, or its
+    /// camera body's look. Params equal to this need no sidecar.
+    baseline: AdjustParams,
+    /// Body serial and lens of the open photo.
+    camera: CameraIds,
+    /// Name typed into the "save look" field.
+    look_name: String,
     /// Previous frame's values, used to spot edits and restart the debounce.
     prev_params: AdjustParams,
     dirty_since: Option<Instant>,
@@ -128,6 +147,9 @@ impl App {
             render_state,
             params: AdjustParams::default(),
             saved_params: AdjustParams::default(),
+            baseline: AdjustParams::default(),
+            camera: CameraIds::default(),
+            look_name: String::new(),
             prev_params: AdjustParams::default(),
             dirty_since: None,
             image: None,
@@ -173,7 +195,14 @@ impl App {
         std::thread::spawn(move || {
             let result = rawler::decode_file(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|raw| develop(&raw));
+                .and_then(|raw| develop(&raw))
+                .map(|img| {
+                    let ids = raw_editor::metadata::camera_ids(&path).unwrap_or_else(|e| {
+                        eprintln!("camera ids: {e:#}");
+                        CameraIds::default()
+                    });
+                    (img, ids)
+                });
             let _ = tx.send((path, result));
             ctx.request_repaint();
         });
@@ -183,7 +212,7 @@ impl App {
         while let Ok((path, result)) = self.loader_rx.try_recv() {
             self.loading = false;
             match result {
-                Ok(img) => {
+                Ok((img, camera)) => {
                     let mut renderer = self.render_state.renderer.write();
                     if let Some(r) = renderer.callback_resources.get_mut::<ImageRenderer>() {
                         r.set_image(&self.render_state.device, &self.render_state.queue, &img);
@@ -191,12 +220,15 @@ impl App {
                     drop(renderer);
 
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let (params, note) = match sidecar::load(&path) {
-                        Ok(Some(p)) => (p, " — edits restored"),
-                        Ok(None) => (AdjustParams::default(), ""),
+                    let serial = camera.serial.as_deref();
+                    let (baseline, _) = sidecar::baseline(&self.config, serial);
+                    let (params, note) = match sidecar::initial(&path, &self.config, serial) {
+                        Ok((p, Origin::Sidecar)) => (p, " — edits restored".to_string()),
+                        Ok((p, Origin::BodyLook(name))) => (p, format!(" — this camera starts in \"{name}\"")),
+                        Ok((p, Origin::Neutral)) => (p, String::new()),
                         Err(e) => {
                             eprintln!("sidecar: {e:#}");
-                            (AdjustParams::default(), " — sidecar unreadable, starting neutral")
+                            (baseline, " — sidecar unreadable, starting fresh".to_string())
                         }
                     };
                     self.status = format!("{name} — {}x{}{note}", img.width, img.height);
@@ -208,6 +240,8 @@ impl App {
                     self.current = Some(path);
                     self.params = params;
                     self.saved_params = params;
+                    self.baseline = baseline;
+                    self.camera = camera;
                     self.prev_params = params;
                     self.dirty_since = None;
                 }
@@ -245,9 +279,12 @@ impl App {
         if self.params == self.saved_params {
             return;
         }
-        // Neutral params mean "no edits" — drop the sidecar instead of
-        // leaving a file full of zeroes next to the raw.
-        let result = if self.params.is_neutral() {
+        // Params equal to what the photo opens with anyway mean "no edits" —
+        // drop the sidecar instead of leaving a redundant file next to the
+        // raw. With a body look that baseline is the look, so resetting such
+        // a photo to neutral *does* write a (neutral) sidecar: that is how one
+        // photo opts out of its camera's look.
+        let result = if self.params == self.baseline {
             sidecar::remove(&path)
         } else {
             sidecar::save(&path, &self.params)
@@ -577,7 +614,12 @@ impl App {
         let as_shot = self.image.as_ref().map_or([1.0; 3], |img| img.colour.as_shot_wb);
         let (export_format, jpeg_quality) = (&mut self.export_format, &mut self.jpeg_quality);
         let picking_wb = &mut self.picking_wb;
-        let looks = raw_editor::looks::builtin();
+        let builtin_looks = raw_editor::looks::builtin();
+        let saved_looks = self.config.looks.clone();
+        let serial = self.camera.serial.clone();
+        let body_look = serial.as_ref().and_then(|s| self.config.body_looks.get(s).cloned());
+        let look_name = &mut self.look_name;
+        let mut look_action: Option<LookAction> = None;
         let p = &mut self.params;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -611,14 +653,69 @@ impl App {
             }
 
             ui.add_space(6.0);
-            let current = looks.iter().find(|l| l.is_applied(p)).map_or("Custom", |l| l.name.as_str());
-            egui::ComboBox::from_label("Look").selected_text(current).show_ui(ui, |ui| {
-                for look in &looks {
-                    if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
-                        look.apply(p);
+            // Saved looks first: a saved look may share a built-in's name and
+            // is the one `Config::find_look` resolves to.
+            let current = saved_looks
+                .iter()
+                .chain(&builtin_looks)
+                .find(|l| l.is_applied(p))
+                .map(|l| l.name.clone());
+            let current_saved = saved_looks.iter().any(|l| Some(&l.name) == current.as_ref());
+            egui::ComboBox::from_label("Look")
+                .selected_text(current.as_deref().unwrap_or("Custom"))
+                .show_ui(ui, |ui| {
+                    for look in &builtin_looks {
+                        if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
+                            look.apply(p);
+                        }
+                    }
+                    if !saved_looks.is_empty() {
+                        ui.separator();
+                        for look in &saved_looks {
+                            if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
+                                look.apply(p);
+                            }
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(look_name).hint_text("Look name").desired_width(120.0));
+                let name = look_name.trim().to_string();
+                if ui
+                    .add_enabled(!name.is_empty(), egui::Button::new("Save look"))
+                    .on_hover_text("Saves white balance, colour mode, mixer and saturation; replaces a saved look of the same name")
+                    .clicked()
+                {
+                    look_action = Some(LookAction::Save(Look::from_params(&name, p)));
+                }
+                if let (true, Some(name)) = (current_saved, &current) {
+                    if ui.button("Delete").on_hover_text(format!("Delete the saved look \"{name}\"")).clicked() {
+                        look_action = Some(LookAction::Delete(name.clone()));
                     }
                 }
             });
+            if let Some(serial) = &serial {
+                let starts = body_look.as_deref().unwrap_or("no look");
+                ui.label(egui::RichText::new(format!("Camera {serial} starts in: {starts}")).weak().small());
+                ui.horizontal(|ui| {
+                    let assignable = current.as_ref().filter(|n| n.as_str() != "None");
+                    let label = match assignable {
+                        Some(n) => format!("Start this camera in \"{n}\""),
+                        None => "Start this camera in this look".into(),
+                    };
+                    if ui
+                        .add_enabled(assignable.is_some() && assignable != body_look.as_ref(), egui::Button::new(label))
+                        .on_hover_text("Photos from this body open in this look until they have edits of their own")
+                        .on_disabled_hover_text("Pick or save a named look first")
+                        .clicked()
+                    {
+                        look_action = assignable.map(|n| LookAction::Assign(serial.clone(), n.clone()));
+                    }
+                    if body_look.is_some() && ui.button("Clear").clicked() {
+                        look_action = Some(LookAction::Unassign(serial.clone()));
+                    }
+                });
+            }
             egui::CollapsingHeader::new("Channel mixer").show(ui, |ui| {
                 egui::Grid::new("mixer").num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
                     ui.label("");
@@ -731,6 +828,9 @@ impl App {
         if reset {
             self.params = AdjustParams::default();
         }
+        if let Some(action) = look_action {
+            self.apply_look_action(action);
+        }
         if do_export {
             // Always ask where to save: the dialog also gives us overwrite
             // confirmation for free, which the old silent
@@ -738,6 +838,33 @@ impl App {
             let ctx = ui.ctx().clone();
             let format = self.export_format;
             self.pick_and_export(&ctx, format);
+        }
+    }
+
+    fn apply_look_action(&mut self, action: LookAction) {
+        self.status = match &action {
+            LookAction::Save(look) => format!("Saved look \"{}\"", look.name),
+            LookAction::Delete(name) => format!("Deleted look \"{name}\""),
+            LookAction::Assign(serial, name) => format!("Camera {serial} now starts in \"{name}\""),
+            LookAction::Unassign(serial) => format!("Camera {serial} now starts neutral"),
+        };
+        match action {
+            LookAction::Save(look) => {
+                self.look_name.clear();
+                self.config.save_look(look);
+            }
+            LookAction::Delete(name) => self.config.delete_look(&name),
+            LookAction::Assign(serial, name) => {
+                self.config.body_looks.insert(serial, name);
+            }
+            LookAction::Unassign(serial) => {
+                self.config.body_looks.remove(&serial);
+            }
+        }
+        // The open photo's no-sidecar baseline may have changed with it.
+        self.baseline = sidecar::baseline(&self.config, self.camera.serial.as_deref()).0;
+        if let Err(e) = self.config.save() {
+            self.status = format!("Couldn't save settings: {e:#}");
         }
     }
 
@@ -951,7 +1078,8 @@ fn batch_one(
     quality: u8,
     config: &Config,
 ) -> anyhow::Result<Option<String>> {
-    let params = sidecar::load(path)?.unwrap_or_default();
+    let serial = raw_editor::metadata::camera_ids(path).ok().and_then(|ids| ids.serial);
+    let (params, _) = sidecar::initial(path, config, serial.as_deref())?;
     let raw = rawler::decode_file(path)?;
     let img = develop(&raw)?;
     let rendered = match export::render_gpu(device, queue, &img, &params) {

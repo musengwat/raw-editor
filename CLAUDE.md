@@ -151,6 +151,31 @@ enforces it. The built-ins are reasoned from the filter physics (behind IR
 Chrome the blue photosites see ~pure IR; Aerochrome = IR→R, R→G, G→B), not
 tuned on real daylight shots. Retune them when those exist.
 
+## Saved looks and per-body looks (IR-3)
+
+`Config.looks` holds saved looks; `Config.body_looks` maps body serial → look
+name (saved looks shadow built-ins of the same name). `sidecar::initial` is
+the one place that decides what a photo opens with — sidecar, else the body
+look, else neutral — and the GUI, GUI batch export and CLI all call it. Keep
+it that way, or exports will stop matching the screen.
+
+The GUI keeps `baseline` (what the photo opens with *without* a sidecar) and
+only removes a sidecar when params equal it, not when they are neutral. That
+is what lets one photo opt out of its body's look: resetting it writes a
+neutral sidecar instead of deleting one.
+
+Serials come from `metadata::camera_ids`: Panasonic stores
+`InternalSerialNumber` (0x25) and `LensType` (0x51) only in a maker note
+inside the embedded preview JPEG's EXIF, not in standard EXIF, and rawler
+does not parse it. `panasonic_ids` is a bounds-checked IFD walk over the first
+4 MB (fuzzed by truncating at every length in the tests). GF1 =
+`F921004200220`, G85 = `XEL2112060047`. Stock GF1 shots carry the same serial
+as IR ones (same body), and the conversion reset the clock, so nothing in the
+metadata tells pre- from post-conversion files.
+
+The CLI honours body looks too. To test without touching the real settings,
+point `XDG_CONFIG_HOME` at a scratch directory.
+
 ## Detail stage (noise reduction + sharpening)
 
 `src/detail.rs` mirrors the `detail()` function in `src/shader.wgsl`; both run

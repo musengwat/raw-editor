@@ -37,6 +37,7 @@ fn a_bogus_key_is_rejected_as_unauthorized_not_malformed() {
         immich_url: url.clone(),
         immich_api_key: "definitely-not-a-valid-key".into(),
         upload_after_export: false,
+        ..Default::default()
     };
 
     let err = immich::upload(&config, &file).expect_err("a bogus key must not succeed");
@@ -65,6 +66,7 @@ fn ping_reports_the_server_version() {
         immich_url: url,
         immich_api_key: "unused".into(),
         upload_after_export: false,
+        ..Default::default()
     };
     let version = immich::ping(&config).expect("version ping");
     eprintln!("immich version: {version}");

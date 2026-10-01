@@ -139,6 +139,106 @@ impl ExportMetadata {
     }
 }
 
+/// What identifies the camera body and lens a raw came from: the keys for
+/// per-body looks (IR-3) and per-lens flat fields (IR-4).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CameraIds {
+    /// Body serial. Panasonic keeps it only in its maker note
+    /// (`InternalSerialNumber`, e.g. `F921004200220`), not in standard EXIF.
+    pub serial: Option<String>,
+    /// Lens model as the camera reports it, e.g. `LUMIX G 20/F1.7`.
+    pub lens: Option<String>,
+}
+
+/// How much of the file to scan for the maker note. Panasonic writes it near
+/// the start (inside the embedded preview JPEG's EXIF, a few KB in).
+const MAKER_NOTE_SCAN: u64 = 4 << 20;
+
+/// Read the body serial and lens without decoding pixels. Uses the Panasonic
+/// maker note where there is one and falls back to standard EXIF fields.
+pub fn camera_ids(path: &Path) -> Result<CameraIds> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .take(MAKER_NOTE_SCAN)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut ids = panasonic_ids(&head);
+    if ids.serial.is_none() || ids.lens.is_none() {
+        if let Ok(src) = RawSource::new(path) {
+            let loader = rawler::RawLoader::new();
+            if let Ok(dec) = loader.get_decoder(&src) {
+                if let Ok(meta) = dec.raw_metadata(&src, &RawDecodeParams::default()) {
+                    ids.serial = ids.serial.or_else(|| meta.exif.serial_number.as_deref().and_then(non_empty));
+                    ids.lens = ids.lens.or_else(|| meta.lens.as_ref().and_then(|l| non_empty(&l.lens_model)));
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Pull `InternalSerialNumber` (0x25) and `LensType` (0x51) out of a
+/// Panasonic maker note found anywhere in `bytes`.
+///
+/// The note is a bare IFD after a 12-byte `Panasonic\0\0\0` signature, with
+/// offsets relative to the TIFF header of the EXIF block around it — the
+/// nearest `Exif\0\0` before it, or the RW2's own header at byte 0. Every
+/// read is bounds-checked: this parses untrusted files.
+pub fn panasonic_ids(bytes: &[u8]) -> CameraIds {
+    const SIG: &[u8] = b"Panasonic\0\0\0";
+    let mut ids = CameraIds::default();
+    let Some(sig) = bytes.windows(SIG.len()).position(|w| w == SIG) else { return ids };
+    let base = bytes[..sig].windows(6).rposition(|w| w == b"Exif\0\0").map_or(0, |p| p + 6);
+    let little = match bytes.get(base..base + 2) {
+        Some(b"II") => true,
+        Some(b"MM") => false,
+        _ => return ids,
+    };
+    let u16_at = |o: usize| bytes.get(o..o + 2).map(|b| {
+        let b = [b[0], b[1]];
+        if little { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }
+    });
+    let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| {
+        let b = [b[0], b[1], b[2], b[3]];
+        if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+    });
+    let ifd = sig + SIG.len();
+    let Some(count) = u16_at(ifd) else { return ids };
+    for k in 0..count.min(512) as usize {
+        let e = ifd + 2 + k * 12;
+        let (Some(tag), Some(typ), Some(n)) = (u16_at(e), u16_at(e + 2), u32_at(e + 4)) else { break };
+        // Only byte-sized types (ASCII = 2, UNDEFINED = 7) are read here.
+        if !(tag == 0x25 || tag == 0x51) || !(typ == 2 || typ == 7) || n > 256 {
+            continue;
+        }
+        let n = n as usize;
+        let data = if n <= 4 {
+            bytes.get(e + 8..e + 8 + n)
+        } else {
+            u32_at(e + 8).and_then(|off| bytes.get(base + off as usize..base + off as usize + n))
+        };
+        let Some(text) = data.map(ascii_field) else { continue };
+        match tag {
+            0x25 => ids.serial = text,
+            _ => ids.lens = text,
+        }
+    }
+    ids
+}
+
+/// A NUL-padded ASCII field, or `None` if it is empty, all zeros (stock
+/// GF1 files sometimes are) or not printable text.
+fn ascii_field(b: &[u8]) -> Option<String> {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    let b = &b[..end];
+    if b.is_empty() || !b.iter().all(|c| c.is_ascii_graphic() || *c == b' ') {
+        return None;
+    }
+    non_empty(std::str::from_utf8(b).ok()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +292,83 @@ mod tests {
     fn blank_strings_are_treated_as_absent() {
         assert_eq!(non_empty("  "), None);
         assert_eq!(non_empty(" Panasonic "), Some("Panasonic".to_string()));
+    }
+
+    // --- camera ids (IR-3) ----------------------------------------------
+
+    /// A minimal EXIF block holding a Panasonic maker note, laid out like the
+    /// GF1's: serial out of line (16 bytes), lens out of line, offsets relative
+    /// to the TIFF header after `Exif\0\0`.
+    fn maker_note(little: bool, serial: &[u8], lens: &[u8]) -> Vec<u8> {
+        let w16 = |v: u16| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+        let w32 = |v: u32| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut b = b"junk\xff\xd8Exif\0\0".to_vec();
+        let base = b.len();
+        b.extend_from_slice(if little { b"II*\0" } else { b"MM\0*" });
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(b"Panasonic\0\0\0");
+        let entries = 3u16;
+        let data_at = (b.len() - base) as u32 + 2 + 12 * entries as u32 + 4;
+        b.extend_from_slice(&w16(entries));
+        // An unrelated SHORT tag first, which must be skipped.
+        b.extend_from_slice(&w16(0x02));
+        b.extend_from_slice(&w16(3));
+        b.extend_from_slice(&w32(1));
+        b.extend_from_slice(&[0, 1, 0, 0]);
+        b.extend_from_slice(&w16(0x25));
+        b.extend_from_slice(&w16(7));
+        b.extend_from_slice(&w32(serial.len() as u32));
+        b.extend_from_slice(&w32(data_at));
+        b.extend_from_slice(&w16(0x51));
+        b.extend_from_slice(&w16(2));
+        b.extend_from_slice(&w32(lens.len() as u32));
+        b.extend_from_slice(&w32(data_at + serial.len() as u32));
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(serial);
+        b.extend_from_slice(lens);
+        b
+    }
+
+    #[test]
+    fn panasonic_ids_read_serial_and_lens_in_both_byte_orders() {
+        for little in [true, false] {
+            let b = maker_note(little, b"F921004200220\0\0\0", b"LUMIX G 20/F1.7\0");
+            let ids = panasonic_ids(&b);
+            assert_eq!(ids.serial.as_deref(), Some("F921004200220"), "little={little}");
+            assert_eq!(ids.lens.as_deref(), Some("LUMIX G 20/F1.7"), "little={little}");
+        }
+    }
+
+    #[test]
+    fn blank_or_garbage_fields_are_not_ids() {
+        let ids = panasonic_ids(&maker_note(true, &[0; 16], b"\x01\x02\x03\x04\x05\0"));
+        assert_eq!(ids, CameraIds::default());
+    }
+
+    /// Truncation at every length must never panic — these are untrusted files.
+    #[test]
+    fn truncated_maker_notes_are_handled() {
+        let b = maker_note(true, b"F921004200220\0\0\0", b"LUMIX G 20/F1.7\0");
+        for n in 0..b.len() {
+            let _ = panasonic_ids(&b[..n]);
+        }
+        assert_eq!(panasonic_ids(b"no maker note here"), CameraIds::default());
+    }
+
+    /// The real files, when present (testdata is gitignored).
+    #[test]
+    fn camera_ids_from_real_files() {
+        let gf1 = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/ir/P1320167.rw2");
+        let g85 = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/P1050019.rw2");
+        if !gf1.exists() || !g85.exists() {
+            eprintln!("SKIP: testdata not present");
+            return;
+        }
+        let ids = camera_ids(&gf1).unwrap();
+        assert_eq!(ids.serial.as_deref(), Some("F921004200220"));
+        assert_eq!(ids.lens.as_deref(), Some("LUMIX G 20/F1.7"));
+        let ids = camera_ids(&g85).unwrap();
+        assert_eq!(ids.serial.as_deref(), Some("XEL2112060047"));
+        assert_eq!(ids.lens.as_deref(), Some("LUMIX G VARIO 7-14/F4.0"));
     }
 }
