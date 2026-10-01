@@ -11,7 +11,7 @@ use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
-use raw_editor::pipeline::{
+use raw_editor::pipeline::{ColourMode, 
     AdjustParams, Colour, ImageColour, Uniforms, View, apply, clip_view, srgb_encode,
 };
 
@@ -407,6 +407,28 @@ fn parity_camera_rgb_with_detail_and_tone() {
             sharpen_threshold: 0.003,
             ..Default::default()
         },
+    );
+}
+
+// --- IR-2: channel mixer --------------------------------------------------
+
+/// Every built-in look, in both colour modes, with the clip block and detail
+/// active: the mixer is folded into the matrix uniform, so this proves the
+/// GPU sees exactly the composed matrix the CPU uses.
+#[test]
+fn parity_channel_mixer_looks() {
+    for look in raw_editor::looks::builtin() {
+        for mode in [ColourMode::Camera, ColourMode::SensorRgb] {
+            let mut p = AdjustParams { saturation: 0.3, nr_chroma: 0.5, sharpen_amount: 0.8, ..Default::default() };
+            look.apply(&mut p);
+            p.colour_mode = mode;
+            assert_image_parity(&camera_source(), p);
+        }
+    }
+    // An arbitrary non-neutral mixer, negative weights included.
+    assert_image_parity(
+        &camera_source(),
+        AdjustParams { mixer: [[1.2, -0.4, 0.3], [0.1, 0.6, 0.2], [-0.2, 0.5, 0.9]], ..Default::default() },
     );
 }
 

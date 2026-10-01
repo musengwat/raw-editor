@@ -59,6 +59,11 @@ pub struct AdjustParams {
     /// Custom white-balance gains `[r, g, b]`, green = 1. `None` = as shot.
     pub wb_gains: Option<[f32; 3]>,
     pub colour_mode: ColourMode,
+    /// Channel mixer, row-major: output channel `i` is `mixer[i] · rgb`.
+    /// Applied after the colour matrix (on white-balanced sensor RGB in
+    /// Sensor RGB mode), so it is where infrared false-colour looks live.
+    /// Rows that sum to 1 keep neutrals neutral. Identity = off.
+    pub mixer: [[f32; 3]; 3],
     /// Exposure in EV stops (gain = 2^ev).
     pub exposure_ev: f32,
     /// -1..1, pivot-based power curve in linear space.
@@ -112,6 +117,7 @@ impl Default for AdjustParams {
         Self {
             wb_gains: None,
             colour_mode: ColourMode::Camera,
+            mixer: IDENTITY3,
             exposure_ev: 0.0,
             contrast: 0.0,
             temp: 0.0,
@@ -170,15 +176,20 @@ pub struct Colour {
 }
 
 impl Colour {
+    /// The channel mixer is folded into the matrix here, so it costs nothing
+    /// per pixel and the shader needs no code of its own for it.
     pub fn resolve(img: &ImageColour, p: &AdjustParams) -> Self {
-        Self {
-            wb: p.wb_gains.unwrap_or(img.as_shot_wb),
-            matrix: match p.colour_mode {
-                ColourMode::Camera => img.cam_to_srgb,
-                ColourMode::SensorRgb => IDENTITY3,
-            },
-        }
+        let base = match p.colour_mode {
+            ColourMode::Camera => img.cam_to_srgb,
+            ColourMode::SensorRgb => IDENTITY3,
+        };
+        Self { wb: p.wb_gains.unwrap_or(img.as_shot_wb), matrix: mat3_mul(&p.mixer, &base) }
     }
+}
+
+/// `a · b` for row-major 3x3 matrices.
+pub fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
 /// Camera RGB → working linear RGB for one pixel: white balance, then make a
@@ -714,6 +725,32 @@ mod tests {
         assert_eq!(clip_view([2.0, 2.0, 2.0]), [1.0, 1.0, 1.0]);
         let g = clip_view([0.5, 0.5, 0.5]);
         assert!((g[0] - 0.5 * CLIP_VIEW_DIM).abs() < 1e-6 && g[0] == g[1] && g[1] == g[2]);
+    }
+
+    // --- channel mixer (IR-2) -------------------------------------------
+
+    #[test]
+    fn mixer_is_applied_after_the_matrix() {
+        let img = ImageColour { as_shot_wb: [1.0; 3], cam_to_srgb: CAM };
+        let swap = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+        let p = AdjustParams { mixer: swap, ..Default::default() };
+        let plain = to_working(&Colour::resolve(&img, &AdjustParams::default()), [0.2, 0.3, 0.5], 0.0);
+        let mixed = to_working(&Colour::resolve(&img, &p), [0.2, 0.3, 0.5], 0.0);
+        assert!(close(mixed, [plain[2], plain[1], plain[0]]), "{mixed:?} vs {plain:?}");
+    }
+
+    #[test]
+    fn identity_mixer_changes_nothing() {
+        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM };
+        assert_eq!(Colour::resolve(&img, &AdjustParams::default()).matrix, CAM);
+    }
+
+    #[test]
+    fn sidecars_from_before_ir2_load_with_the_mixer_off() {
+        let p: AdjustParams = serde_json::from_str(r#"{"colour_mode":"sensor_rgb"}"#).unwrap();
+        assert_eq!(p.mixer, IDENTITY3);
+        let m = AdjustParams { mixer: [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], ..Default::default() };
+        assert_eq!(serde_json::from_str::<AdjustParams>(&serde_json::to_string(&m).unwrap()).unwrap(), m);
     }
 }
 

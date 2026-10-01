@@ -13,7 +13,7 @@ use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
-use raw_editor::pipeline::{AdjustParams, ColourMode, ImageColour, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN};
+use raw_editor::pipeline::{AdjustParams, ColourMode, IDENTITY3, ImageColour, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN};
 use raw_editor::config::Config;
 use raw_editor::immich;
 use raw_editor::sidecar;
@@ -577,6 +577,7 @@ impl App {
         let as_shot = self.image.as_ref().map_or([1.0; 3], |img| img.colour.as_shot_wb);
         let (export_format, jpeg_quality) = (&mut self.export_format, &mut self.jpeg_quality);
         let picking_wb = &mut self.picking_wb;
+        let looks = raw_editor::looks::builtin();
         let p = &mut self.params;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -608,6 +609,44 @@ impl App {
             if r.changed() || b.changed() {
                 p.wb_gains = Some(g);
             }
+
+            ui.add_space(6.0);
+            let current = looks.iter().find(|l| l.is_applied(p)).map_or("Custom", |l| l.name.as_str());
+            egui::ComboBox::from_label("Look").selected_text(current).show_ui(ui, |ui| {
+                for look in &looks {
+                    if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
+                        look.apply(p);
+                    }
+                }
+            });
+            egui::CollapsingHeader::new("Channel mixer").show(ui, |ui| {
+                egui::Grid::new("mixer").num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
+                    ui.label("");
+                    for h in ["R in", "G in", "B in", "Sum"] {
+                        ui.label(egui::RichText::new(h).weak());
+                    }
+                    ui.end_row();
+                    for (i, out) in ["R out", "G out", "B out"].iter().enumerate() {
+                        ui.label(*out);
+                        for j in 0..3 {
+                            ui.add(
+                                egui::DragValue::new(&mut p.mixer[i][j])
+                                    .speed(0.01)
+                                    .range(-2.0..=2.0)
+                                    .fixed_decimals(2),
+                            );
+                        }
+                        let sum: f32 = p.mixer[i].iter().sum();
+                        let text = egui::RichText::new(format!("{sum:.2}"));
+                        let text = if (sum - 1.0).abs() > 0.005 { text.color(ui.visuals().warn_fg_color) } else { text.weak() };
+                        ui.label(text).on_hover_text("Rows that sum to 1 keep whites neutral");
+                        ui.end_row();
+                    }
+                });
+                if ui.add_enabled(p.mixer != IDENTITY3, egui::Button::new("Reset mixer")).clicked() {
+                    p.mixer = IDENTITY3;
+                }
+            });
 
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Basic").strong());

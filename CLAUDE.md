@@ -136,6 +136,21 @@ set: mean diff ~3/65535, neutral/ordinary colours at rounding level. Accepted.
 Regression method: export `testdata` with the previous binary and diff the
 16-bit TIFFs.
 
+## Channel mixer and looks (IR-2)
+
+`AdjustParams.mixer` is a row-major 3x3 applied *after* the colour matrix.
+`Colour::resolve` multiplies it into the matrix (`mixer · matrix`), so the
+shader, histogram, eyedropper and export get it for free — there is no mixer
+code in the shader, and none should be added. `parity_channel_mixer_looks`
+covers it on the GPU.
+
+`src/looks.rs` holds `Look` (mixer + optional colour mode / WB / saturation;
+`None`/`LookWb::Keep` leave the photo's value alone) and the built-ins. Every
+built-in row sums to 1 so white-balanced neutrals stay neutral — a test
+enforces it. The built-ins are reasoned from the filter physics (behind IR
+Chrome the blue photosites see ~pure IR; Aerochrome = IR→R, R→G, G→B), not
+tuned on real daylight shots. Retune them when those exist.
+
 ## Detail stage (noise reduction + sharpening)
 
 `src/detail.rs` mirrors the `detail()` function in `src/shader.wgsl`; both run
