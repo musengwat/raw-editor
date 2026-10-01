@@ -71,8 +71,25 @@ from `cfa.color_at(row, col+1)`.
 
 Verify with a synthetic round trip rather than by eye: take a known RGB image,
 mosaic it to the GF1's GBRG pattern, demosaic, and assert PSNR is meaningfully
-above the bilinear path's PSNR on the same input. That test catches a transposed
-filter immediately, which visual inspection will not.
+above the bilinear path's PSNR on the same input.
+
+*Implementation note (Phase 6, Oct 2026):* a PSNR check on a mixed scene does
+**not** catch a transposed Laplacian. Planting that bug (the ±2 terms swapped
+between axes while the bilinear part stays right) cost under 1 dB averaged over
+edges in every direction, and the test still passed. What catches it is
+stripes along one axis at a time: the correct filter gains ~5 dB over bilinear
+on both axes, symmetrically; the transposed one gains ~2 dB along one and loses
+along the other (`mhc_gain_holds_along_both_axes`). Two more traps showed up:
+
+- The test scene must have **correlated** channels (shared detail, slowly
+  varying colour). With independent per-channel detail MHC has nothing to
+  borrow and beats bilinear by only ~0.3 dB, which looks like a broken filter.
+- MHC must run on **white-balanced** values. In raw camera units the GF1's red
+  sits ~2.3x below green, so green's Laplacian over-corrects red and blue: dark
+  edges go teal and bright edges pink (very visible on branches against the
+  P1050113 sky). `develop` therefore passes the as-shot WB as `Mosaic.balance`;
+  the filter runs on balanced values and divides the gains back out, so the
+  texture still holds camera RGB for the live WB controls.
 
 Note the GF1 is **GBRG**, not the RGGB the literature assumes — the phase offset
 must come from `cfa.color_at()`, never a hardcoded parity check.

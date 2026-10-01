@@ -82,6 +82,27 @@ Regression check for this area: develop every file in `testdata/` and confirm
 `P1050113.rw2` (ISO 100, overcast sky) renders a neutral sky while every other
 file stays byte-identical. `RAW_EDITOR_DEBUG=1` prints the per-colour decision.
 
+## Demosaic (Phase 6)
+
+`develop::demosaic` runs Malvar-He-Cutler over a `Mosaic` (normalized plane,
+saturated-photosite map, CFA lookup, balance gains). Bilinear stays in the
+code as `Demosaic::Bilinear`: it is the tests' reference and the per-pixel
+fallback. Rules:
+
+- The clip flag is always the 3x3 neighbourhood, whatever the method. Pixels
+  whose only saturated neighbours are the ±2 axial samples use bilinear (MHC's
+  Laplacian would read the ceiling as detail and ring).
+- MHC runs on **white-balanced** values (`balance` = as-shot WB) and divides the
+  gains back out. In raw units it fringes every edge teal/pink. Keep the
+  `mhc_runs_in_white_balanced_units` test.
+- Edges mirror (`reflect`), which keeps the Bayer phase; clamping would not.
+- Output is clamped at 0 — the Laplacian overshoots below zero at hard edges.
+- A transposed G-site Laplacian passes a mixed-scene PSNR test; only the
+  per-axis stripe test catches it. See `docs/phase5-6-algorithms.md`.
+- Regression method: export `testdata` to TIFF with the old and new binaries and
+  compare (mean diff, luma edge energy, high-frequency chroma) plus a 6x zoom of
+  the P1050113 branches against the sky — that crop shows fringing at once.
+
 ## Camera RGB, white balance and the matrix (IR-1)
 
 The texture holds demosaiced **camera** RGB, not white balanced or matrixed;
