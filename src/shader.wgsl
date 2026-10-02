@@ -13,6 +13,8 @@ struct Uniforms {
     hotspot: vec4<f32>,    // .rgb = hot-spot strength per channel, .a = radius
     optics: vec4<f32>,     // .xy = hot-spot centre (uv), .z = aspect w/h, .w = flat field on
     hsl: array<vec4<f32>, 8>, // per-colour [hue, sat, lum, _]; hsl[0].w = 1 when active
+    geom0: vec4<f32>,      // output uv -> source uv, row 0 (.xyz); see pipeline::Geometry
+    geom1: vec4<f32>,      // row 1
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -224,12 +226,17 @@ fn hsl_adjust(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var c = to_working(textureSample(tex, samp, in.uv), in.uv);
+    // Crop / rotate / straighten: where in the source this output pixel is.
+    // Everything after works in source uv, so optics and detail are unchanged.
+    let src = vec2(dot(u.geom0.xyz, vec3(in.uv, 1.0)), dot(u.geom1.xyz, vec3(in.uv, 1.0)));
+    // Sampled before the outside test: textureSample needs uniform control flow.
+    var c = to_working(textureSample(tex, samp, src), src);
+    let outside = any(src < vec2(0.0)) || any(src > vec2(1.0));
 
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.
     if u.nr_luma > 0.0 || u.nr_chroma > 0.0 || u.sharpen_amount > 0.0 {
-        c = detail(in.uv, c);
+        c = detail(src, c);
     }
 
     // 1. Exposure + white balance as combined per-channel gains.
@@ -275,6 +282,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     c = clamp(c, vec3(0.0), vec3(1.0));
+    // Straightened corners with no source behind them.
+    if outside {
+        c = vec3(0.0);
+    }
     if u.target_is_srgb == 0.0 {
         c = srgb_encode(c);
     }

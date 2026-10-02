@@ -22,7 +22,7 @@ use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
 use crate::metadata::ExportMetadata;
-use crate::pipeline::{AdjustParams, Uniforms, View, apply, srgb_encode};
+use crate::pipeline::{AdjustParams, Geometry, Uniforms, View, apply, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -70,14 +70,50 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     // shader.
     let working = img.working(params);
     let detailed = detail::apply(img.width, img.height, &working, params);
-    let mut data = vec![0u16; img.width * img.height * 3];
-    data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {
-        let c = apply(params, [src[0], src[1], src[2]]);
-        for i in 0..3 {
-            dst[i] = to_u16(srgb_encode(c[i]));
-        }
-    });
-    Rendered { width: img.width, height: img.height, data }
+    let geom = Geometry::resolve(params, &img.colour, img.width, img.height);
+    let (w, h) = (geom.width, geom.height);
+    let mut data = vec![0u16; w * h * 3];
+    if geom.is_identity(img.width, img.height) {
+        data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {
+            let c = apply(params, [src[0], src[1], src[2]]);
+            for i in 0..3 {
+                dst[i] = to_u16(srgb_encode(c[i]));
+            }
+        });
+    } else {
+        // Same mapping as the shader: output pixel centre → source uv, then a
+        // bilinear sample (clamp to edge, like the GPU sampler) of the
+        // detailed working image. With no straightening the uv lands on pixel
+        // centres and this is an exact copy.
+        data.par_chunks_mut(3).enumerate().for_each(|(i, dst)| {
+            let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
+            let s = geom.source_uv(uv);
+            if !(0.0..=1.0).contains(&s[0]) || !(0.0..=1.0).contains(&s[1]) {
+                return; // black, as the shader draws it
+            }
+            let c = apply(params, bilinear(&detailed, img.width, img.height, s));
+            for k in 0..3 {
+                dst[k] = to_u16(srgb_encode(c[k]));
+            }
+        });
+    }
+    Rendered { width: w, height: h, data }
+}
+
+/// Bilinear sample of an RGB plane at `uv`, texel centres at `(i + 0.5) / n`,
+/// clamped at the edges — what the GPU's linear sampler does.
+fn bilinear(px: &[f32], w: usize, h: usize, uv: [f32; 2]) -> [f32; 3] {
+    let x = (uv[0] * w as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+    let y = (uv[1] * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let at = |x: usize, y: usize, k: usize| px[(y * w + x) * 3 + k];
+    std::array::from_fn(|k| {
+        let top = at(x0, y0, k) + (at(x1, y0, k) - at(x0, y0, k)) * fx;
+        let bot = at(x0, y1, k) + (at(x1, y1, k) - at(x0, y1, k)) * fx;
+        top + (bot - top) * fy
+    })
 }
 
 /// Render the whole image through the real WGSL pipeline in one offscreen
@@ -89,6 +125,7 @@ pub fn render_gpu(
     params: &AdjustParams,
 ) -> Result<Rendered> {
     let (w, h) = (img.width, img.height);
+    let geom = Geometry::resolve(params, &img.colour, w, h);
     let limit = device.limits().max_texture_dimension_2d as usize;
     if w > limit || h > limit {
         anyhow::bail!("image {w}x{h} exceeds the device's {limit}px texture limit");
@@ -103,6 +140,9 @@ pub fn render_gpu(
     // one source texel and the export matches the 1:1 preview.
     let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
     renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false));
+    // The target is the cropped / rotated output; the texel above stays the
+    // source's, so detail still steps one source pixel.
+    let (w, h) = (geom.width, geom.height);
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -395,6 +435,24 @@ pub fn batch_output_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_render_applies_rotation_and_crop() {
+        // 3x2, each pixel a distinct grey level.
+        let data: Vec<f32> = (0..6).flat_map(|i| [i as f32 * 0.1 + 0.05; 3]).collect();
+        let img = DevelopedImage::linear_srgb(3, 2, data);
+        let at = |r: &Rendered, x: usize, y: usize| r.data[(y * r.width + x) * 3];
+        let plain = render_cpu(&img, &AdjustParams::default());
+        // A clockwise turn: 2x3, and its top-left is the source's bottom-left.
+        let turned = render_cpu(&img, &AdjustParams { rotation: 1, ..Default::default() });
+        assert_eq!((turned.width, turned.height), (2, 3));
+        assert_eq!(at(&turned, 0, 0), at(&plain, 0, 1));
+        assert_eq!(at(&turned, 1, 0), at(&plain, 0, 0));
+        // Crop to the right-hand column.
+        let cropped = render_cpu(&img, &AdjustParams { crop: [2.0 / 3.0, 0.0, 1.0, 1.0], ..Default::default() });
+        assert_eq!((cropped.width, cropped.height), (1, 2));
+        assert_eq!(at(&cropped, 0, 1), at(&plain, 2, 1));
+    }
 
     #[test]
     fn batch_output_path_redirects_into_a_folder() {

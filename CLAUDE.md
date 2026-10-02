@@ -328,3 +328,28 @@ Thumbnails: `histogram::box_downsample` (box-averaged; the histogram's own
 `downsample` point-samples on purpose) → `looks::thumbnail` → `render_cpu`
 with detail off. `App::update_thumbs` re-renders only when params changed
 and no pointer button is down.
+
+## Crop, rotate, straighten
+
+`pipeline::Geometry::resolve` turns `rotation` (+ the camera's
+`ImageColour::turns`), `straighten` and `crop` into one affine map from output
+uv to source uv (`Uniforms.geom0/geom1`); the shader samples at that source uv
+first thing, so optics and detail stay in source space and the texel stays the
+source's. Outside the source renders black (sampled first, then masked —
+`textureSample` needs uniform control flow). The crop snaps to whole pixels
+of the rotated frame, so without straightening the CPU path (`render_cpu`:
+detail on the source grid, then bilinear at the mapped uv) is exact;
+`parity_rotation_and_crop` / `parity_straighten` cover both.
+Anything sized from a render must use the **render's** size, not the
+source's — the look thumbnails crashed egui on the first straighten for that
+reason (`thumbnail_size_follows_the_crop`).
+
+Orientation: rawler leaves `RawImage::orientation` at Normal for RW2, so
+`metadata::develop_file` (decode + develop + turns from the EXIF block) is the
+one entry point the GUI, batch export and CLI use. Exports write Orientation
+1 because the pixels are already upright. `testdata/portrait/P1050191.rw2`
+(G85, orientation 8) backs `portrait_frames_export_upright`.
+
+Crop UI: `widgets::{CropGrab, drag_crop, fit_aspect}` are pure and tested; the
+overlay hit-tests at `pointer.press_origin()` because egui reports a drag only
+after a few points of movement, enough to miss a corner.

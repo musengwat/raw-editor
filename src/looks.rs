@@ -290,15 +290,17 @@ pub fn find_builtin(name: &str) -> Option<Look> {
 /// A small sRGB picture of `look` applied on top of `p`, for the look
 /// picker. `src` should be a box-downsampled copy of the photo. Detail is off
 /// (noise reduction and sharpening mean nothing at thumbnail size). Returns
-/// RGBA8, row-major.
-pub fn thumbnail(src: &crate::develop::DevelopedImage, p: &AdjustParams, look: &Look) -> Vec<u8> {
+/// the size and RGBA8 pixels, row-major — the size follows the crop and
+/// rotation, so it is not the source's.
+pub fn thumbnail(src: &crate::develop::DevelopedImage, p: &AdjustParams, look: &Look) -> ([usize; 2], Vec<u8>) {
     let mut q = *p;
     look.apply(&mut q);
     q.nr_luma = 0.0;
     q.nr_chroma = 0.0;
     q.sharpen_amount = 0.0;
     let r = crate::export::render_cpu(src, &q);
-    r.data.chunks(3).flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8, 255]).collect()
+    let rgba = r.data.chunks(3).flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8, 255]).collect();
+    ([r.width, r.height], rgba)
 }
 
 #[cfg(test)]
@@ -369,11 +371,22 @@ mod tests {
         // it must come out grey.
         let img = crate::develop::DevelopedImage::linear_srgb(2, 1, vec![0.5, 0.2, 0.3, 0.5, 0.2, 0.3]);
         let p = AdjustParams { colour_mode: ColourMode::SensorRgb, ..Default::default() };
-        let plain = thumbnail(&img, &p, &builtin()[0]);
+        let (_, plain) = thumbnail(&img, &p, &builtin()[0]);
         assert!(plain[0] > plain[1], "{plain:?}");
-        let mono = thumbnail(&img, &p, &find_builtin("IR Chrome — IR mono").unwrap());
+        let (_, mono) = thumbnail(&img, &p, &find_builtin("IR Chrome — IR mono").unwrap());
         assert_eq!((mono.len(), mono[0], mono[3]), (8, mono[1], 255));
         assert_eq!(mono[1], mono[2]);
+    }
+
+    /// The crash this caught: a straightened crop shrinks the render, and
+    /// the GUI built its texture from the source size instead.
+    #[test]
+    fn thumbnail_size_follows_the_crop() {
+        let img = crate::develop::DevelopedImage::linear_srgb(40, 30, vec![0.2; 40 * 30 * 3]);
+        let p = AdjustParams { rotation: 1, crop: [0.0, 0.0, 0.5, 1.0], ..Default::default() };
+        let ([w, h], rgba) = thumbnail(&img, &p, &builtin()[0]);
+        assert_eq!((w, h), (15, 40));
+        assert_eq!(rgba.len(), w * h * 4);
     }
 
     #[test]

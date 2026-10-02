@@ -42,6 +42,35 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_owned())
 }
 
+impl ExportMetadata {
+    /// Clockwise quarter turns that show the frame upright, from the EXIF
+    /// orientation (6 = 90° clockwise, 3 = 180°, 8 = 90° anticlockwise).
+    /// rawler leaves `RawImage::orientation` at Normal for RW2 files, so this
+    /// — the EXIF block — is the value to trust.
+    pub fn turns(&self) -> u8 {
+        match self.orientation {
+            Some(6) => 1,
+            Some(3) => 2,
+            Some(8) => 3,
+            _ => 0,
+        }
+    }
+}
+
+/// Decode and develop a raw file, with the camera's orientation applied from
+/// its EXIF (see [`ExportMetadata::turns`]). Every caller that renders a file
+/// should come through here, or portrait shots export sideways.
+pub fn develop_file(path: &Path) -> Result<crate::develop::DevelopedImage> {
+    let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
+    let mut img = crate::develop::develop(&raw)?;
+    match read(path) {
+        Ok(m) if m.orientation.is_some() => img.colour.turns = m.turns(),
+        Ok(_) => {}
+        Err(e) => eprintln!("orientation: {e:#}"),
+    }
+    Ok(img)
+}
+
 /// Read the metadata out of a raw file without decoding any pixels.
 pub fn read(path: &Path) -> Result<ExportMetadata> {
     let src = RawSource::new(path).with_context(|| format!("opening {}", path.display()))?;
@@ -76,11 +105,11 @@ pub fn read(path: &Path) -> Result<ExportMetadata> {
 impl ExportMetadata {
     /// Build the tag set written into an export.
     ///
-    /// Orientation is deliberately carried through: the develop stage does not
-    /// rotate pixels, so they sit in sensor order, and passing the camera's
-    /// orientation on is what makes a portrait frame display upright — the same
-    /// thing the in-camera JPEG relies on. Dropping it would silently leave
-    /// every portrait export on its side.
+    /// `orientation` holds the camera's value, but it is written as 1 ("as
+    /// stored"): the render applies it (`ImageColour::turns`, set from
+    /// [`ExportMetadata::turns`]) plus any user rotation, so the pixels are
+    /// already upright. Writing the camera's value would make viewers rotate
+    /// a portrait frame a second time.
     ///
     /// `ColorSpace = 1` marks the file sRGB so viewers stop guessing. A real ICC
     /// profile would be better and is a separate job.
@@ -115,8 +144,8 @@ impl ExportMetadata {
         if let Some(v) = self.iso {
             tags.push(ExifTag::ISO(vec![v]));
         }
-        if let Some(v) = self.orientation {
-            tags.push(ExifTag::Orientation(vec![v]));
+        if self.orientation.is_some() {
+            tags.push(ExifTag::Orientation(vec![1]));
         }
         if let Some(v) = &self.artist {
             tags.push(ExifTag::Artist(v.clone()));
@@ -278,14 +307,22 @@ mod tests {
         assert_eq!(tags.len(), 2, "unset fields should not be written: {joined}");
     }
 
-    /// Orientation must survive, or portrait exports display on their side.
+    /// Pixels leave upright, so the tag says "as stored" whatever the camera
+    /// recorded; the camera's value drives the rotation instead.
     #[test]
-    fn orientation_is_carried() {
+    fn orientation_is_written_upright() {
         let joined = sample().tags().iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
-        assert!(joined.contains("Orientation"), "orientation dropped: {joined}");
+        assert!(joined.contains("Orientation([1])"), "expected Orientation 1: {joined}");
         let none = ExportMetadata { orientation: None, ..sample() };
         let joined = none.tags().iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
         assert!(!joined.contains("Orientation"));
+    }
+
+    #[test]
+    fn exif_orientation_becomes_clockwise_turns() {
+        for (tag, turns) in [(None, 0), (Some(1), 0), (Some(6), 1), (Some(3), 2), (Some(8), 3), (Some(2), 0)] {
+            assert_eq!(ExportMetadata { orientation: tag, ..sample() }.turns(), turns, "tag {tag:?}");
+        }
     }
 
     #[test]

@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use eframe::wgpu;
-use raw_editor::develop::develop;
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::metadata;
 use raw_editor::sidecar;
@@ -159,8 +158,7 @@ fn export_one(
     }
 
     let t = std::time::Instant::now();
-    let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
-    let mut img = develop(&raw)?;
+    let mut img = raw_editor::metadata::develop_file(path)?;
     println!("developed: {}x{} in {:.2?}", img.width, img.height, t.elapsed());
     img.flat = settings.flat_for(ids.lens.as_deref());
     if params.flat_field {

@@ -142,6 +142,9 @@ mod tests {
             hotspot_centre: [0.48, 0.55],
             hotspot_balance: [1.0, 0.7, 0.4],
             flat_field: true,
+            rotation: 3,
+            straighten: -1.5,
+            crop: [0.05, 0.1, 0.95, 0.85],
         };
         save(&raw, &params).unwrap();
         assert_eq!(load(&raw).unwrap().unwrap(), params);

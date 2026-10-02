@@ -10,11 +10,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use raw_editor::develop::{DevelopedImage, develop};
+use raw_editor::develop::DevelopedImage;
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{
-    AdjustParams, ColourMode, HSL_BANDS, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN,
+    AdjustParams, ColourMode, Geometry, HSL_BANDS, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX,
+    WB_GAIN_MIN, straighten_crop,
 };
 use raw_editor::config::Config;
 use raw_editor::history::History;
@@ -22,7 +23,7 @@ use raw_editor::immich;
 use raw_editor::looks::Look;
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
-use raw_editor::widgets::{ColorWheel, resettable, section_header};
+use raw_editor::widgets::{ColorWheel, CropGrab, drag_crop, fit_aspect, resettable, section_header};
 
 /// Hold this key to bypass every adjustment and see the original.
 const COMPARE_KEY: egui::Key = egui::Key::B;
@@ -152,6 +153,14 @@ struct App {
     show_settings: bool,
     /// Which property the per-colour panel shows: 0 hue, 1 saturation, 2 luminance.
     hsl_tab: usize,
+    /// Crop mode: the whole frame is shown with the crop as a draggable box.
+    cropping: bool,
+    /// The crop when crop mode was entered, for Esc.
+    crop_before: [f32; 4],
+    /// Locked crop ratio (width / height in pixels), `None` = free.
+    crop_aspect: Option<f32>,
+    /// Drag in progress: what was grabbed, the crop and pointer at its start.
+    crop_drag: Option<(CropGrab, [f32; 4], egui::Pos2)>,
     /// Result of the last "Test connection", shown in the settings dialog.
     ping_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
     ping_status: String,
@@ -206,6 +215,10 @@ impl App {
             }),
             show_settings: false,
             hsl_tab: 0,
+            cropping: false,
+            crop_before: [0.0, 0.0, 1.0, 1.0],
+            crop_aspect: None,
+            crop_drag: None,
             ping_rx: None,
             ping_status: String::new(),
         };
@@ -225,9 +238,7 @@ impl App {
         let tx = self.loader_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = rawler::decode_file(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|raw| develop(&raw))
+            let result = raw_editor::metadata::develop_file(&path)
                 .map(|img| {
                     let ids = raw_editor::metadata::camera_ids(&path).unwrap_or_else(|e| {
                         eprintln!("camera ids: {e:#}");
@@ -278,6 +289,8 @@ impl App {
                     self.camera = camera;
                     self.prev_params = params;
                     self.history = History::new(params);
+                    self.cropping = false;
+                    self.crop_drag = None;
                     self.dirty_since = None;
                 }
                 Err(e) => self.status = format!("Failed to load {}: {e:#}", path.display()),
@@ -660,8 +673,8 @@ impl App {
         let thumbs = looks
             .into_iter()
             .map(|look| {
-                let rgba = raw_editor::looks::thumbnail(src, &self.params, &look);
-                let img = egui::ColorImage::from_rgba_unmultiplied([src.width, src.height], &rgba);
+                let (size, rgba) = raw_editor::looks::thumbnail(src, &self.params, &look);
+                let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                 let tex = ctx.load_texture(format!("look:{}", look.name), img, egui::TextureOptions::LINEAR);
                 (look, tex)
             })
@@ -706,6 +719,8 @@ impl App {
         let has_flat = lens.as_ref().is_some_and(|l| self.config.flat_fields.contains_key(l));
         let mut optics_action: Option<OpticsAction> = None;
         let hsl_tab = &mut self.hsl_tab;
+        let (cropping, crop_before, crop_aspect) = (&mut self.cropping, &mut self.crop_before, &mut self.crop_aspect);
+        let source = self.image.as_ref().map(|img| (img.width as f32, img.height as f32, img.colour.turns));
         let thumbs: Vec<(Look, egui::TextureHandle)> = self.thumbs.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
         let p = &mut self.params;
         let d = AdjustParams::default();
@@ -778,7 +793,8 @@ impl App {
                 egui::CollapsingHeader::new("Look previews").default_open(true).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         for (look, tex) in &thumbs {
-                            let size = tex.size_vec2() * (92.0 / THUMB_LONG_SIDE as f32);
+                            // Scale by the long side so portrait crops fit too.
+                            let size = tex.size_vec2() * (92.0 / tex.size_vec2().max_elem());
                             let selected = look.is_applied(p);
                             let tip = if look.note.is_empty() { look.name.clone() } else { format!("{}\n{}", look.name, look.note) };
                             let resp = ui
@@ -970,6 +986,73 @@ impl App {
                 }
             }
 
+            ui.add_space(10.0);
+            header(ui, "Crop & rotate", Section::Geometry, p);
+            // The rotated frame's size, for straightening and aspect ratios.
+            let frame = |p: &AdjustParams| {
+                source.map(|(w, h, turns)| if (turns + p.rotation) % 2 == 1 { (h, w) } else { (w, h) })
+            };
+            ui.add_enabled_ui(source.is_some(), |ui| {
+                ui.horizontal(|ui| {
+                    let mut turned = false;
+                    if ui.button("⟲ 90°").on_hover_text("Rotate anticlockwise").clicked() {
+                        p.rotation = (p.rotation + 3) % 4;
+                        turned = true;
+                    }
+                    if ui.button("⟳ 90°").on_hover_text("Rotate clockwise").clicked() {
+                        p.rotation = (p.rotation + 1) % 4;
+                        turned = true;
+                    }
+                    // The old crop was for the other orientation; start over.
+                    if turned && let Some((w, h)) = frame(p) {
+                        p.crop = straighten_crop(p.straighten, w, h);
+                    }
+                    if ui.toggle_value(cropping, "Crop").on_hover_text("Drag the box on the photo; Enter when done").changed()
+                        && *cropping
+                    {
+                        *crop_before = p.crop;
+                    }
+                });
+                let before = p.straighten;
+                resettable(ui, &mut p.straighten, d.straighten, |ui, v| {
+                    ui.add(egui::Slider::new(v, -45.0..=45.0).step_by(0.1).suffix("°").text("Straighten"))
+                        .on_hover_text("Fine rotation; the crop shrinks so no empty corners show")
+                });
+                if p.straighten != before && let Some((w, h)) = frame(p) {
+                    p.crop = straighten_crop(p.straighten, w, h);
+                    if let Some(a) = *crop_aspect {
+                        p.crop = fit_aspect(p.crop, a * h / w);
+                    }
+                }
+                const RATIOS: [(&str, Option<f32>); 9] = [
+                    ("Free", None),
+                    ("Original", Some(0.0)),
+                    ("1:1", Some(1.0)),
+                    ("4:5", Some(0.8)),
+                    ("5:4", Some(1.25)),
+                    ("3:2", Some(1.5)),
+                    ("2:3", Some(2.0 / 3.0)),
+                    ("16:9", Some(16.0 / 9.0)),
+                    ("9:16", Some(9.0 / 16.0)),
+                ];
+                let label = RATIOS
+                    .iter()
+                    .find(|(_, r)| *r == *crop_aspect || (r == &Some(0.0) && crop_aspect.is_some_and(|a| frame(p).is_some_and(|(w, h)| (a - w / h).abs() < 1e-4))))
+                    .map_or("Custom", |(n, _)| n);
+                egui::ComboBox::from_label("Aspect").selected_text(label).show_ui(ui, |ui| {
+                    for (name, ratio) in RATIOS {
+                        if ui.selectable_label(name == label, name).clicked() {
+                            let Some((w, h)) = frame(p) else { continue };
+                            // "Original" = the frame's own ratio.
+                            *crop_aspect = ratio.map(|r| if r == 0.0 { w / h } else { r });
+                            if let Some(a) = *crop_aspect {
+                                p.crop = fit_aspect(p.crop, a * h / w);
+                            }
+                        }
+                    }
+                });
+            });
+
             ui.add_space(12.0);
             reset = ui
                 .add_enabled(!p.is_neutral(), egui::Button::new("Reset all"))
@@ -1099,12 +1182,100 @@ impl App {
 
     /// Eyedropper armed: crosshair over the image, a hint badge, and on click
     /// the white balance that makes that spot neutral. Esc disarms.
+    /// The crop box over the whole frame: drag edges, corners or the inside.
+    /// Enter finishes, Esc puts the crop back as it was.
+    fn crop_overlay(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        view: raw_editor::pipeline::View,
+        frame: [usize; 2],
+    ) {
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.params.crop = self.crop_before;
+            self.cropping = false;
+            return;
+        }
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.cropping = false;
+            return;
+        }
+        let quad = egui::Rect::from_center_size(
+            rect.center() + egui::vec2(view.offset[0] * rect.width() / 2.0, -view.offset[1] * rect.height() / 2.0),
+            egui::vec2(view.scale[0] * rect.width(), view.scale[1] * rect.height()),
+        );
+        let at = |x: f32, y: f32| quad.min + egui::vec2(x * quad.width(), y * quad.height());
+        let [x0, y0, x1, y1] = self.params.crop;
+        let crop = egui::Rect::from_min_max(at(x0, y0), at(x1, y1));
+
+        // Interaction.
+        let slop = 10.0;
+        // Hit-test where the button went down: egui only reports a drag once
+        // the pointer has already moved a few points, which on a fast drag
+        // is enough to miss a corner.
+        if response.drag_started()
+            && let Some(pos) = ui.ctx().input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
+        {
+            let grab = CropGrab::at(crop, pos, slop);
+            if !grab.is_none() {
+                self.crop_drag = Some((grab, self.params.crop, pos));
+            }
+        }
+        if let (Some((grab, start, from)), Some(pos)) = (self.crop_drag, response.interact_pointer_pos())
+            && response.dragged()
+        {
+            let d = pos - from;
+            // Ratio in normalised units: pixel ratio × frame height / width.
+            let aspect = self.crop_aspect.map(|a| a * frame[1] as f32 / frame[0] as f32);
+            self.params.crop = drag_crop(start, grab, d.x / quad.width(), d.y / quad.height(), aspect);
+        }
+        if response.drag_stopped() {
+            self.crop_drag = None;
+        }
+        if let Some(pos) = response.hover_pos() {
+            let grab = self.crop_drag.map_or_else(|| CropGrab::at(crop, pos, slop), |(g, _, _)| g);
+            ui.ctx().set_cursor_icon(grab.cursor());
+        }
+
+        // Drawing (with the crop as it is after this frame's drag).
+        let [x0, y0, x1, y1] = self.params.crop;
+        let crop = egui::Rect::from_min_max(at(x0, y0), at(x1, y1));
+        let painter = ui.painter_at(rect);
+        let shade = egui::Color32::from_black_alpha(150);
+        for r in [
+            egui::Rect::from_min_max(quad.min, egui::pos2(quad.max.x, crop.min.y)),
+            egui::Rect::from_min_max(egui::pos2(quad.min.x, crop.max.y), quad.max),
+            egui::Rect::from_min_max(egui::pos2(quad.min.x, crop.min.y), egui::pos2(crop.min.x, crop.max.y)),
+            egui::Rect::from_min_max(egui::pos2(crop.max.x, crop.min.y), egui::pos2(quad.max.x, crop.max.y)),
+        ] {
+            painter.rect_filled(r, 0.0, shade);
+        }
+        let thin = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
+        for t in [1.0 / 3.0, 2.0 / 3.0] {
+            let x = crop.min.x + crop.width() * t;
+            let y = crop.min.y + crop.height() * t;
+            painter.line_segment([egui::pos2(x, crop.min.y), egui::pos2(x, crop.max.y)], thin);
+            painter.line_segment([egui::pos2(crop.min.x, y), egui::pos2(crop.max.x, y)], thin);
+        }
+        painter.rect_stroke(crop, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Middle);
+        for c in [crop.left_top(), crop.right_top(), crop.left_bottom(), crop.right_bottom()] {
+            painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)), 1.0, egui::Color32::WHITE);
+        }
+        let (pw, ph) = (((x1 - x0) * frame[0] as f32).round(), ((y1 - y0) * frame[1] as f32).round());
+        let hint = format!("{pw} × {ph}  ·  drag the box  ·  Enter done  ·  Esc cancel");
+        let badge = egui::Rect::from_min_size(rect.center_top() + egui::vec2(-170.0, 12.0), egui::vec2(340.0, 24.0));
+        painter.rect_filled(badge, 4.0, egui::Color32::from_black_alpha(180));
+        painter.text(badge.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+    }
+
     fn handle_wb_pick(
         &mut self,
         ui: &egui::Ui,
         rect: egui::Rect,
         response: &egui::Response,
         view: raw_editor::pipeline::View,
+        geom: Geometry,
         size: [usize; 2],
     ) {
         if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1138,7 +1309,7 @@ impl App {
             (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
             1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
         ];
-        let Some([x, y]) = view.image_pixel(ndc, size) else {
+        let Some([x, y]) = view.quad_uv(ndc).and_then(|uv| geom.source_pixel(uv, size[0], size[1])) else {
             self.status = "Missed the image — click on the photo".into();
             return;
         };
@@ -1180,6 +1351,16 @@ impl App {
         };
 
         let texel = [1.0 / iw as f32, 1.0 / ih as f32];
+        let colour = self.image.as_ref().map_or(ImageColour::LINEAR_SRGB, |img| img.colour);
+        // In crop mode the whole (rotated, straightened) frame is shown and
+        // the crop is drawn on top; otherwise the output is the cropped frame.
+        let mut shown = self.params;
+        if self.cropping {
+            shown.crop = [0.0, 0.0, 1.0, 1.0];
+            self.zoom_100 = false;
+        }
+        let geom = Geometry::resolve(&shown, &colour, iw, ih);
+        let (ow, oh) = (geom.width, geom.height);
         // Viewport size in physical pixels — NDC [-1,1] spans exactly this.
         let ppp = ui.ctx().pixels_per_point();
         let (vw, vh) = (rect.width() * ppp, rect.height() * ppp);
@@ -1190,7 +1371,7 @@ impl App {
             // this the detail filters are invisible, because a 4592px image
             // shown in a ~1000px viewport throws away exactly the frequencies
             // sharpening and noise reduction act on.
-            let scale = [iw as f32 / vw, ih as f32 / vh];
+            let scale = [ow as f32 / vw, oh as f32 / vh];
             if response.dragged() {
                 let d = response.drag_delta();
                 self.pan[0] += 2.0 * d.x * ppp / vw;
@@ -1204,7 +1385,7 @@ impl App {
             raw_editor::pipeline::View { scale, offset: self.pan, texel }
         } else {
             self.pan = [0.0, 0.0];
-            let img_aspect = iw as f32 / ih as f32;
+            let img_aspect = ow as f32 / oh as f32;
             let rect_aspect = rect.width() / rect.height();
             let scale = if img_aspect > rect_aspect {
                 [1.0, rect_aspect / img_aspect]
@@ -1216,12 +1397,13 @@ impl App {
 
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
+        // The geometry stays, so before and after line up.
         let comparing = shortcut(ui.ctx(), COMPARE_KEY, true);
-        let colour = self.image.as_ref().map_or(ImageColour::LINEAR_SRGB, |img| img.colour);
         let mut uniforms = if comparing {
-            Uniforms::passthrough(&colour, view, target_is_srgb)
+            let before = AdjustParams { rotation: shown.rotation, straighten: shown.straighten, crop: shown.crop, ..Default::default() };
+            Uniforms::new(&before, &colour, view, target_is_srgb)
         } else {
-            Uniforms::new(&self.params, &colour, view, target_is_srgb)
+            Uniforms::new(&shown, &colour, view, target_is_srgb)
         };
         uniforms.show_clip = if self.show_clip { 1.0 } else { 0.0 };
 
@@ -1229,7 +1411,9 @@ impl App {
             .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
 
         if self.picking_wb {
-            self.handle_wb_pick(ui, rect, &response, view, [iw, ih]);
+            self.handle_wb_pick(ui, rect, &response, view, geom, [iw, ih]);
+        } else if self.cropping {
+            self.crop_overlay(ui, rect, &response, view, [ow, oh]);
         }
 
         if comparing {
@@ -1326,8 +1510,7 @@ fn batch_one(
 ) -> anyhow::Result<Option<String>> {
     let ids = raw_editor::metadata::camera_ids(path).unwrap_or_default();
     let (params, _) = sidecar::initial(path, config, &ids)?;
-    let raw = rawler::decode_file(path)?;
-    let mut img = develop(&raw)?;
+    let mut img = raw_editor::metadata::develop_file(path)?;
     img.flat = config.flat_for(ids.lens.as_deref());
     let rendered = match export::render_gpu(device, queue, &img, &params) {
         Ok(r) => r,

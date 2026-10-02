@@ -80,6 +80,8 @@ Infrared (the GF1 is now a full-spectrum conversion):
   untested starting points. See **Looks** below
 - [x] IR-6 — per-colour hue / saturation / luminance (8 bands) and a look
   strength slider
+- [x] Crop, rotate (quarter turns + straighten) with a draggable crop box;
+  portrait frames open and export upright
 - [x] IR-4 — hot-spot correction: a radial model (amount, radius, centre,
   per-channel colour) plus a per-lens flat field made from one evenly lit,
   defocused frame (*Optics → Make from this photo*). A lens with a flat field
@@ -224,6 +226,16 @@ folder of raws and a destination and exports every one of them using its own
 sidecar, counting progress in the status bar; a file that fails is reported and
 the rest carry on. *Edit → Reset adjustments* mirrors the Reset all button.
 Drag-and-drop still works.
+
+**Crop & rotate**: ⟲/⟳ turn the photo a quarter at a time; *Straighten*
+rotates by up to ±45° and shrinks the crop so no empty corners show; *Crop*
+switches the photo into crop mode — the whole frame with the crop as a box:
+drag its corners or edges, or drag inside to move it, Enter to finish, Esc to
+cancel. *Aspect* locks the ratio (Original, 1:1, 4:5, 3:2, 16:9 and their
+portrait twins). Everything is stored in the sidecar like any other edit, so
+it can be changed or reset later. Portrait shots now open upright: the
+camera's orientation is applied as a starting rotation, and exports carry
+upright pixels with EXIF Orientation 1.
 
 **Compare**: hold `B` to render the same frame with neutral params — the
 "before" view goes through the identical shader, so only the adjustments differ.

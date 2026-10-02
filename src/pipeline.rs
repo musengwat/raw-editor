@@ -120,6 +120,14 @@ pub struct AdjustParams {
     pub hotspot_balance: [f32; 3],
     /// Apply the flat field saved for this photo's lens, if there is one.
     pub flat_field: bool,
+
+    /// Extra clockwise quarter turns on top of the camera's orientation.
+    pub rotation: u8,
+    /// Fine rotation in degrees, clockwise, about the frame centre.
+    pub straighten: f32,
+    /// Crop `[x0, y0, x1, y1]`, normalised to the rotated (and straightened)
+    /// frame. `[0, 0, 1, 1]` = no crop.
+    pub crop: [f32; 4],
 }
 
 /// Half-width of the detail neighbourhood, in source pixels. Mirrored in
@@ -161,6 +169,9 @@ impl Default for AdjustParams {
             hotspot_centre: [0.5, 0.5],
             hotspot_balance: [1.0; 3],
             flat_field: false,
+            rotation: 0,
+            straighten: 0.0,
+            crop: [0.0, 0.0, 1.0, 1.0],
         }
     }
 }
@@ -214,6 +225,11 @@ impl AdjustParams {
                 self.hotspot_balance = d.hotspot_balance;
                 self.flat_field = d.flat_field;
             }
+            Section::Geometry => {
+                self.rotation = d.rotation;
+                self.straighten = d.straighten;
+                self.crop = d.crop;
+            }
         }
     }
 
@@ -235,10 +251,11 @@ pub enum Section {
     Wheels,
     Detail,
     Optics,
+    Geometry,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Colour,
         Section::Basic,
         Section::Hsl,
@@ -246,6 +263,7 @@ impl Section {
         Section::Wheels,
         Section::Detail,
         Section::Optics,
+        Section::Geometry,
     ];
 }
 
@@ -262,13 +280,100 @@ pub struct ImageColour {
     pub as_shot_wb: [f32; 3],
     /// Row-major; row sums are 1, so white-balanced neutral stays neutral.
     pub cam_to_srgb: [[f32; 3]; 3],
+    /// Clockwise quarter turns that display the frame upright, from the
+    /// camera's orientation tag. Folded into the geometry so portrait shots
+    /// open upright and exports carry upright pixels (Orientation = 1).
+    pub turns: u8,
 }
 
 pub const IDENTITY3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 impl ImageColour {
     /// For data that is already linear sRGB: unit gains, identity matrix.
-    pub const LINEAR_SRGB: Self = Self { as_shot_wb: [1.0; 3], cam_to_srgb: IDENTITY3 };
+    pub const LINEAR_SRGB: Self = Self { as_shot_wb: [1.0; 3], cam_to_srgb: IDENTITY3, turns: 0 };
+}
+
+/// Where each output pixel comes from: quarter turns (camera orientation plus
+/// the user's), a fine straighten angle about the centre, then a crop. All of
+/// it composes to one affine map from output uv to source uv, which the
+/// shader applies before anything else — so lens corrections and the detail
+/// stage still work on source pixels, where they belong.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geometry {
+    /// Output size in pixels.
+    pub width: usize,
+    pub height: usize,
+    /// `src = [a[0][0]·u + a[0][1]·v + a[0][2], a[1][0]·u + a[1][1]·v + a[1][2]]`.
+    pub a: [[f32; 3]; 2],
+}
+
+impl Geometry {
+    /// Resolve for a `w`x`h` source. The crop is snapped to whole pixels of
+    /// the rotated frame, so with no straightening every output pixel centre
+    /// lands exactly on a source pixel centre and nothing is resampled.
+    pub fn resolve(p: &AdjustParams, img: &ImageColour, w: usize, h: usize) -> Self {
+        let turns = (img.turns + p.rotation) % 4;
+        let (cw, ch) = if turns % 2 == 1 { (h as f64, w as f64) } else { (w as f64, h as f64) };
+        let [x0, y0, x1, y1] = p.crop.map(|v| v.clamp(0.0, 1.0) as f64);
+        let px0 = (x0 * cw).round().min(cw - 1.0);
+        let py0 = (y0 * ch).round().min(ch - 1.0);
+        let pw = ((x1 - x0) * cw).round().clamp(1.0, cw - px0);
+        let ph = ((y1 - y0) * ch).round().clamp(1.0, ch - py0);
+        let theta = (p.straighten as f64).to_radians();
+        let (sin, cos) = theta.sin_cos();
+        let map = |u: f64, v: f64| -> [f64; 2] {
+            // Output uv → rotated-frame pixels → undo the straighten about the
+            // centre → undo the quarter turns.
+            let (x, y) = (px0 + u * pw - cw / 2.0, py0 + v * ph - ch / 2.0);
+            let (x, y) = (cos * x + sin * y + cw / 2.0, -sin * x + cos * y + ch / 2.0);
+            let (qx, qy) = (x / cw, y / ch);
+            match turns {
+                0 => [qx, qy],
+                1 => [qy, 1.0 - qx],
+                2 => [1.0 - qx, 1.0 - qy],
+                _ => [1.0 - qy, qx],
+            }
+        };
+        let o = map(0.0, 0.0);
+        let du = map(1.0, 0.0);
+        let dv = map(0.0, 1.0);
+        let a = [
+            [(du[0] - o[0]) as f32, (dv[0] - o[0]) as f32, o[0] as f32],
+            [(du[1] - o[1]) as f32, (dv[1] - o[1]) as f32, o[1] as f32],
+        ];
+        Self { width: pw as usize, height: ph as usize, a }
+    }
+
+    pub fn source_uv(&self, uv: [f32; 2]) -> [f32; 2] {
+        let a = &self.a;
+        [a[0][0] * uv[0] + a[0][1] * uv[1] + a[0][2], a[1][0] * uv[0] + a[1][1] * uv[1] + a[1][2]]
+    }
+
+    /// The source pixel behind an output uv, or `None` where straightening
+    /// left no source (the black corners).
+    pub fn source_pixel(&self, uv: [f32; 2], w: usize, h: usize) -> Option<[usize; 2]> {
+        let s = self.source_uv(uv);
+        if !(0.0..=1.0).contains(&s[0]) || !(0.0..=1.0).contains(&s[1]) {
+            return None;
+        }
+        Some([((s[0] * w as f32) as usize).min(w - 1), ((s[1] * h as f32) as usize).min(h - 1)])
+    }
+
+    /// True when the output is the source, pixel for pixel.
+    pub fn is_identity(&self, w: usize, h: usize) -> bool {
+        (self.width, self.height) == (w, h) && self.a == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    }
+}
+
+/// The largest crop with the frame's own aspect ratio, centred, that stays
+/// inside a frame of `w`x`h` (after quarter turns) straightened by `degrees` —
+/// so straightening never shows empty corners. Returns `[x0, y0, x1, y1]`.
+pub fn straighten_crop(degrees: f32, w: f32, h: f32) -> [f32; 4] {
+    let (s, c) = degrees.to_radians().sin_cos();
+    let (s, c) = (s.abs(), c.abs());
+    let k = (w / (w * c + h * s)).min(h / (w * s + h * c)).min(1.0);
+    let m = (1.0 - k) / 2.0;
+    [m, m, 1.0 - m, 1.0 - m]
 }
 
 /// White balance and matrix as actually applied to one render.
@@ -324,7 +429,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 368 bytes.
+/// Total size 400 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -346,6 +451,9 @@ pub struct Uniforms {
     /// Per-colour bands `[hue, sat, lum, _]`; `hsl[0][3]` is 1.0 when any
     /// band is non-zero, so the shader can skip the stage.
     pub hsl: [[f32; 4]; 8],
+    /// Output uv → source uv, the two rows of [`Geometry::a`] (`.w` unused).
+    pub geom0: [f32; 4],
+    pub geom1: [f32; 4],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -393,15 +501,22 @@ impl View {
     /// up, both -1..1), or `None` off the image. Inverse of the quad placement
     /// in `vs_main`.
     pub fn image_pixel(&self, ndc: [f32; 2], size: [usize; 2]) -> Option<[usize; 2]> {
+        let [u, v] = self.quad_uv(ndc)?;
+        let px = ((u * size[0] as f32) as usize).min(size[0] - 1);
+        let py = ((v * size[1] as f32) as usize).min(size[1] - 1);
+        Some([px, py])
+    }
+
+    /// The quad's uv (0..1, v down) under a viewport position in NDC, or
+    /// `None` off the quad. With a geometry this is the *output* uv; see
+    /// [`Geometry::source_pixel`].
+    pub fn quad_uv(&self, ndc: [f32; 2]) -> Option<[f32; 2]> {
         let cx = (ndc[0] - self.offset[0]) / self.scale[0];
         let cy = (ndc[1] - self.offset[1]) / self.scale[1];
         if !(-1.0..=1.0).contains(&cx) || !(-1.0..=1.0).contains(&cy) {
             return None;
         }
-        let (u, v) = (cx * 0.5 + 0.5, 0.5 - cy * 0.5);
-        let px = ((u * size[0] as f32) as usize).min(size[0] - 1);
-        let py = ((v * size[1] as f32) as usize).min(size[1] - 1);
-        Some([px, py])
+        Some([cx * 0.5 + 0.5, 0.5 - cy * 0.5])
     }
 
     /// Aspect-fitted, unpanned.
@@ -413,6 +528,12 @@ impl View {
     pub fn one_to_one(texel: [f32; 2]) -> Self {
         Self::fit([1.0, 1.0], texel)
     }
+}
+
+/// The geometry for a render, with the source size recovered from the texel.
+fn view_geometry(p: &AdjustParams, img: &ImageColour, view: View) -> Geometry {
+    let (w, h) = ((1.0 / view.texel[0]).round() as usize, (1.0 / view.texel[1]).round() as usize);
+    Geometry::resolve(p, img, w, h)
 }
 
 impl Uniforms {
@@ -443,6 +564,8 @@ impl Uniforms {
                 h[0][3] = if hsl_active(&p.hsl) { 1.0 } else { 0.0 };
                 h
             },
+            geom0: { let g = view_geometry(p, img, view); [g.a[0][0], g.a[0][1], g.a[0][2], 0.0] },
+            geom1: { let g = view_geometry(p, img, view); [g.a[1][0], g.a[1][1], g.a[1][2], 0.0] },
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -685,6 +808,9 @@ mod tests {
             hotspot_centre: [0.4, 0.6],
             hotspot_balance: [1.2, 1.0, 0.8],
             flat_field: true,
+            rotation: 1,
+            straighten: 2.0,
+            crop: [0.1, 0.1, 0.9, 0.8],
         }
     }
 
@@ -759,6 +885,78 @@ mod tests {
         assert_eq!(at(0.5)[0], [0.5, 0.0, 0.5]);
     }
 
+    fn geom(p: AdjustParams, turns: u8, w: usize, h: usize) -> Geometry {
+        Geometry::resolve(&p, &ImageColour { turns, ..ImageColour::LINEAR_SRGB }, w, h)
+    }
+
+    fn close2(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5
+    }
+
+    #[test]
+    fn default_geometry_is_identity() {
+        assert!(geom(AdjustParams::default(), 0, 40, 30).is_identity(40, 30));
+    }
+
+    #[test]
+    fn quarter_turns_map_corners_and_swap_size() {
+        // Output top-left after a clockwise turn is the source's bottom-left.
+        let cases = [(0, [0.0, 0.0]), (1, [0.0, 1.0]), (2, [1.0, 1.0]), (3, [1.0, 0.0])];
+        for (turns, corner) in cases {
+            let g = geom(AdjustParams::default(), turns, 40, 30);
+            assert!(close2(g.source_uv([0.0, 0.0]), corner), "turns {turns}: {:?}", g.source_uv([0.0, 0.0]));
+            let size = if turns % 2 == 1 { (30, 40) } else { (40, 30) };
+            assert_eq!((g.width, g.height), size);
+        }
+    }
+
+    #[test]
+    fn source_pixel_follows_the_rotation() {
+        // Turned clockwise, the output's top-left pixel is the source's
+        // bottom-left one.
+        let g = geom(AdjustParams { rotation: 1, ..Default::default() }, 0, 40, 30);
+        assert_eq!(g.source_pixel([0.01, 0.01], 40, 30), Some([0, 29]));
+        let s = geom(AdjustParams { straighten: 10.0, ..Default::default() }, 0, 40, 30);
+        assert_eq!(s.source_pixel([0.0, 0.0], 40, 30), None, "uncropped straightened corner is empty");
+    }
+
+    #[test]
+    fn camera_and_user_turns_add_up() {
+        let p = AdjustParams { rotation: 3, ..Default::default() };
+        // Camera says turn once, the user turns three more: back to upright.
+        assert!(geom(p, 1, 40, 30).is_identity(40, 30));
+    }
+
+    #[test]
+    fn crop_snaps_to_whole_pixels() {
+        let p = AdjustParams { crop: [0.101, 0.2, 0.604, 0.7], ..Default::default() };
+        let g = geom(p, 0, 100, 50);
+        assert_eq!((g.width, g.height), (50, 25));
+        // First output pixel centre lands on source pixel 10's centre.
+        let s = g.source_uv([0.5 / 50.0, 0.5 / 25.0]);
+        assert!(close2(s, [10.5 / 100.0, 10.5 / 50.0]), "{s:?}");
+    }
+
+    #[test]
+    fn straighten_crop_leaves_no_empty_corners() {
+        for deg in [-12.0f32, -3.0, 0.5, 5.0, 20.0] {
+            let (w, h) = (4000.0, 3000.0);
+            let p = AdjustParams { straighten: deg, crop: straighten_crop(deg, w, h), ..Default::default() };
+            let g = geom(p, 0, w as usize, h as usize);
+            for c in [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+                let s = g.source_uv(c);
+                assert!(s.iter().all(|v| (-1e-3..=1.0 + 1e-3).contains(v)), "{deg}°: corner {c:?} → {s:?}");
+            }
+            // And it is the largest such crop: the frame is not shrunk for nothing.
+            let grown = straighten_crop(deg, w, h).map(|v| if v < 0.5 { v - 0.01 } else { v + 0.01 });
+            let g = geom(AdjustParams { straighten: deg, crop: grown, ..Default::default() }, 0, w as usize, h as usize);
+            assert!([[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]].iter().any(|c| {
+                let s = g.source_uv(*c);
+                s.iter().any(|v| !(0.0..=1.0).contains(v))
+            }) || deg.abs() < 1.0, "{deg}°: a 1% bigger crop should poke outside");
+        }
+    }
+
     #[test]
     fn resetting_every_section_resets_everything() {
         // Catches a new param that was never assigned to a section, and so
@@ -828,8 +1026,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_368_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 368);
+    fn uniforms_layout_is_400_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 400);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -844,6 +1042,8 @@ mod tests {
             &u.hotspot as *const _ as usize,
             &u.optics as *const _ as usize,
             &u.hsl as *const _ as usize,
+            &u.geom0 as *const _ as usize,
+            &u.geom1 as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
         }
@@ -1014,7 +1214,7 @@ mod tests {
 
     #[test]
     fn sensor_rgb_mode_drops_the_matrix_and_custom_wb_overrides_as_shot() {
-        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM };
+        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM, turns: 0 };
         let def = Colour::resolve(&img, &AdjustParams::default());
         assert_eq!(def, Colour { wb: [2.0, 1.0, 1.5], matrix: CAM });
         let p = AdjustParams {
@@ -1077,7 +1277,7 @@ mod tests {
 
     #[test]
     fn mixer_is_applied_after_the_matrix() {
-        let img = ImageColour { as_shot_wb: [1.0; 3], cam_to_srgb: CAM };
+        let img = ImageColour { as_shot_wb: [1.0; 3], cam_to_srgb: CAM, turns: 0 };
         let swap = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
         let p = AdjustParams { mixer: swap, ..Default::default() };
         let plain = to_working(&Colour::resolve(&img, &AdjustParams::default()), [0.2, 0.3, 0.5], 0.0);
@@ -1087,7 +1287,7 @@ mod tests {
 
     #[test]
     fn identity_mixer_changes_nothing() {
-        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM };
+        let img = ImageColour { as_shot_wb: [2.0, 1.0, 1.5], cam_to_srgb: CAM, turns: 0 };
         assert_eq!(Colour::resolve(&img, &AdjustParams::default()).matrix, CAM);
     }
 

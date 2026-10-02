@@ -330,3 +330,19 @@ fn flat_field_on_a_real_frame_through_the_gpu_export() {
     eprintln!("GPU vs CPU with flat field: mean {mean:.1}, worst {worst} (of 65535)");
     assert!(mean < 64.0 && worst < 1024, "GPU and CPU disagree: mean {mean:.1}, worst {worst}");
 }
+
+/// A portrait G85 frame (EXIF orientation 8): rawler reports it as Normal,
+/// so the turn must come from the EXIF, and the export must come out tall.
+/// Skips without testdata.
+#[test]
+fn portrait_frames_export_upright() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/portrait/P1050191.rw2");
+    if !path.exists() {
+        eprintln!("SKIP: testdata not present");
+        return;
+    }
+    let img = raw_editor::metadata::develop_file(&path).unwrap();
+    assert_eq!(img.colour.turns, 3, "orientation 8 = a quarter turn anticlockwise");
+    let g = raw_editor::pipeline::Geometry::resolve(&AdjustParams::default(), &img.colour, img.width, img.height);
+    assert!(g.height > g.width, "{}x{} should be portrait", g.width, g.height);
+}

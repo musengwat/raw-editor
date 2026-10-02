@@ -145,6 +145,19 @@ const SRGB_TO_XYZ: [[f32; 3]; 3] = [
     [0.0193339, 0.1191920, 0.9503041],
 ];
 
+/// Clockwise quarter turns that show a frame upright, from its EXIF
+/// orientation (6 = turn 90° clockwise, 8 = 90° anticlockwise). Mirrored
+/// orientations do not come out of cameras held normally and are ignored.
+pub fn orientation_turns(o: rawler::decoders::Orientation) -> u8 {
+    use rawler::decoders::Orientation::*;
+    match o {
+        Rotate90 => 1,
+        Rotate180 => 2,
+        Rotate270 => 3,
+        _ => 0,
+    }
+}
+
 pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     if raw.cpp != 1 {
         bail!("expected bayer CFA data (cpp=1), got cpp={}", raw.cpp);
@@ -216,7 +229,7 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     };
     let (out, clip) = demosaic(&mosaic, (ax, ay, aw, ah), Demosaic::Mhc);
 
-    let colour = ImageColour { as_shot_wb: [wb[0], wb[1], wb[2]], cam_to_srgb };
+    let colour = ImageColour { as_shot_wb: [wb[0], wb[1], wb[2]], cam_to_srgb, turns: orientation_turns(raw.orientation) };
     Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None })
 }
 

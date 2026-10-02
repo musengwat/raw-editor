@@ -393,6 +393,7 @@ fn camera_source() -> DevelopedImage {
     img.colour = ImageColour {
         as_shot_wb: [2.1, 1.0, 1.6],
         cam_to_srgb: [[1.7, -0.55, -0.15], [-0.25, 1.45, -0.2], [0.02, -0.5, 1.48]],
+        turns: 0,
     };
     img
 }
@@ -443,6 +444,51 @@ fn parity_channel_mixer_looks() {
         &camera_source(),
         AdjustParams { mixer: [[1.2, -0.4, 0.3], [0.1, 0.6, 0.2], [-0.2, 0.5, 0.9]], ..Default::default() },
     );
+}
+
+// --- Crop, rotate, straighten ----------------------------------------------
+
+/// GPU render at the geometry's output size against the CPU export path.
+fn assert_geometry_parity(img: &DevelopedImage, params: AdjustParams, tolerance: i32) {
+    let Some(ctx) = common::gpu() else { return };
+    let cpu = raw_editor::export::render_cpu(img, &params);
+    let gpu = render_image_sized(&ctx.device, &ctx.queue, img, &params, false, cpu.width, cpu.height);
+    let mut worst = 0i32;
+    for (i, px) in gpu.iter().enumerate() {
+        for ch in 0..3 {
+            let want = (cpu.data[i * 3 + ch] / 257) as i32;
+            worst = worst.max((want - px[ch] as i32).abs());
+        }
+    }
+    assert!(worst <= tolerance, "geometry parity off by {worst} (params {params:?})");
+}
+
+/// Quarter turns and a crop resample nothing: exact, detail included.
+#[test]
+fn parity_rotation_and_crop() {
+    for rotation in 0..4u8 {
+        let p = AdjustParams {
+            rotation,
+            crop: [0.125, 0.25, 0.75, 0.875],
+            sharpen_amount: 0.8,
+            nr_chroma: 0.4,
+            saturation: 0.2,
+            ..Default::default()
+        };
+        assert_geometry_parity(&camera_source(), p, 3);
+    }
+}
+
+/// Straightening resamples. The GPU filters camera RGB, the CPU filters the
+/// processed working image, so allow a little more at sharp edges.
+#[test]
+fn parity_straighten() {
+    let p = AdjustParams {
+        straighten: 7.0,
+        crop: raw_editor::pipeline::straighten_crop(7.0, 24.0, 24.0),
+        ..Default::default()
+    };
+    assert_geometry_parity(&camera_source(), p, 6);
 }
 
 // --- Fit-to-window preview -------------------------------------------------

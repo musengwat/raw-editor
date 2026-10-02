@@ -210,6 +210,109 @@ pub fn section_header(ui: &mut egui::Ui, title: &str, changed: bool) -> bool {
     .inner
 }
 
+/// Which parts of a crop rectangle a drag moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CropGrab {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+    /// Inside the rectangle, away from the edges: move the whole thing.
+    pub inside: bool,
+}
+
+impl CropGrab {
+    pub fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What a pointer at `pos` grabs on the crop `r` (screen space), with
+    /// edges `slop` points thick.
+    pub fn at(r: egui::Rect, pos: Pos2, slop: f32) -> Self {
+        let near_x = pos.x > r.left() - slop && pos.x < r.right() + slop;
+        let near_y = pos.y > r.top() - slop && pos.y < r.bottom() + slop;
+        let g = Self {
+            left: near_y && (pos.x - r.left()).abs() < slop,
+            right: near_y && (pos.x - r.right()).abs() < slop,
+            top: near_x && (pos.y - r.top()).abs() < slop,
+            bottom: near_x && (pos.y - r.bottom()).abs() < slop,
+            inside: false,
+        };
+        if g.is_none() && r.contains(pos) { Self { inside: true, ..g } } else { g }
+    }
+
+    pub fn cursor(&self) -> egui::CursorIcon {
+        use egui::CursorIcon::*;
+        match (self.left || self.right, self.top || self.bottom) {
+            _ if self.inside => Grab,
+            (true, true) if (self.left && self.top) || (self.right && self.bottom) => ResizeNwSe,
+            (true, true) => ResizeNeSw,
+            (true, false) => ResizeHorizontal,
+            (false, true) => ResizeVertical,
+            _ => Default,
+        }
+    }
+}
+
+/// Smallest crop side, as a fraction of the frame.
+pub const MIN_CROP: f32 = 0.02;
+
+/// The crop after dragging `grab` by `(dx, dy)` (fractions of the frame) from
+/// `start`. `aspect` is the locked width/height ratio *in normalised units*
+/// (pixel ratio × frame height / frame width), or `None` for free.
+pub fn drag_crop(start: [f32; 4], grab: CropGrab, dx: f32, dy: f32, aspect: Option<f32>) -> [f32; 4] {
+    let [mut x0, mut y0, mut x1, mut y1] = start;
+    if grab.inside {
+        let (w, h) = (x1 - x0, y1 - y0);
+        let nx = (x0 + dx).clamp(0.0, 1.0 - w);
+        let ny = (y0 + dy).clamp(0.0, 1.0 - h);
+        return [nx, ny, nx + w, ny + h];
+    }
+    if grab.left {
+        x0 = (x0 + dx).clamp(0.0, x1 - MIN_CROP);
+    }
+    if grab.right {
+        x1 = (x1 + dx).clamp(x0 + MIN_CROP, 1.0);
+    }
+    if grab.top {
+        y0 = (y0 + dy).clamp(0.0, y1 - MIN_CROP);
+    }
+    if grab.bottom {
+        y1 = (y1 + dy).clamp(y0 + MIN_CROP, 1.0);
+    }
+    let Some(a) = aspect else { return [x0, y0, x1, y1] };
+    // Keep the ratio: a pure top/bottom drag sets the height and the width
+    // follows about the centre; anything else sets the width and the height
+    // follows away from the dragged edge.
+    let horizontal = grab.left || grab.right;
+    let (mut w, mut h) = (x1 - x0, y1 - y0);
+    if horizontal { h = w / a } else { w = h * a }
+    // Shrink to fit the frame from the anchored side.
+    let (ax, ay) = (if grab.left { x1 } else { x0 }, if grab.top { y1 } else { y0 });
+    let room_x = if horizontal { if grab.left { ax } else { 1.0 - ax } } else { 1.0 };
+    let room_y = if grab.top { ay } else { 1.0 - ay };
+    let k = (room_x / w).min(room_y / h).min(1.0);
+    (w, h) = (w * k, h * k);
+    let (x0, x1) = if horizontal {
+        if grab.left { (ax - w, ax) } else { (ax, ax + w) }
+    } else {
+        let cx = ((start[0] + start[2]) / 2.0).clamp(w / 2.0, 1.0 - w / 2.0);
+        (cx - w / 2.0, cx + w / 2.0)
+    };
+    let (y0, y1) = if grab.top { (ay - h, ay) } else { (ay, ay + h) };
+    [x0, y0, x1, y1]
+}
+
+/// The largest crop of ratio `aspect` (normalised, as in [`drag_crop`])
+/// inside `crop`, centred on it.
+pub fn fit_aspect(crop: [f32; 4], aspect: f32) -> [f32; 4] {
+    let [x0, y0, x1, y1] = crop;
+    let (w, h) = (x1 - x0, y1 - y0);
+    let (nw, nh) = if w / h > aspect { (h * aspect, h) } else { (w, w / aspect) };
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    [cx - nw / 2.0, cy - nh / 2.0, cx + nw / 2.0, cy + nh / 2.0]
+}
+
 /// Overlaid RGB histogram plus a per-channel clipped-percentage line.
 pub fn histogram(ui: &mut egui::Ui, h: &crate::histogram::Histogram) {
     use crate::histogram::BINS;
@@ -288,6 +391,54 @@ mod tests {
             modifiers: Default::default(),
         };
         vec![egui::Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    fn approx(a: [f32; 4], b: [f32; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    #[test]
+    fn crop_grab_finds_edges_corners_and_inside() {
+        let r = egui::Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(300.0, 200.0));
+        let g = CropGrab::at(r, Pos2::new(101.0, 199.0), 8.0);
+        assert!(g.left && g.bottom && !g.right && !g.top);
+        assert!(CropGrab::at(r, Pos2::new(200.0, 150.0), 8.0).inside);
+        assert!(CropGrab::at(r, Pos2::new(200.0, 98.0), 8.0).top);
+        assert!(CropGrab::at(r, Pos2::new(500.0, 150.0), 8.0).is_none());
+    }
+
+    #[test]
+    fn free_drag_moves_only_the_grabbed_edges() {
+        let start = [0.1, 0.1, 0.9, 0.9];
+        let right = CropGrab { right: true, ..Default::default() };
+        assert!(approx(drag_crop(start, right, -0.2, 0.3, None), [0.1, 0.1, 0.7, 0.9]));
+        // Clamped to the frame and to the minimum size.
+        assert!(approx(drag_crop(start, right, 0.5, 0.0, None), [0.1, 0.1, 1.0, 0.9]));
+        assert!(approx(drag_crop(start, right, -2.0, 0.0, None), [0.1, 0.1, 0.1 + MIN_CROP, 0.9]));
+    }
+
+    #[test]
+    fn moving_keeps_the_size_inside_the_frame() {
+        let inside = CropGrab { inside: true, ..Default::default() };
+        assert!(approx(drag_crop([0.2, 0.2, 0.6, 0.5], inside, 0.9, -0.9, None), [0.6, 0.0, 1.0, 0.3]));
+    }
+
+    #[test]
+    fn locked_aspect_holds_through_a_corner_drag() {
+        let br = CropGrab { right: true, bottom: true, ..Default::default() };
+        let c = drag_crop([0.0, 0.0, 0.5, 0.5], br, 0.2, 0.05, Some(1.0));
+        assert!(((c[2] - c[0]) - (c[3] - c[1])).abs() < 1e-5, "{c:?}");
+        assert_eq!([c[0], c[1]], [0.0, 0.0], "top-left stays anchored");
+        // Too big for the frame: shrinks to fit instead of spilling out.
+        let c = drag_crop([0.0, 0.5, 0.4, 0.9], br, 0.5, 0.0, Some(1.0));
+        assert!(c.iter().all(|v| (0.0..=1.0 + 1e-5).contains(v)), "{c:?}");
+        assert!(((c[2] - c[0]) - (c[3] - c[1])).abs() < 1e-5, "{c:?}");
+    }
+
+    #[test]
+    fn fit_aspect_is_centred_and_inside() {
+        let c = fit_aspect([0.0, 0.0, 1.0, 0.5], 1.0);
+        assert!(approx(c, [0.25, 0.0, 0.75, 0.5]), "{c:?}");
     }
 
     #[test]
