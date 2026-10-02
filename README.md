@@ -152,6 +152,11 @@ filter the IR lands mostly in red, so red minus green is the IR signal. Both
 subtractions amplify noise: the #16 and mono looks are grainy at ISO 800 —
 shoot at ISO 100 and use NR. The #16 looks also need about +1 EV.
 
+Black level: Panasonic files under-report their black level by 15 (the GF1
+says 0, the real floor is 15–16). The editor now adds it; before, the faint
+blue channel behind the #16 carried a ~17% false floor that turned the
+Aerochrome sky maroon.
+
 Two hardware facts behind all this: on the GF1 the **dust-shaker glass
 blocks infrared too**, so a conversion has to remove it as well as the IR-cut
 filter (before it came out, daylight frames showed almost no IR); and the

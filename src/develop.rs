@@ -158,6 +158,17 @@ pub fn orientation_turns(o: rawler::decoders::Orientation) -> u8 {
     }
 }
 
+/// Panasonic RW2 black-level tags (0x1C–0x1E) are 15 short of the real
+/// black: the GF1 reports 0 but its darkest values pile up at 16, the G85
+/// reports 128 but its floor sits at ~143 (dcraw/LibRaw add the same 15).
+/// rawler uses the tag as is, so without this every pixel carried a +15
+/// pedestal — invisible in bright channels, but behind a #16 orange filter
+/// the blue (IR) channel's median is ~95, so it was a 17% error that the
+/// Aerochrome mix turned into maroon skies and red shadows.
+pub fn black_pedestal(make: &str) -> f32 {
+    if make.to_ascii_lowercase().contains("panasonic") { 15.0 } else { 0.0 }
+}
+
 pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     if raw.cpp != 1 {
         bail!("expected bayer CFA data (cpp=1), got cpp={}", raw.cpp);
@@ -176,7 +187,8 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     let (ax, ay, aw, ah) = (area.p.x, area.p.y, area.d.w, area.d.h);
 
     // Per-CFA-color black and white levels (RGBE order, E falls back to G).
-    let black: Vec<f32> = raw.blacklevel.levels.iter().map(|r| r.n as f32 / r.d as f32).collect();
+    let pedestal = black_pedestal(&raw.make);
+    let black: Vec<f32> = raw.blacklevel.levels.iter().map(|r| r.n as f32 / r.d as f32 + pedestal).collect();
     let white: Vec<f32> = raw.whitelevel.0.iter().map(|&w| w as f32).collect();
     let level = |arr: &[f32], c: usize, dflt: f32| -> f32 {
         *arr.get(c).or_else(|| arr.first()).unwrap_or(&dflt)
@@ -784,6 +796,13 @@ mod tests {
             .collect();
         let pick = img.neutral_gains(10, 10, &AdjustParams::default()).unwrap();
         assert!((pick.gains[0] - 2.0).abs() < 1e-5 && (pick.gains[2] - 4.0).abs() < 1e-5, "{pick:?}");
+    }
+
+    #[test]
+    fn panasonic_black_level_gets_its_pedestal() {
+        assert_eq!(black_pedestal("Panasonic"), 15.0);
+        assert_eq!(black_pedestal("PANASONIC"), 15.0);
+        assert_eq!(black_pedestal("Canon"), 0.0);
     }
 
     #[test]

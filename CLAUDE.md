@@ -353,3 +353,15 @@ one entry point the GUI, batch export and CLI use. Exports write Orientation
 Crop UI: `widgets::{CropGrab, drag_crop, fit_aspect}` are pure and tested; the
 overlay hit-tests at `pointer.press_origin()` because egui reports a drag only
 after a few points of movement, enough to miss a corner.
+
+## Panasonic black level (+15)
+
+rawler takes the RW2 black-level tags (0x1C–0x1E) as is, but they are 15
+short: the GF1 reports 0 and its darkest values clip at 16; the G85 reports
+128 and its floor is ~143. `develop::black_pedestal` adds 15 for Panasonic
+(dcraw/LibRaw do the same). Without it the #16 blue channel — median ~95 on a
+starved frame like P1320300 — carried a ~17% pedestal that the Aerochrome mix
+turned into a maroon sky and red shadows. Measured by fitting B = k·G + c on
+the least-IR pixels (c went from +0.0015…+0.0043 to ≈0). The GF1's "masked"
+border columns carry image content, so they cannot be used for black.
+Renders of Panasonic files are slightly darker in deep shadow than before.
