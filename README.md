@@ -93,6 +93,11 @@ Optics) has its own *Reset*, enabled while anything under it has changed, and
 *Reset all* at the bottom (also *Edit → Reset adjustments*) clears everything.
 All of them reset to neutral, not to the photo's camera look.
 
+**Undo**: **Ctrl+Z** (⌘Z on macOS) undoes, **Ctrl+Shift+Z** or **Ctrl+Y**
+redoes; both are also in the *Edit* menu. A whole slider drag is one step.
+History is per photo and starts fresh when another one is opened. While a text
+field has focus, Ctrl+Z belongs to the field.
+
 **Colour**: white balance and how camera RGB becomes working RGB — built for
 the infrared-converted GF1, useful on any file.
 *Pick neutral* (or **W**) arms an eyedropper: click something that should be

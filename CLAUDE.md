@@ -263,3 +263,13 @@ fails when a new param is added without assigning it to a section. Widget
 tests drive a headless `egui::Context` with synthetic pointer events (advance
 `RawInput.time` per frame, one event per frame for double-clicks, and
 `textures_delta.clear()` or the drop asserts).
+
+## Undo
+
+`src/history.rs` is a generic `History<T>`; the GUI calls `observe(params,
+settled)` every frame with `settled = no pointer button down`, so a drag is one
+step. Undo mid-drag returns to the pre-drag state. Ctrl+Z is consumed *before*
+the single-key shortcuts, and `shortcut()` ignores keys pressed with Ctrl/⌘ —
+otherwise Ctrl+Z also toggled the Z zoom. Real-input GUI testing works through
+`libXtst` via Python ctypes (`XTestFakeKeyEvent`/`MotionEvent`/`ButtonEvent`
+on `:10`) even though `xdotool` is not installed.

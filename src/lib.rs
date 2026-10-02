@@ -5,6 +5,7 @@ pub mod export;
 pub mod flatfield;
 pub mod gpu;
 pub mod histogram;
+pub mod history;
 pub mod immich;
 pub mod looks;
 pub mod metadata;

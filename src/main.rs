@@ -17,6 +17,7 @@ use raw_editor::pipeline::{
     AdjustParams, ColourMode, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN,
 };
 use raw_editor::config::Config;
+use raw_editor::history::History;
 use raw_editor::immich;
 use raw_editor::looks::Look;
 use raw_editor::metadata::CameraIds;
@@ -32,11 +33,18 @@ const PICK_WB_KEY: egui::Key = egui::Key::W;
 /// Toggles the clipping overlay.
 const CLIP_KEY: egui::Key = egui::Key::C;
 
+/// Ctrl+Z / Ctrl+Shift+Z (⌘ on macOS); Ctrl+Y also redoes, as on Windows.
+const UNDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+const REDO: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::Z);
+const REDO_ALT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
+
 /// Single-key shortcuts must not fire while the user is typing into a text
-/// field (the Immich settings, say).
+/// field (the Immich settings, say), nor as part of a Ctrl/⌘ chord — Ctrl+Z
+/// is undo, not zoom.
 fn shortcut(ctx: &egui::Context, key: egui::Key, held: bool) -> bool {
     !ctx.egui_wants_keyboard_input()
-        && ctx.input(|i| if held { i.key_down(key) } else { i.key_pressed(key) })
+        && ctx.input(|i| !i.modifiers.command && if held { i.key_down(key) } else { i.key_pressed(key) })
 }
 /// How long the params must sit still before the sidecar is written.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(600);
@@ -99,6 +107,8 @@ struct App {
     look_name: String,
     /// Previous frame's values, used to spot edits and restart the debounce.
     prev_params: AdjustParams,
+    /// Undo / redo of `params` for the open photo; reset on every load.
+    history: History<AdjustParams>,
     dirty_since: Option<Instant>,
 
     image: Option<Arc<DevelopedImage>>,
@@ -160,6 +170,7 @@ impl App {
             camera: CameraIds::default(),
             look_name: String::new(),
             prev_params: AdjustParams::default(),
+            history: History::new(AdjustParams::default()),
             dirty_since: None,
             image: None,
             current: None,
@@ -252,10 +263,25 @@ impl App {
                     self.baseline = baseline;
                     self.camera = camera;
                     self.prev_params = params;
+                    self.history = History::new(params);
                     self.dirty_since = None;
                 }
                 Err(e) => self.status = format!("Failed to load {}: {e:#}", path.display()),
             }
+        }
+    }
+
+    fn undo(&mut self) {
+        match self.history.undo(self.params) {
+            Some(p) => self.params = p,
+            None => self.status = "Nothing to undo".into(),
+        }
+    }
+
+    fn redo(&mut self) {
+        match self.history.redo(self.params) {
+            Some(p) => self.params = p,
+            None => self.status = "Nothing to redo".into(),
         }
     }
 
@@ -588,6 +614,18 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let undo = ui.ctx().format_shortcut(&UNDO);
+                let redo = ui.ctx().format_shortcut(&REDO);
+                let p = self.params;
+                if ui.add_enabled(self.history.can_undo(p), egui::Button::new("Undo").shortcut_text(undo)).clicked() {
+                    self.undo();
+                    ui.close();
+                }
+                if ui.add_enabled(self.history.can_redo(p), egui::Button::new("Redo").shortcut_text(redo)).clicked() {
+                    self.redo();
+                    ui.close();
+                }
+                ui.separator();
                 let changed = !self.params.is_neutral();
                 if ui.add_enabled(changed, egui::Button::new("Reset adjustments")).clicked() {
                     self.params = AdjustParams::default();
@@ -1130,6 +1168,20 @@ impl eframe::App for App {
         self.poll_ping();
         self.poll_export();
 
+        // Leave Ctrl+Z alone while a text field has focus: it has its own undo.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            // Redo first: Ctrl+Shift+Z would otherwise also match plain Ctrl+Z.
+            let (redo, undo) = ui.ctx().input_mut(|i| {
+                let redo = i.consume_shortcut(&REDO) || i.consume_shortcut(&REDO_ALT);
+                (redo, !redo && i.consume_shortcut(&UNDO))
+            });
+            if redo {
+                self.redo();
+            } else if undo {
+                self.undo();
+            }
+        }
+
         // Z flips between fit and 1:1.
         if shortcut(ui.ctx(), PICK_WB_KEY, false) && self.image.is_some() {
             self.picking_wb = !self.picking_wb;
@@ -1164,6 +1216,9 @@ impl eframe::App for App {
         });
         self.settings_window(ui);
 
+        // A drag is one undo step: record only once every button is up.
+        let settled = !ui.ctx().input(|i| i.pointer.any_down());
+        self.history.observe(self.params, settled);
         self.autosave_tick(ui.ctx());
     }
 
