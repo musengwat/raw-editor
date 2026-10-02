@@ -287,3 +287,16 @@ the single-key shortcuts, and `shortcut()` ignores keys pressed with Ctrl/⌘ �
 otherwise Ctrl+Z also toggled the Z zoom. Real-input GUI testing works through
 `libXtst` via Python ctypes (`XTestFakeKeyEvent`/`MotionEvent`/`ButtonEvent`
 on `:10`) even though `xdotool` is not installed.
+
+## Per-colour HSL and look strength (IR-6)
+
+`pipeline::hsl_adjust` (step 6 of `apply`, after saturation) and `hsl_adjust`
+in the shader are twins: RGB→HSV hue, band parameters linearly interpolated
+between the two nearest `HSL_BANDS` centres (cyclic, magenta→red wraps), weight
+`clamp(s / HSL_FULL_SAT)` so greys are untouched, then the branch-free HSV→RGB
+`v − v·s·clamp(min(k, 4−k))`. Keep the tie order of the max-channel branches
+identical on both sides. `Uniforms.hsl` is `array<vec4, 8>` (uniform arrays
+need 16-byte strides, so vec4) and `hsl[0].w` is the "active" flag the shader
+early-outs on; Uniforms is now 368 bytes. `parity_hsl_and_look_strength`
+covers both. `mixer_strength` is folded into the matrix in `Colour::resolve`
+(lerp towards identity), so the shader has no code for it.

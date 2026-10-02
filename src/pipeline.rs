@@ -64,6 +64,12 @@ pub struct AdjustParams {
     /// Sensor RGB mode), so it is where infrared false-colour looks live.
     /// Rows that sum to 1 keep neutrals neutral. Identity = off.
     pub mixer: [[f32; 3]; 3],
+    /// How much of the mixer applies: 0 = none (identity), 1 = all of it.
+    /// This is the "look strength" control; values past 1 exaggerate.
+    pub mixer_strength: f32,
+    /// Per-colour adjustments, one `[hue, saturation, luminance]` per band in
+    /// [`HSL_BANDS`] order, each -1..1, 0 = off. See [`hsl_adjust`].
+    pub hsl: [[f32; 3]; 8],
     /// Exposure in EV stops (gain = 2^ev).
     pub exposure_ev: f32,
     /// -1..1, pivot-based power curve in linear space.
@@ -131,6 +137,8 @@ impl Default for AdjustParams {
             wb_gains: None,
             colour_mode: ColourMode::Camera,
             mixer: IDENTITY3,
+            mixer_strength: 1.0,
+            hsl: [[0.0; 3]; 8],
             exposure_ev: 0.0,
             contrast: 0.0,
             temp: 0.0,
@@ -171,7 +179,9 @@ impl AdjustParams {
                 self.wb_gains = d.wb_gains;
                 self.colour_mode = d.colour_mode;
                 self.mixer = d.mixer;
+                self.mixer_strength = d.mixer_strength;
             }
+            Section::Hsl => self.hsl = d.hsl,
             Section::Basic => {
                 self.exposure_ev = d.exposure_ev;
                 self.contrast = d.contrast;
@@ -220,6 +230,7 @@ impl AdjustParams {
 pub enum Section {
     Colour,
     Basic,
+    Hsl,
     Tonal,
     Wheels,
     Detail,
@@ -227,8 +238,15 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 6] =
-        [Section::Colour, Section::Basic, Section::Tonal, Section::Wheels, Section::Detail, Section::Optics];
+    pub const ALL: [Section; 7] = [
+        Section::Colour,
+        Section::Basic,
+        Section::Hsl,
+        Section::Tonal,
+        Section::Wheels,
+        Section::Detail,
+        Section::Optics,
+    ];
 }
 
 /// What the raw file says about its own colour: the camera's as-shot white
@@ -268,7 +286,10 @@ impl Colour {
             ColourMode::Camera => img.cam_to_srgb,
             ColourMode::SensorRgb => IDENTITY3,
         };
-        Self { wb: p.wb_gains.unwrap_or(img.as_shot_wb), matrix: mat3_mul(&p.mixer, &base) }
+        // Look strength: blend the mixer towards identity.
+        let s = p.mixer_strength;
+        let mixer = std::array::from_fn(|i| std::array::from_fn(|j| IDENTITY3[i][j] + s * (p.mixer[i][j] - IDENTITY3[i][j])));
+        Self { wb: p.wb_gains.unwrap_or(img.as_shot_wb), matrix: mat3_mul(&mixer, &base) }
     }
 }
 
@@ -303,7 +324,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 240 bytes.
+/// Total size 368 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -322,6 +343,9 @@ pub struct Uniforms {
     /// Hot-spot centre (uv) in `.xy`, image aspect (w/h) in `.z`, flat field
     /// on (1.0) / off in `.w`.
     pub optics: [f32; 4],
+    /// Per-colour bands `[hue, sat, lum, _]`; `hsl[0][3]` is 1.0 when any
+    /// band is non-zero, so the shader can skip the stage.
+    pub hsl: [[f32; 4]; 8],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -414,6 +438,11 @@ impl Uniforms {
                 view.texel[1] / view.texel[0],
                 if p.flat_field { 1.0 } else { 0.0 },
             ],
+            hsl: {
+                let mut h = p.hsl.map(|b| [b[0], b[1], b[2], 0.0]);
+                h[0][3] = if hsl_active(&p.hsl) { 1.0 } else { 0.0 };
+                h
+            },
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -511,7 +540,89 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
     for v in &mut c {
         *v = l + (*v - l) * s;
     }
+
+    // 6. Per-colour hue / saturation / luminance.
+    if hsl_active(&p.hsl) {
+        c = hsl_adjust(&p.hsl, c);
+    }
     c
+}
+
+/// The per-colour bands: name and centre hue in degrees. Spacing follows
+/// Lightroom's — tighter around the warm hues, where skin and foliage live.
+pub const HSL_BANDS: [(&str, f32); 8] = [
+    ("Red", 0.0),
+    ("Orange", 30.0),
+    ("Yellow", 60.0),
+    ("Green", 120.0),
+    ("Aqua", 180.0),
+    ("Blue", 240.0),
+    ("Purple", 270.0),
+    ("Magenta", 300.0),
+];
+/// Hue slider at ±1 rotates by this much (as a fraction of the circle: 30°).
+pub const HSL_HUE_MAX: f32 = 30.0 / 360.0;
+/// Luminance slider at ±1 is ±1 stop.
+pub const HSL_LUM_EV: f32 = 1.0;
+/// HSV saturation at which a colour gets the full adjustment; greyer colours
+/// get proportionally less, so neutrals are never touched.
+pub const HSL_FULL_SAT: f32 = 0.25;
+
+pub fn hsl_active(hsl: &[[f32; 3]; 8]) -> bool {
+    hsl.iter().flatten().any(|&v| v != 0.0)
+}
+
+/// The adjustment for a hue (0..1): linear interpolation between the two
+/// nearest band centres, so neighbouring bands blend with no seams.
+pub fn hsl_at(hsl: &[[f32; 3]; 8], h: f32) -> [f32; 3] {
+    let deg = h * 360.0;
+    let mut i = 7;
+    for k in 0..8 {
+        if deg >= HSL_BANDS[k].1 {
+            i = k;
+        }
+    }
+    let lo = HSL_BANDS[i].1;
+    let hi = if i == 7 { 360.0 } else { HSL_BANDS[i + 1].1 };
+    let t = (deg - lo) / (hi - lo);
+    let (a, b) = (hsl[i], hsl[(i + 1) % 8]);
+    std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t)
+}
+
+fn fract(x: f32) -> f32 {
+    x - x.floor()
+}
+
+/// Per-colour adjustment on linear RGB, via HSV: rotate hue, scale HSV
+/// saturation, then scale the whole pixel by a luminance gain. Mirrors
+/// `hsl_adjust` in the shader, branch for branch.
+pub fn hsl_adjust(hsl: &[[f32; 3]; 8], c: [f32; 3]) -> [f32; 3] {
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    let d = mx - mn;
+    if mx <= 1e-6 || d <= 1e-6 {
+        return c;
+    }
+    let h6 = if mx == c[0] {
+        (c[1] - c[2]) / d
+    } else if mx == c[1] {
+        (c[2] - c[0]) / d + 2.0
+    } else {
+        (c[0] - c[1]) / d + 4.0
+    };
+    let h = fract(h6 / 6.0);
+    let s = d / mx;
+    let w = (s / HSL_FULL_SAT).clamp(0.0, 1.0);
+    let [dh, ds, dl] = hsl_at(hsl, h).map(|v| v * w);
+    let h = fract(h + dh * HSL_HUE_MAX);
+    let s = s * (1.0 + ds);
+    // HSV → RGB, the branch-free form the shader uses too.
+    let ch = |n: f32| {
+        let k = (n + h * 6.0) % 6.0;
+        mx - mx * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    let gain = (dl * HSL_LUM_EV).exp2();
+    [ch(5.0) * gain, ch(3.0) * gain, ch(1.0) * gain]
 }
 
 /// Share of luminance the unclipped part of the clipping overlay keeps, so the
@@ -550,6 +661,8 @@ mod tests {
             wb_gains: Some([2.0, 1.0, 1.5]),
             colour_mode: ColourMode::SensorRgb,
             mixer: [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            mixer_strength: 0.5,
+            hsl: [[0.1, -0.2, 0.3]; 8],
             exposure_ev: 1.0,
             contrast: 0.2,
             temp: 0.1,
@@ -573,6 +686,77 @@ mod tests {
             hotspot_balance: [1.2, 1.0, 0.8],
             flat_field: true,
         }
+    }
+
+    fn hue_deg(c: [f32; 3]) -> f32 {
+        let mx = c[0].max(c[1]).max(c[2]);
+        let d = mx - c[0].min(c[1]).min(c[2]);
+        let h = if mx == c[0] { (c[1] - c[2]) / d } else if mx == c[1] { (c[2] - c[0]) / d + 2.0 } else { (c[0] - c[1]) / d + 4.0 };
+        (h * 60.0).rem_euclid(360.0)
+    }
+
+    fn band(name: &str) -> usize {
+        HSL_BANDS.iter().position(|(n, _)| *n == name).unwrap()
+    }
+
+    #[test]
+    fn hsl_bands_interpolate_between_centres() {
+        let mut hsl = [[0.0; 3]; 8];
+        hsl[band("Yellow")] = [1.0, 0.0, 0.0];
+        assert_eq!(hsl_at(&hsl, 60.0 / 360.0), [1.0, 0.0, 0.0]);
+        assert_eq!(hsl_at(&hsl, 90.0 / 360.0), [0.5, 0.0, 0.0], "halfway to green");
+        assert_eq!(hsl_at(&hsl, 200.0 / 360.0), [0.0, 0.0, 0.0]);
+        // Magenta wraps round to red.
+        let mut hsl = [[0.0; 3]; 8];
+        hsl[band("Red")] = [0.0, 1.0, 0.0];
+        assert!((hsl_at(&hsl, 330.0 / 360.0)[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hsl_leaves_greys_alone() {
+        let hsl = [[1.0, 1.0, 1.0]; 8];
+        assert_eq!(hsl_adjust(&hsl, GREY), GREY);
+    }
+
+    #[test]
+    fn hsl_desaturating_blue_spares_red() {
+        let mut hsl = [[0.0; 3]; 8];
+        hsl[band("Blue")] = [0.0, -1.0, 0.0];
+        let blue = hsl_adjust(&hsl, [0.1, 0.1, 0.6]);
+        assert!((blue[0] - blue[2]).abs() < 1e-5, "fully desaturated: {blue:?}");
+        let red = [0.6, 0.1, 0.1];
+        let out = hsl_adjust(&hsl, red);
+        assert!(out.iter().zip(red).all(|(o, i)| (o - i).abs() < 1e-6), "{out:?}");
+    }
+
+    #[test]
+    fn hsl_hue_shift_rotates_by_up_to_thirty_degrees() {
+        let mut hsl = [[0.0; 3]; 8];
+        hsl[band("Red")] = [1.0, 0.0, 0.0];
+        let out = hsl_adjust(&hsl, [0.8, 0.0, 0.0]);
+        assert!((hue_deg(out) - 30.0).abs() < 0.01, "{out:?} at {}", hue_deg(out));
+    }
+
+    #[test]
+    fn hsl_luminance_is_a_stop_per_unit() {
+        let mut hsl = [[0.0; 3]; 8];
+        hsl[band("Green")] = [0.0, 0.0, 1.0];
+        let out = hsl_adjust(&hsl, [0.1, 0.5, 0.1]);
+        for (o, i) in out.iter().zip([0.1, 0.5, 0.1]) {
+            assert!((o - 2.0 * i).abs() < 1e-5, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn mixer_strength_blends_towards_identity() {
+        let swap = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+        let at = |s: f32| {
+            let p = AdjustParams { colour_mode: ColourMode::SensorRgb, mixer: swap, mixer_strength: s, ..Default::default() };
+            Colour::resolve(&ImageColour::LINEAR_SRGB, &p).matrix
+        };
+        assert_eq!(at(0.0), IDENTITY3);
+        assert_eq!(at(1.0), swap);
+        assert_eq!(at(0.5)[0], [0.5, 0.0, 0.5]);
     }
 
     #[test]
@@ -644,8 +828,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_240_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 240);
+    fn uniforms_layout_is_368_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 368);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -659,6 +843,7 @@ mod tests {
             &u.gain as *const _ as usize,
             &u.hotspot as *const _ as usize,
             &u.optics as *const _ as usize,
+            &u.hsl as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
         }

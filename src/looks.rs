@@ -58,6 +58,9 @@ pub struct Look {
     pub mixer: [[f32; 3]; 3],
     /// `None` leaves the photo's saturation as it is.
     pub saturation: Option<f32>,
+    /// Per-colour adjustments; `None` leaves the photo's alone.
+    #[serde(default)]
+    pub hsl: Option<[[f32; 3]; 8]>,
     /// What the look is for (filter, what it does), shown as a tooltip.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
@@ -65,7 +68,15 @@ pub struct Look {
 
 impl Look {
     fn builtin(name: &str, mixer: [[f32; 3]; 3], mode: Option<ColourMode>) -> Self {
-        Self { name: name.into(), colour_mode: mode, wb: LookWb::Keep, mixer, saturation: None, note: String::new() }
+        Self {
+            name: name.into(),
+            colour_mode: mode,
+            wb: LookWb::Keep,
+            mixer,
+            saturation: None,
+            hsl: None,
+            note: String::new(),
+        }
     }
 
     fn wb(mut self, gains: [f32; 3]) -> Self {
@@ -78,8 +89,9 @@ impl Look {
         self
     }
 
-    /// Capture the current colour settings of `p` as a look. Exposure, tone
-    /// and detail are per photo and deliberately left out.
+    /// Capture the current colour settings of `p` as a look — white balance,
+    /// colour mode, mixer, saturation and the per-colour panel. Exposure, tone,
+    /// detail and look strength are per photo and deliberately left out.
     pub fn from_params(name: &str, p: &AdjustParams) -> Self {
         Self {
             name: name.trim().into(),
@@ -87,6 +99,7 @@ impl Look {
             wb: p.wb_gains.map_or(LookWb::AsShot, LookWb::Gains),
             mixer: p.mixer,
             saturation: Some(p.saturation),
+            hsl: Some(p.hsl),
             note: String::new(),
         }
     }
@@ -103,6 +116,9 @@ impl Look {
         }
         if let Some(s) = self.saturation {
             p.saturation = s;
+        }
+        if let Some(h) = self.hsl {
+            p.hsl = h;
         }
     }
 
@@ -314,6 +330,7 @@ mod tests {
             colour_mode: ColourMode::SensorRgb,
             mixer: [[0.0, 0.2, 0.8], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             saturation: 0.25,
+            hsl: [[0.2, -0.1, 0.3]; 8],
             exposure_ev: 1.5,
             ..Default::default()
         };
@@ -328,8 +345,19 @@ mod tests {
         assert_eq!(dst.colour_mode, src.colour_mode);
         assert_eq!(dst.mixer, src.mixer);
         assert_eq!(dst.saturation, src.saturation);
+        assert_eq!(dst.hsl, src.hsl);
         assert_eq!(dst.exposure_ev, -0.5, "exposure is per photo, not part of a look");
         assert!(look.is_applied(&dst));
+    }
+
+    #[test]
+    fn saved_looks_from_before_hsl_still_load() {
+        let json = r#"{"name":"Old","colour_mode":"sensor_rgb","wb":"keep","mixer":[[1,0,0],[0,1,0],[0,0,1]],"saturation":0.1}"#;
+        let look: Look = serde_json::from_str(json).unwrap();
+        assert_eq!(look.hsl, None);
+        let mut p = AdjustParams { hsl: [[0.5; 3]; 8], ..Default::default() };
+        look.apply(&mut p);
+        assert_eq!(p.hsl, [[0.5; 3]; 8], "a look without HSL leaves the photo's alone");
     }
 
     #[test]

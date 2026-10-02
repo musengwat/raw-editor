@@ -432,6 +432,28 @@ fn parity_channel_mixer_looks() {
     );
 }
 
+// --- IR-6: per-colour HSL and look strength --------------------------------
+
+/// Every band moved, each differently, on top of saturation and a half-strength
+/// mixer — the hue interpolation, the HSV round trip and the luminance gain all
+/// have to agree with the CPU mirror.
+#[test]
+fn parity_hsl_and_look_strength() {
+    let hsl = std::array::from_fn(|i| {
+        let f = i as f32 / 7.0;
+        [1.0 - 2.0 * f, 0.8 * f - 0.4, 0.6 - f]
+    });
+    let p = AdjustParams {
+        hsl,
+        saturation: 0.3,
+        colour_mode: ColourMode::SensorRgb,
+        mixer: [[0.0, -1.5, 2.5], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        mixer_strength: 0.5,
+        ..Default::default()
+    };
+    assert_image_parity(&camera_source(), p);
+}
+
 // --- IR-4: hot spot and flat field --------------------------------------
 
 /// A flat field with real structure: brighter gain towards one corner and a

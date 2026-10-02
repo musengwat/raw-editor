@@ -118,6 +118,8 @@ mod tests {
             wb_gains: Some([0.64, 1.0, 2.35]),
             colour_mode: crate::pipeline::ColourMode::SensorRgb,
             mixer: [[0.0, 0.1, 0.9], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            mixer_strength: 0.7,
+            hsl: std::array::from_fn(|i| [0.1 * i as f32 - 0.3, -0.2, 0.05 * i as f32]),
             exposure_ev: 1.25,
             contrast: -0.4,
             temp: 0.3,

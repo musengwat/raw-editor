@@ -14,7 +14,7 @@ use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{
-    AdjustParams, ColourMode, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN,
+    AdjustParams, ColourMode, HSL_BANDS, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN,
 };
 use raw_editor::config::Config;
 use raw_editor::history::History;
@@ -143,6 +143,8 @@ struct App {
 
     config: Config,
     show_settings: bool,
+    /// Which property the per-colour panel shows: 0 hue, 1 saturation, 2 luminance.
+    hsl_tab: usize,
     /// Result of the last "Test connection", shown in the settings dialog.
     ping_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
     ping_status: String,
@@ -194,6 +196,7 @@ impl App {
                 Config::default()
             }),
             show_settings: false,
+            hsl_tab: 0,
             ping_rx: None,
             ping_status: String::new(),
         };
@@ -670,6 +673,7 @@ impl App {
         let lens = self.camera.lens.clone();
         let has_flat = lens.as_ref().is_some_and(|l| self.config.flat_fields.contains_key(l));
         let mut optics_action: Option<OpticsAction> = None;
+        let hsl_tab = &mut self.hsl_tab;
         let p = &mut self.params;
         let d = AdjustParams::default();
         let mut reset_section: Option<Section> = None;
@@ -737,6 +741,12 @@ impl App {
                         }
                     }
                 });
+            ui.add_enabled_ui(p.mixer != IDENTITY3, |ui| {
+                resettable(ui, &mut p.mixer_strength, d.mixer_strength, |ui, v| {
+                    ui.add(egui::Slider::new(v, 0.0..=1.5).text("Look strength"))
+                        .on_hover_text("Blend the look's channel mix with the plain image; past 1 exaggerates it")
+                });
+            });
             if let Some(note) = builtin_looks
                 .iter()
                 .find(|l| Some(&l.name) == current.as_ref() && !current_saved)
@@ -819,6 +829,23 @@ impl App {
             resettable(ui, &mut p.temp, d.temp, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Temp")));
             resettable(ui, &mut p.tint, d.tint, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Tint")));
             resettable(ui, &mut p.saturation, d.saturation, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Saturation")));
+
+            ui.add_space(10.0);
+            header(ui, "Per colour", Section::Hsl, p);
+            ui.horizontal(|ui| {
+                for (i, name) in ["Hue", "Saturation", "Luminance"].iter().enumerate() {
+                    ui.selectable_value(hsl_tab, i, *name);
+                }
+            });
+            for (b, (name, centre)) in HSL_BANDS.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let swatch = egui::ecolor::Hsva::new(centre / 360.0, 0.8, 0.9, 1.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from(swatch));
+                    let t = *hsl_tab;
+                    resettable(ui, &mut p.hsl[b][t], d.hsl[b][t], |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text(*name)));
+                });
+            }
 
             ui.add_space(10.0);
             header(ui, "Tonal range", Section::Tonal, p);

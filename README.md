@@ -78,6 +78,8 @@ Infrared (the GF1 is now a full-spectrum conversion):
   *Full spectrum* (no filter: natural, vivid, IR mono) and *#16 orange*
   (Aerochrome, gold & blue, IR mono). The IR Chrome looks stay as derived,
   untested starting points. See **Looks** below
+- [x] IR-6 — per-colour hue / saturation / luminance (8 bands) and a look
+  strength slider
 - [x] IR-4 — hot-spot correction: a radial model (amount, radius, centre,
   per-channel colour) plus a per-lens flat field made from one evenly lit,
   defocused frame (*Optics → Make from this photo*). A lens with a flat field
@@ -154,6 +156,19 @@ It is a viewing aid only and never reaches an export.
 
 **Basic**: exposure (EV), contrast (power curve about a 0.18 pivot), temp/tint
 (opposing channel gains), saturation (luma-preserving).
+
+**Per colour**: hue, saturation and luminance for eight colour bands (red,
+orange, yellow, green, aqua, blue, purple, magenta), switched with the
+Hue / Saturation / Luminance tabs. Hue moves a band up to 30° round the
+wheel, luminance up to a stop either way. Neighbouring bands blend smoothly
+and greys are never touched (the effect fades in up to 25% HSV saturation).
+This is where an IR look gets finished — push a teal sky to blue, warm the
+foliage. It runs after saturation, in the shader and the CPU mirror alike.
+
+**Look strength** (under the Look menu) blends the look's channel mix with
+the plain image: 0 = no mix, 1 = the look, up to 1.5 to exaggerate. *Save
+look* stores white balance, colour mode, mixer, saturation and the per-colour
+settings.
 
 **Tonal range**: highlights, shadows, whites, blacks. Each drives a smooth
 `smoothstep` mask over an approximate *display-domain* luminance

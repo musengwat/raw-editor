@@ -12,6 +12,7 @@ struct Uniforms {
     gain: vec4<f32>,       // .rgb = per-channel gain  (neutral 1)
     hotspot: vec4<f32>,    // .rgb = hot-spot strength per channel, .a = radius
     optics: vec4<f32>,     // .xy = hot-spot centre (uv), .z = aspect w/h, .w = flat field on
+    hsl: array<vec4<f32>, 8>, // per-colour [hue, sat, lum, _]; hsl[0].w = 1 when active
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -173,6 +174,54 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
     return max(out_chroma + nr_l + u.sharpen_amount * d, vec3(0.0));
 }
 
+// --- Per-colour adjustments — mirrors src/pipeline.rs::hsl_adjust ---------
+
+// Band centres in degrees; must match pipeline::HSL_BANDS.
+const HSL_CENTRES = array<f32, 8>(0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0);
+const HSL_HUE_MAX: f32 = 0.083333336; // 30 / 360
+const HSL_LUM_EV: f32 = 1.0;
+const HSL_FULL_SAT: f32 = 0.25;
+
+fn hsl_at(h: f32) -> vec3<f32> {
+    let deg = h * 360.0;
+    var i = 7u;
+    for (var k = 0u; k < 8u; k++) {
+        if deg >= HSL_CENTRES[k] {
+            i = k;
+        }
+    }
+    let lo = HSL_CENTRES[i];
+    let hi = select(HSL_CENTRES[min(i + 1u, 7u)], 360.0, i == 7u);
+    let t = (deg - lo) / (hi - lo);
+    return mix(u.hsl[i].xyz, u.hsl[(i + 1u) % 8u].xyz, t);
+}
+
+fn hsl_adjust(c: vec3<f32>) -> vec3<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let d = mx - mn;
+    if mx <= 1e-6 || d <= 1e-6 {
+        return c;
+    }
+    var h6: f32;
+    if mx == c.r {
+        h6 = (c.g - c.b) / d;
+    } else if mx == c.g {
+        h6 = (c.b - c.r) / d + 2.0;
+    } else {
+        h6 = (c.r - c.g) / d + 4.0;
+    }
+    var h = fract(h6 / 6.0);
+    var s = d / mx;
+    let w = clamp(s / HSL_FULL_SAT, 0.0, 1.0);
+    let adj = hsl_at(h) * w;
+    h = fract(h + adj.x * HSL_HUE_MAX);
+    s = s * (1.0 + adj.y);
+    let k = (vec3(5.0, 3.0, 1.0) + h * 6.0) % vec3(6.0);
+    let rgb = mx - mx * s * clamp(min(k, vec3(4.0) - k), vec3(0.0), vec3(1.0));
+    return rgb * exp2(adj.z * HSL_LUM_EV);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var c = to_working(textureSample(tex, samp, in.uv), in.uv);
@@ -209,6 +258,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 5. Luma-preserving saturation.
     let luma = dot(c, LUMA_709);
     c = luma + (c - luma) * (1.0 + u.saturation);
+
+    // 6. Per-colour hue / saturation / luminance.
+    if u.hsl[0].w > 0.5 {
+        c = hsl_adjust(c);
+    }
 
     // Clipping overlay — mirrored in src/pipeline.rs::clip_view.
     if u.show_clip > 0.5 {
