@@ -300,3 +300,16 @@ need 16-byte strides, so vec4) and `hsl[0].w` is the "active" flag the shader
 early-outs on; Uniforms is now 368 bytes. `parity_hsl_and_look_strength`
 covers both. `mixer_strength` is folded into the matrix in `Colour::resolve`
 (lerp towards identity), so the shader has no code for it.
+
+## Fit-to-window preview: mipmaps
+
+The image texture carries a full mip chain (`gpu::mip_chain`, 2x2 box
+averages built on the CPU at load) and the sampler is trilinear. `fs_main`'s
+`textureSample` picks the level from screen derivatives, so the fit view shows
+averaged pixels; exports and the GPU parity tests render at 1:1 and stay on
+level 0, and `detail()` samples level 0 explicitly. Without the chain the fit
+view point-sampled one source pixel per screen pixel and showed
+full-resolution noise at a quarter of the size — IR looks that subtract
+channels looked far worse on screen than in their exports.
+`downscaled_view_averages_instead_of_point_sampling` fails (38 levels off)
+if the chain is dropped.

@@ -48,10 +48,23 @@ fn render_image_with(
     params: &AdjustParams,
     show_clip: bool,
 ) -> Vec<[u8; 4]> {
-    let (w, h) = (img.width, img.height);
+    render_image_sized(device, queue, img, params, show_clip, img.width, img.height)
+}
+
+/// Render into a `w`x`h` target. Smaller than the image = the fit-to-window
+/// case, where the GPU picks a mip level.
+fn render_image_sized(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DevelopedImage,
+    params: &AdjustParams,
+    show_clip: bool,
+    w: usize,
+    h: usize,
+) -> Vec<[u8; 4]> {
     let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_image(device, queue, img);
-    let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
+    let view = View::one_to_one([1.0 / img.width as f32, 1.0 / img.height as f32]);
     let mut uniforms = Uniforms::new(params, &img.colour, view, false);
     uniforms.show_clip = if show_clip { 1.0 } else { 0.0 };
     renderer.write_uniforms(queue, &uniforms);
@@ -430,6 +443,34 @@ fn parity_channel_mixer_looks() {
         &camera_source(),
         AdjustParams { mixer: [[1.2, -0.4, 0.3], [0.1, 0.6, 0.2], [-0.2, 0.5, 0.9]], ..Default::default() },
     );
+}
+
+// --- Fit-to-window preview -------------------------------------------------
+
+/// Noise rendered at 1/8 size must come out as the 8x8 block averages (mip
+/// level 3), not as one picked source pixel per output pixel — the bug that
+/// made the fit view look far noisier than the photo.
+#[test]
+fn downscaled_view_averages_instead_of_point_sampling() {
+    let Some(gpu) = common::gpu() else { return };
+    let (sw, sh, k) = (64usize, 64usize, 8usize);
+    let mut seed = 12345u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        0.05 + 0.5 * (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let data: Vec<f32> = (0..sw * sh).flat_map(|_| { let v = rnd(); [v, v, v] }).collect();
+    let img = DevelopedImage::linear_srgb(sw, sh, data.clone());
+    let out = render_image_sized(&gpu.device, &gpu.queue, &img, &AdjustParams::default(), false, sw / k, sh / k);
+    let mut worst = 0i32;
+    for by in 0..sh / k {
+        for bx in 0..sw / k {
+            let mean: f32 = (0..k * k).map(|i| data[((by * k + i / k) * sw + bx * k + i % k) * 3]).sum::<f32>() / (k * k) as f32;
+            let want = (srgb_encode(mean) * 255.0).round() as i32;
+            worst = worst.max((out[by * (sw / k) + bx][0] as i32 - want).abs());
+        }
+    }
+    assert!(worst <= 2, "downscaled output is {worst} levels off the block average");
 }
 
 // --- IR-6: per-colour HSL and look strength --------------------------------

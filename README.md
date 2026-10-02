@@ -195,6 +195,10 @@ because at zero it happily amplifies grain along with detail. On a real ISO 800
 frame, NR at 0.9 cuts pixel-to-pixel gradient by 56% while leaving local
 contrast alone.
 
+The fit-to-window view is drawn from averaged (mipmapped) copies of the image,
+so it shows the noise level the photo really has at that size rather than
+picking one source pixel per screen pixel.
+
 These act on *source* pixels, so they are invisible in a fit-to-window view of a
 16MP image — that view has already thrown away the frequencies they work on.
 Press **Z** (or use the *View* menu) for a 1:1 view and drag to pan; that is the
