@@ -249,3 +249,17 @@ edge clamping included.
   has to exist already). Compression is Deflate + horizontal predictor and must
   stay lossless — `compressed_tiff_round_trips_exactly` asserts sample-exact
   equality, so do not swap in anything lossy.
+
+## Reset controls
+
+`widgets::resettable` wraps one control with a ↺ button (space always
+reserved via `add_visible`, so rows don't shift) and double-click-to-reset.
+egui sliders sense **drag only** — their `Response` never reports clicks — so
+the double-click is read off `ui.input` pointer state against the slider's
+rect; and a right-click menu is deliberately absent because any button drags a
+slider. Sections are `pipeline::Section`; `AdjustParams::reset_section` is the
+single list of which field belongs where, and `resetting_every_section_resets_everything`
+fails when a new param is added without assigning it to a section. Widget
+tests drive a headless `egui::Context` with synthetic pointer events (advance
+`RawInput.time` per frame, one event per frame for double-clicks, and
+`textures_delta.clear()` or the drop asserts).

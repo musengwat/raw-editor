@@ -160,6 +160,56 @@ impl<'a> ColorWheel<'a> {
     }
 }
 
+const RESET_GLYPH: &str = "↺";
+
+/// Wrap one control with a way back to `default`: a ↺ button beside it that
+/// shows once the value has moved (its space is always reserved, so nothing
+/// shifts), or double-click the control itself.
+/// `add` draws the control against the value, e.g. a `Slider`.
+pub fn resettable<T: PartialEq + Copy + std::fmt::Debug>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    default: T,
+    add: impl FnOnce(&mut egui::Ui, &mut T) -> egui::Response,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let mut response = add(ui, value);
+        let changed = *value != default;
+        let button = ui
+            .add_visible(changed, egui::Button::new(RESET_GLYPH).small().frame(false))
+            .on_hover_text(format!("Reset to {default:?}"));
+        // Sliders only sense drags, so their response never reports a
+        // double-click; read it off the pointer instead.
+        let double_clicked = ui.input(|i| {
+            i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                && i.pointer.interact_pos().is_some_and(|p| response.rect.contains(p))
+        });
+        // No right-click menu: egui sliders drag with any button, so a
+        // right-click would move the value before the menu opened.
+        if button.clicked() || (changed && double_clicked) {
+            *value = default;
+            response.mark_changed();
+        }
+        response
+    })
+    .inner
+}
+
+/// A bold section heading with a Reset button on the right, enabled while
+/// anything in the section differs from neutral. Returns true when clicked.
+pub fn section_header(ui: &mut egui::Ui, title: &str, changed: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled(changed, egui::Button::new("Reset").small())
+                .on_hover_text(format!("Reset everything under {title}"))
+                .clicked()
+        })
+        .inner
+    })
+    .inner
+}
+
 /// Overlaid RGB histogram plus a per-channel clipped-percentage line.
 pub fn histogram(ui: &mut egui::Ui, h: &crate::histogram::Histogram) {
     use crate::histogram::BINS;
@@ -206,6 +256,75 @@ pub fn histogram(ui: &mut egui::Ui, h: &crate::histogram::Histogram) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run frames of a one-slider UI, feeding `events` into the last one.
+    /// Returns the slider's response from the final frame.
+    fn run_slider(
+        ctx: &egui::Context,
+        value: &mut f32,
+        events: Vec<egui::Event>,
+    ) -> egui::Response {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0))),
+            // Advance the clock so double-click timing works.
+            time: Some(ctx.input(|i| i.time) + 0.05),
+            events,
+            ..Default::default()
+        };
+        let mut out = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            out = Some(resettable(ui, value, 0.0, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0))));
+        });
+        // No renderer here; drop the font atlas upload instead of applying it.
+        output.textures_delta.clear();
+        out.unwrap()
+    }
+
+    fn click(at: Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    #[test]
+    fn reset_button_restores_the_default() {
+        let ctx = egui::Context::default();
+        let mut v = 0.5;
+        let slider = run_slider(&ctx, &mut v, vec![]);
+        // The ↺ sits just right of the slider in the same row.
+        let at = Pos2::new(slider.rect.right() + 10.0, slider.rect.center().y);
+        run_slider(&ctx, &mut v, click(at));
+        assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn untouched_value_has_no_visible_reset() {
+        let ctx = egui::Context::default();
+        let mut v = 0.0;
+        let slider = run_slider(&ctx, &mut v, vec![]);
+        let at = Pos2::new(slider.rect.right() + 10.0, slider.rect.center().y);
+        run_slider(&ctx, &mut v, click(at));
+        assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn double_click_on_the_slider_resets_it() {
+        let ctx = egui::Context::default();
+        let mut v = 0.5;
+        let slider = run_slider(&ctx, &mut v, vec![]);
+        // Off-centre on the rail: a single click would *set* the value there.
+        let at = Pos2::new(slider.rect.left() + 20.0, slider.rect.center().y);
+        // One event per frame, as a real pointer delivers them.
+        let [mv, down, up] = <[egui::Event; 3]>::try_from(click(at)).unwrap();
+        for e in [mv, down.clone(), up.clone(), down, up] {
+            run_slider(&ctx, &mut v, vec![e]);
+        }
+        assert_eq!(v, 0.0);
+    }
 
     #[test]
     fn knob_chroma_roundtrip() {

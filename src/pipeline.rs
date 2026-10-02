@@ -162,6 +162,73 @@ impl AdjustParams {
     pub fn is_neutral(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Put one panel section's controls back to neutral, leaving the rest.
+    pub fn reset_section(&mut self, section: Section) {
+        let d = Self::default();
+        match section {
+            Section::Colour => {
+                self.wb_gains = d.wb_gains;
+                self.colour_mode = d.colour_mode;
+                self.mixer = d.mixer;
+            }
+            Section::Basic => {
+                self.exposure_ev = d.exposure_ev;
+                self.contrast = d.contrast;
+                self.temp = d.temp;
+                self.tint = d.tint;
+                self.saturation = d.saturation;
+            }
+            Section::Tonal => {
+                self.highlights = d.highlights;
+                self.shadows = d.shadows;
+                self.whites = d.whites;
+                self.blacks = d.blacks;
+            }
+            Section::Wheels => {
+                self.lift = d.lift;
+                self.gamma = d.gamma;
+                self.gain = d.gain;
+            }
+            Section::Detail => {
+                self.nr_luma = d.nr_luma;
+                self.nr_chroma = d.nr_chroma;
+                self.sharpen_amount = d.sharpen_amount;
+                self.sharpen_radius = d.sharpen_radius;
+                self.sharpen_threshold = d.sharpen_threshold;
+            }
+            Section::Optics => {
+                self.hotspot_amount = d.hotspot_amount;
+                self.hotspot_radius = d.hotspot_radius;
+                self.hotspot_centre = d.hotspot_centre;
+                self.hotspot_balance = d.hotspot_balance;
+                self.flat_field = d.flat_field;
+            }
+        }
+    }
+
+    /// True when every control in `section` sits at its neutral value.
+    pub fn section_is_neutral(&self, section: Section) -> bool {
+        let mut reset = *self;
+        reset.reset_section(section);
+        reset == *self
+    }
+}
+
+/// The groups of controls in the side panel, each with its own Reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Colour,
+    Basic,
+    Tonal,
+    Wheels,
+    Detail,
+    Optics,
+}
+
+impl Section {
+    pub const ALL: [Section; 6] =
+        [Section::Colour, Section::Basic, Section::Tonal, Section::Wheels, Section::Detail, Section::Optics];
 }
 
 /// What the raw file says about its own colour: the camera's as-shot white
@@ -476,6 +543,62 @@ mod tests {
     use super::*;
 
     const GREY: [f32; 3] = [0.18, 0.18, 0.18];
+
+    /// Every control moved off neutral.
+    fn all_moved() -> AdjustParams {
+        AdjustParams {
+            wb_gains: Some([2.0, 1.0, 1.5]),
+            colour_mode: ColourMode::SensorRgb,
+            mixer: [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            exposure_ev: 1.0,
+            contrast: 0.2,
+            temp: 0.1,
+            tint: -0.1,
+            saturation: 0.3,
+            highlights: -0.4,
+            shadows: 0.4,
+            whites: 0.1,
+            blacks: -0.1,
+            lift: [0.1; 3],
+            gamma: [1.1; 3],
+            gain: [0.9; 3],
+            sharpen_amount: 1.0,
+            sharpen_radius: 2.0,
+            sharpen_threshold: 0.01,
+            nr_luma: 0.5,
+            nr_chroma: 0.5,
+            hotspot_amount: 0.5,
+            hotspot_radius: 0.6,
+            hotspot_centre: [0.4, 0.6],
+            hotspot_balance: [1.2, 1.0, 0.8],
+            flat_field: true,
+        }
+    }
+
+    #[test]
+    fn resetting_every_section_resets_everything() {
+        // Catches a new param that was never assigned to a section, and so
+        // would survive every per-section Reset.
+        let mut p = all_moved();
+        for s in Section::ALL {
+            assert!(!p.section_is_neutral(s), "{s:?} should start moved");
+            p.reset_section(s);
+            assert!(p.section_is_neutral(s));
+        }
+        assert!(p.is_neutral());
+    }
+
+    #[test]
+    fn resetting_a_section_leaves_the_others_alone() {
+        let moved = all_moved();
+        for s in Section::ALL {
+            let mut p = moved;
+            p.reset_section(s);
+            for other in Section::ALL.into_iter().filter(|&o| o != s) {
+                assert!(!p.section_is_neutral(other), "resetting {s:?} touched {other:?}");
+            }
+        }
+    }
 
     #[test]
     fn identity_params_pass_through() {

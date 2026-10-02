@@ -86,6 +86,13 @@ trap in the MHC paper's figure, are worked out in
 
 ## Controls
 
+**Resetting**: every slider gets a small ↺ beside it once it has moved off
+neutral; click it, or double-click the slider, to put that one control back.
+Each section heading (Colour, Basic, Tonal range, Lift / Gamma / Gain, Detail,
+Optics) has its own *Reset*, enabled while anything under it has changed, and
+*Reset all* at the bottom (also *Edit → Reset adjustments*) clears everything.
+All of them reset to neutral, not to the photo's camera look.
+
 **Colour**: white balance and how camera RGB becomes working RGB — built for
 the infrared-converted GF1, useful on any file.
 *Pick neutral* (or **W**) arms an eyedropper: click something that should be
@@ -148,7 +155,7 @@ where to write — every export goes through a save dialog, which also means the
 system asks before overwriting anything. *File → Batch export folder…* takes a
 folder of raws and a destination and exports every one of them using its own
 sidecar, counting progress in the status bar; a file that fails is reported and
-the rest carry on. *Edit → Reset adjustments* mirrors the Reset button.
+the rest carry on. *Edit → Reset adjustments* mirrors the Reset all button.
 Drag-and-drop still works.
 
 **Compare**: hold `B` to render the same frame with neutral params — the

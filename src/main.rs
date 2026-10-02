@@ -13,13 +13,15 @@ use eframe::egui;
 use raw_editor::develop::{DevelopedImage, develop};
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
-use raw_editor::pipeline::{AdjustParams, ColourMode, IDENTITY3, ImageColour, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN};
+use raw_editor::pipeline::{
+    AdjustParams, ColourMode, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX, WB_GAIN_MIN,
+};
 use raw_editor::config::Config;
 use raw_editor::immich;
 use raw_editor::looks::Look;
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
-use raw_editor::widgets::ColorWheel;
+use raw_editor::widgets::{ColorWheel, resettable, section_header};
 
 /// Hold this key to bypass every adjustment and see the original.
 const COMPARE_KEY: egui::Key = egui::Key::B;
@@ -631,9 +633,16 @@ impl App {
         let has_flat = lens.as_ref().is_some_and(|l| self.config.flat_fields.contains_key(l));
         let mut optics_action: Option<OpticsAction> = None;
         let p = &mut self.params;
+        let d = AdjustParams::default();
+        let mut reset_section: Option<Section> = None;
+        let mut header = |ui: &mut egui::Ui, title: &str, section: Section, p: &AdjustParams| {
+            if section_header(ui, title, !p.section_is_neutral(section)) {
+                reset_section = Some(section);
+            }
+        };
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(egui::RichText::new("Colour").strong());
+            header(ui, "Colour", Section::Colour, p);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut p.colour_mode, ColourMode::Camera, "Camera")
                     .on_hover_text("The camera's colour matrix — right for visible light");
@@ -756,22 +765,22 @@ impl App {
             });
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Basic").strong());
-            ui.add(egui::Slider::new(&mut p.exposure_ev, -5.0..=5.0).text("Exposure (EV)"));
-            ui.add(egui::Slider::new(&mut p.contrast, -1.0..=1.0).text("Contrast"));
-            ui.add(egui::Slider::new(&mut p.temp, -1.0..=1.0).text("Temp"));
-            ui.add(egui::Slider::new(&mut p.tint, -1.0..=1.0).text("Tint"));
-            ui.add(egui::Slider::new(&mut p.saturation, -1.0..=1.0).text("Saturation"));
+            header(ui, "Basic", Section::Basic, p);
+            resettable(ui, &mut p.exposure_ev, d.exposure_ev, |ui, v| ui.add(egui::Slider::new(v, -5.0..=5.0).text("Exposure (EV)")));
+            resettable(ui, &mut p.contrast, d.contrast, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Contrast")));
+            resettable(ui, &mut p.temp, d.temp, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Temp")));
+            resettable(ui, &mut p.tint, d.tint, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Tint")));
+            resettable(ui, &mut p.saturation, d.saturation, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Saturation")));
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Tonal range").strong());
-            ui.add(egui::Slider::new(&mut p.highlights, -1.0..=1.0).text("Highlights"));
-            ui.add(egui::Slider::new(&mut p.shadows, -1.0..=1.0).text("Shadows"));
-            ui.add(egui::Slider::new(&mut p.whites, -1.0..=1.0).text("Whites"));
-            ui.add(egui::Slider::new(&mut p.blacks, -1.0..=1.0).text("Blacks"));
+            header(ui, "Tonal range", Section::Tonal, p);
+            resettable(ui, &mut p.highlights, d.highlights, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Highlights")));
+            resettable(ui, &mut p.shadows, d.shadows, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Shadows")));
+            resettable(ui, &mut p.whites, d.whites, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Whites")));
+            resettable(ui, &mut p.blacks, d.blacks, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Blacks")));
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Lift / Gamma / Gain").strong());
+            header(ui, "Lift / Gamma / Gain", Section::Wheels, p);
             ui.horizontal(|ui| {
                 ColorWheel::new("Lift", &mut p.lift, 0.0, 0.5).show(ui);
                 ColorWheel::new("Gamma", &mut p.gamma, 1.0, 0.5).show(ui);
@@ -779,18 +788,14 @@ impl App {
             });
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Detail").strong());
-            ui.add(egui::Slider::new(&mut p.nr_luma, 0.0..=1.0).text("NR luminance"));
-            ui.add(egui::Slider::new(&mut p.nr_chroma, 0.0..=1.0).text("NR colour"));
-            ui.add(egui::Slider::new(&mut p.sharpen_amount, 0.0..=3.0).text("Sharpen"));
-            ui.add(
-                egui::Slider::new(&mut p.sharpen_radius, 0.3..=3.0).text("Radius"),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.sharpen_threshold, 0.0..=0.05)
-                    .text("Threshold")
-                    .fixed_decimals(3),
-            );
+            header(ui, "Detail", Section::Detail, p);
+            resettable(ui, &mut p.nr_luma, d.nr_luma, |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).text("NR luminance")));
+            resettable(ui, &mut p.nr_chroma, d.nr_chroma, |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).text("NR colour")));
+            resettable(ui, &mut p.sharpen_amount, d.sharpen_amount, |ui, v| ui.add(egui::Slider::new(v, 0.0..=3.0).text("Sharpen")));
+            resettable(ui, &mut p.sharpen_radius, d.sharpen_radius, |ui, v| ui.add(egui::Slider::new(v, 0.3..=3.0).text("Radius")));
+            resettable(ui, &mut p.sharpen_threshold, d.sharpen_threshold, |ui, v| {
+                ui.add(egui::Slider::new(v, 0.0..=0.05).text("Threshold").fixed_decimals(3))
+            });
             ui.label(
                 egui::RichText::new("Detail acts on source pixels — judge it at 1:1")
                     .weak()
@@ -798,16 +803,18 @@ impl App {
             );
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Optics").strong());
-            ui.add(egui::Slider::new(&mut p.hotspot_amount, 0.0..=2.0).text("Hot spot"))
+            header(ui, "Optics", Section::Optics, p);
+            resettable(ui, &mut p.hotspot_amount, d.hotspot_amount, |ui, v| ui.add(egui::Slider::new(v, 0.0..=2.0).text("Hot spot")))
                 .on_hover_text("How much brighter the lens's central hot spot is than its surroundings; 0 = off");
             ui.add_enabled_ui(p.hotspot_amount > 0.0, |ui| {
-                ui.add(egui::Slider::new(&mut p.hotspot_radius, 0.05..=1.0).text("Spot radius"));
-                ui.add(egui::Slider::new(&mut p.hotspot_centre[0], 0.0..=1.0).text("Spot X"));
-                ui.add(egui::Slider::new(&mut p.hotspot_centre[1], 0.0..=1.0).text("Spot Y"));
+                resettable(ui, &mut p.hotspot_radius, d.hotspot_radius, |ui, v| ui.add(egui::Slider::new(v, 0.05..=1.0).text("Spot radius")));
+                resettable(ui, &mut p.hotspot_centre[0], d.hotspot_centre[0], |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).text("Spot X")));
+                resettable(ui, &mut p.hotspot_centre[1], d.hotspot_centre[1], |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).text("Spot Y")));
                 egui::CollapsingHeader::new("Spot colour").show(ui, |ui| {
                     for (i, name) in ["Red", "Green", "Blue"].iter().enumerate() {
-                        ui.add(egui::Slider::new(&mut p.hotspot_balance[i], 0.0..=2.0).text(*name));
+                        resettable(ui, &mut p.hotspot_balance[i], d.hotspot_balance[i], |ui, v| {
+                            ui.add(egui::Slider::new(v, 0.0..=2.0).text(*name))
+                        });
                     }
                 });
             });
@@ -839,7 +846,10 @@ impl App {
             }
 
             ui.add_space(12.0);
-            reset = ui.button("Reset").clicked();
+            reset = ui
+                .add_enabled(!p.is_neutral(), egui::Button::new("Reset all"))
+                .on_hover_text("Each slider also has its own ↺, or double-click a slider to reset it")
+                .clicked();
             ui.label(
                 egui::RichText::new(format!("Hold {} to compare with the original", COMPARE_KEY.name()))
                     .weak()
@@ -878,6 +888,8 @@ impl App {
 
         if reset {
             self.params = AdjustParams::default();
+        } else if let Some(section) = reset_section {
+            self.params.reset_section(section);
         }
         if let Some(action) = look_action {
             self.apply_look_action(action);
