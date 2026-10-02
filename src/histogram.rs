@@ -43,6 +43,35 @@ pub fn downsample(img: &DevelopedImage, long_side: usize) -> DevelopedImage {
     DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone() }
 }
 
+/// Box-averaged copy whose long side is at most `long_side` — for pictures
+/// (look thumbnails), where point sampling would show full-resolution noise.
+/// The clip mask is averaged too, which is what the GPU's filtering does.
+pub fn box_downsample(img: &DevelopedImage, long_side: usize) -> DevelopedImage {
+    let step = img.width.max(img.height).div_ceil(long_side).max(1);
+    let (w, h) = (img.width / step, img.height / step);
+    let n = (step * step) as f32;
+    let px: Vec<([f32; 3], f32)> = (0..w * h)
+        .into_par_iter()
+        .map(|o| {
+            let (bx, by) = ((o % w) * step, (o / w) * step);
+            let (mut c, mut k) = ([0f32; 3], 0f32);
+            for y in by..by + step {
+                for x in bx..bx + step {
+                    let i = y * img.width + x;
+                    for ch in 0..3 {
+                        c[ch] += img.data[i * 3 + ch];
+                    }
+                    k += img.clip_at(i);
+                }
+            }
+            (c.map(|v| v / n), k / n)
+        })
+        .collect();
+    let data = px.iter().flat_map(|(c, _)| *c).collect();
+    let clip = if img.clip.is_empty() { Vec::new() } else { px.iter().map(|(_, k)| *k).collect() };
+    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone() }
+}
+
 pub fn compute(img: &DevelopedImage, p: &AdjustParams) -> Histogram {
     let col = Colour::resolve(&img.colour, p);
     // Optics are evaluated at the small copy's own pixel centres, a fraction
@@ -102,6 +131,16 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_downsample_averages_blocks() {
+        // 4x2, values 0..8 in red; long side 2 => step 2, a 2x1 result.
+        let data: Vec<f32> = (0..8).flat_map(|i| [i as f32, 1.0, 0.0]).collect();
+        let img = DevelopedImage::linear_srgb(4, 2, data);
+        let small = box_downsample(&img, 2);
+        assert_eq!((small.width, small.height), (2, 1));
+        assert_eq!(small.data, vec![2.5, 1.0, 0.0, 4.5, 1.0, 0.0]); // mean(0,1,4,5), mean(2,3,6,7)
+    }
     use crate::pipeline::ImageColour;
 
     fn img(w: usize, h: usize, px: impl Fn(usize, usize) -> [f32; 3]) -> DevelopedImage {

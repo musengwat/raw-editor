@@ -61,6 +61,12 @@ pub struct Look {
     /// Per-colour adjustments; `None` leaves the photo's alone.
     #[serde(default)]
     pub hsl: Option<[[f32; 3]; 8]>,
+    /// Contrast and black level, for looks that emulate a film's tone.
+    /// `None` leaves the photo's alone.
+    #[serde(default)]
+    pub contrast: Option<f32>,
+    #[serde(default)]
+    pub blacks: Option<f32>,
     /// What the look is for (filter, what it does), shown as a tooltip.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
@@ -75,6 +81,8 @@ impl Look {
             mixer,
             saturation: None,
             hsl: None,
+            contrast: None,
+            blacks: None,
             note: String::new(),
         }
     }
@@ -89,9 +97,25 @@ impl Look {
         self
     }
 
+    /// A finished effect: tone and per-colour work on top of the mix.
+    fn finish(mut self, saturation: f32, contrast: f32, blacks: f32, hsl: &[(&str, [f32; 3])]) -> Self {
+        self.saturation = Some(saturation);
+        self.contrast = Some(contrast);
+        self.blacks = Some(blacks);
+        let mut h = [[0.0; 3]; 8];
+        for (name, v) in hsl {
+            let i = crate::pipeline::HSL_BANDS.iter().position(|(n, _)| n == name).expect("band name");
+            h[i] = *v;
+        }
+        self.hsl = Some(h);
+        self
+    }
+
     /// Capture the current colour settings of `p` as a look — white balance,
-    /// colour mode, mixer, saturation and the per-colour panel. Exposure, tone,
-    /// detail and look strength are per photo and deliberately left out.
+    /// colour mode, mixer, saturation, the per-colour panel, contrast and
+    /// blacks. Exposure, the other tonal sliders, detail and look strength are
+    /// per photo and deliberately left out (exposure depends on the aperture
+    /// and light, not the look).
     pub fn from_params(name: &str, p: &AdjustParams) -> Self {
         Self {
             name: name.trim().into(),
@@ -100,6 +124,8 @@ impl Look {
             mixer: p.mixer,
             saturation: Some(p.saturation),
             hsl: Some(p.hsl),
+            contrast: Some(p.contrast),
+            blacks: Some(p.blacks),
             note: String::new(),
         }
     }
@@ -120,6 +146,12 @@ impl Look {
         if let Some(h) = self.hsl {
             p.hsl = h;
         }
+        if let Some(c) = self.contrast {
+            p.contrast = c;
+        }
+        if let Some(b) = self.blacks {
+            p.blacks = b;
+        }
     }
 
     /// True when applying this look to `p` would change nothing — how the UI
@@ -136,9 +168,15 @@ impl Look {
 /// grey card refines it without changing the look's mixer.
 const WB_FULL_SPECTRUM: [f32; 3] = [0.94, 1.0, 1.55];
 const WB_ORANGE_16: [f32; 3] = [0.63, 1.0, 4.56];
+/// For the #16 Aerochrome effects: neutral on *clouds* rather than asphalt.
+/// Clouds reflect more IR than asphalt (raw R/G 1.24 against 1.58), so with
+/// the asphalt balance they came out pink; real Aerochrome keeps them white.
+const WB_ORANGE_16_CLOUDS: [f32; 3] = [0.72, 1.0, 4.56];
 
 /// IR estimate behind the #16: blue minus its orange leak (see module docs).
 const IR_16: [f32; 3] = [0.0, -1.5, 2.5];
+/// Aerochrome mix behind the #16: IR → red, red → green, green → blue.
+const AERO_16: [[f32; 3]; 3] = [IR_16, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 /// IR-ish signal with no filter: red's excess over green.
 const IR_FULL: [f32; 3] = [3.0, -2.0, 0.0];
 
@@ -170,12 +208,57 @@ pub fn builtin() -> Vec<Look> {
         Look::builtin("Full spectrum — vivid", [[2.0, -1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], ir)
             .wb(WB_FULL_SPECTRUM)
             .note("No filter. Boosts red's IR excess: cyan sky, copper-red trees"),
+        Look::builtin("Full spectrum — Aerochrome", [[2.5, -1.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], ir)
+            .wb(WB_FULL_SPECTRUM)
+            .finish(0.1, 0.25, 0.0, &[
+                ("Red", [-0.2, 0.4, -0.2]),
+                ("Orange", [-0.8, 0.3, -0.15]),
+                ("Blue", [0.0, -0.2, 0.0]),
+                ("Aqua", [0.5, 0.0, 0.0]),
+            ])
+            .note("No filter. Aerochrome-style: red foliage, natural blue sky. Weaker IR than with the #16, so foliage is red rather than crimson"),
         Look::builtin("Full spectrum — IR mono", [IR_FULL; 3], ir)
             .wb(WB_FULL_SPECTRUM)
             .note("No filter. Black and white from red minus green: dark sky, glowing trees"),
-        Look::builtin("#16 orange — Aerochrome", [IR_16, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], ir)
+        // Aerochrome effects: the IR → red, red → green, green → blue mix,
+        // cloud-neutral white balance, then slide-film contrast and per-colour
+        // work — red pulled towards crimson and darkened, purple and aqua
+        // pulled into blue so the sky is blue rather than violet or teal,
+        // magenta nudged back to red so grass is not neon pink. Tuned by eye
+        // on P1320278 (f/3.9) and P1320294 (f/20) through the real export.
+        Look::builtin("#16 orange — Aerochrome", AERO_16, ir)
+            .wb(WB_ORANGE_16_CLOUDS)
+            .finish(0.3, 0.3, 0.0, &[
+                ("Red", [-0.2, 0.4, -0.25]),
+                ("Magenta", [0.4, 0.0, -0.2]),
+                ("Purple", [-1.0, 0.2, -0.2]),
+                ("Blue", [0.0, 0.5, -0.3]),
+                ("Aqua", [0.8, 0.4, -0.25]),
+            ])
+            .note("Tiffen #16 orange. Kodak Aerochrome: crimson foliage, blue sky, white clouds. Set exposure per photo"),
+        Look::builtin("#16 orange — Aerochrome deep", AERO_16, ir)
+            .wb(WB_ORANGE_16_CLOUDS)
+            .finish(0.45, 0.45, 0.0, &[
+                ("Red", [-0.2, 0.5, -0.45]),
+                ("Magenta", [0.5, 0.0, -0.3]),
+                ("Purple", [-1.0, 0.3, -0.3]),
+                ("Blue", [0.0, 0.7, -0.45]),
+                ("Aqua", [0.9, 0.5, -0.4]),
+            ])
+            .note("Tiffen #16 orange. Aerochrome with more contrast: darker reds, deeper sky"),
+        Look::builtin("#16 orange — Aerochrome faded", AERO_16, ir)
+            .wb(WB_ORANGE_16_CLOUDS)
+            .finish(0.15, 0.0, 0.35, &[
+                ("Red", [-0.5, 0.1, 0.05]),
+                ("Magenta", [0.2, 0.0, 0.0]),
+                ("Purple", [-0.8, 0.0, 0.0]),
+                ("Blue", [0.0, 0.2, -0.1]),
+                ("Aqua", [0.6, 0.2, 0.0]),
+            ])
+            .note("Tiffen #16 orange. Aerochrome like an old scan: pink foliage, lifted blacks, soft"),
+        Look::builtin("#16 orange — channel mix only", AERO_16, ir)
             .wb(WB_ORANGE_16)
-            .note("Tiffen #16 orange. IR → red, red → green, green → blue: red foliage, blue sky"),
+            .note("Tiffen #16 orange. Just the Aerochrome channel mix, no tone or colour work — a base to build on"),
         Look::builtin("#16 orange — gold & blue", gold, ir)
             .wb(WB_ORANGE_16)
             .note("Tiffen #16 orange. Golden foliage under a blue sky"),
@@ -202,6 +285,20 @@ pub fn builtin() -> Vec<Look> {
 pub fn find_builtin(name: &str) -> Option<Look> {
     let name = RENAMED.iter().find(|(old, _)| *old == name).map_or(name, |(_, new)| new);
     builtin().into_iter().find(|l| l.name == name)
+}
+
+/// A small sRGB picture of `look` applied on top of `p`, for the look
+/// picker. `src` should be a box-downsampled copy of the photo. Detail is off
+/// (noise reduction and sharpening mean nothing at thumbnail size). Returns
+/// RGBA8, row-major.
+pub fn thumbnail(src: &crate::develop::DevelopedImage, p: &AdjustParams, look: &Look) -> Vec<u8> {
+    let mut q = *p;
+    look.apply(&mut q);
+    q.nr_luma = 0.0;
+    q.nr_chroma = 0.0;
+    q.sharpen_amount = 0.0;
+    let r = crate::export::render_cpu(src, &q);
+    r.data.chunks(3).flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8, 255]).collect()
 }
 
 #[cfg(test)]
@@ -253,14 +350,30 @@ mod tests {
     }
 
     #[test]
-    fn tuned_looks_set_their_white_balance_but_keep_saturation() {
+    fn tuned_looks_set_white_balance_and_only_aerochrome_sets_tone() {
         for look in builtin().iter().filter(|l| l.name.starts_with("Full spectrum") || l.name.starts_with("#16")) {
-            let mut p = AdjustParams { saturation: 0.3, ..Default::default() };
+            let mut p = AdjustParams { saturation: 0.3, exposure_ev: 0.7, ..Default::default() };
             look.apply(&mut p);
             assert!(p.wb_gains.is_some(), "{}", look.name);
-            assert_eq!(p.saturation, 0.3, "{}", look.name);
+            assert_eq!(p.exposure_ev, 0.7, "{}: exposure stays per photo", look.name);
+            if !look.name.contains("Aerochrome") {
+                assert_eq!(p.saturation, 0.3, "{}", look.name);
+            }
             assert!(!look.note.is_empty(), "{} needs a note saying which filter it is for", look.name);
         }
+    }
+
+    #[test]
+    fn thumbnail_shows_the_look_not_the_current_params() {
+        // A reddish-IR pixel; Sensor RGB, identity: stays red. Through IR mono
+        // it must come out grey.
+        let img = crate::develop::DevelopedImage::linear_srgb(2, 1, vec![0.5, 0.2, 0.3, 0.5, 0.2, 0.3]);
+        let p = AdjustParams { colour_mode: ColourMode::SensorRgb, ..Default::default() };
+        let plain = thumbnail(&img, &p, &builtin()[0]);
+        assert!(plain[0] > plain[1], "{plain:?}");
+        let mono = thumbnail(&img, &p, &find_builtin("IR Chrome — IR mono").unwrap());
+        assert_eq!((mono.len(), mono[0], mono[3]), (8, mono[1], 255));
+        assert_eq!(mono[1], mono[2]);
     }
 
     #[test]
@@ -296,12 +409,37 @@ mod tests {
 
     #[test]
     fn orange_16_aerochrome_turns_foliage_red_and_sky_blue() {
-        let [sky, grass, maple, road] = ORANGE_16.map(|c| render("#16 orange — Aerochrome", c));
+        let [sky, grass, maple, road] = ORANGE_16.map(|c| render("#16 orange — channel mix only", c));
         for f in [grass, maple] {
             assert!(f[0] > f[1] * 1.2 && f[0] > f[2] * 1.2, "foliage {f:?}");
         }
         assert!(sky[2] > sky[0], "sky {sky:?}");
         assert!(road.iter().all(|&v| (v - road[1]).abs() < road[1] * 0.25), "asphalt near neutral {road:?}");
+    }
+
+    /// The finished effect, end to end through `apply`: crimson foliage,
+    /// blue sky, and clouds close to white.
+    #[test]
+    fn orange_16_aerochrome_effect_keeps_clouds_white() {
+        let full = |name: &str, cam: [f32; 3]| {
+            let mut p = AdjustParams::default();
+            find_builtin(name).unwrap().apply(&mut p);
+            crate::pipeline::apply(&p, to_working(&Colour::resolve(&ImageColour::LINEAR_SRGB, &p), cam, 0.0))
+        };
+        for name in ["#16 orange — Aerochrome", "#16 orange — Aerochrome deep"] {
+            let [sky, grass, maple, _] = ORANGE_16.map(|c| full(name, c));
+            for f in [grass, maple] {
+                assert!(f[0] > 2.0 * f[1] && f[0] > 1.5 * f[2], "{name}: foliage should be crimson {f:?}");
+            }
+            assert!(sky[2] > sky[0], "{name}: sky {sky:?}");
+            // Brightest 20% of the sky band in P1320278 — the clouds.
+            let cloud = full(name, [0.9957, 0.8051, 0.173]);
+            // Pink/violet = green well below both red and blue. The asphalt
+            // white balance gave (1.01, 0.74, 1.17) here; a blue-white cloud
+            // is fine.
+            let pink = cloud[1] < 0.85 * cloud[0].min(cloud[2]);
+            assert!(!pink, "{name}: clouds should be white, not pink {cloud:?}");
+        }
     }
 
     #[test]

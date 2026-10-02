@@ -33,6 +33,9 @@ const PICK_WB_KEY: egui::Key = egui::Key::W;
 /// Toggles the clipping overlay.
 const CLIP_KEY: egui::Key = egui::Key::C;
 
+/// Long side of a look thumbnail, in pixels.
+const THUMB_LONG_SIDE: usize = 120;
+
 /// Ctrl+Z / Ctrl+Shift+Z (⌘ on macOS); Ctrl+Y also redoes, as on Windows.
 const UNDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
 const REDO: egui::KeyboardShortcut =
@@ -137,6 +140,10 @@ struct App {
     show_clip: bool,
     /// Small copy of the image the histogram is computed from.
     preview: Option<DevelopedImage>,
+    /// Box-averaged copy the look thumbnails render from.
+    thumb_src: Option<DevelopedImage>,
+    /// Look thumbnails and the params they were rendered for.
+    thumbs: Option<(AdjustParams, Vec<(Look, egui::TextureHandle)>)>,
     /// Histogram and the params it was computed with, so it is only redone
     /// when something changes.
     histogram: Option<(AdjustParams, raw_editor::histogram::Histogram)>,
@@ -190,6 +197,8 @@ impl App {
             picking_wb: false,
             show_clip: false,
             preview: None,
+            thumb_src: None,
+            thumbs: None,
             histogram: None,
             config: Config::load().unwrap_or_else(|e| {
                 eprintln!("config: {e:#} — starting with defaults");
@@ -257,6 +266,8 @@ impl App {
                     self.status = format!("{name} — {}x{}{note}", img.width, img.height);
                     self.preview =
                         Some(raw_editor::histogram::downsample(&img, raw_editor::histogram::PREVIEW_LONG_SIDE));
+                    self.thumb_src = Some(raw_editor::histogram::box_downsample(&img, THUMB_LONG_SIDE));
+                    self.thumbs = None;
                     self.histogram = None;
                     self.picking_wb = false;
                     self.image = Some(Arc::new(img));
@@ -638,7 +649,28 @@ impl App {
         });
     }
 
+    /// Re-render the look thumbnails once the params have settled (not on
+    /// every frame of a drag). ~12k pixels per look, a few ms in all.
+    fn update_thumbs(&mut self, ctx: &egui::Context) {
+        let Some(src) = &self.thumb_src else { return };
+        if self.thumbs.as_ref().is_some_and(|(p, _)| *p == self.params) || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let looks: Vec<Look> = raw_editor::looks::builtin().into_iter().chain(self.config.looks.iter().cloned()).collect();
+        let thumbs = looks
+            .into_iter()
+            .map(|look| {
+                let rgba = raw_editor::looks::thumbnail(src, &self.params, &look);
+                let img = egui::ColorImage::from_rgba_unmultiplied([src.width, src.height], &rgba);
+                let tex = ctx.load_texture(format!("look:{}", look.name), img, egui::TextureOptions::LINEAR);
+                (look, tex)
+            })
+            .collect();
+        self.thumbs = Some((self.params, thumbs));
+    }
+
     fn side_panel(&mut self, ui: &mut egui::Ui) {
+        self.update_thumbs(ui.ctx());
         ui.heading("Adjust");
         ui.add_space(6.0);
 
@@ -674,6 +706,7 @@ impl App {
         let has_flat = lens.as_ref().is_some_and(|l| self.config.flat_fields.contains_key(l));
         let mut optics_action: Option<OpticsAction> = None;
         let hsl_tab = &mut self.hsl_tab;
+        let thumbs: Vec<(Look, egui::TextureHandle)> = self.thumbs.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
         let p = &mut self.params;
         let d = AdjustParams::default();
         let mut reset_section: Option<Section> = None;
@@ -741,6 +774,23 @@ impl App {
                         }
                     }
                 });
+            if !thumbs.is_empty() {
+                egui::CollapsingHeader::new("Look previews").default_open(true).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (look, tex) in &thumbs {
+                            let size = tex.size_vec2() * (92.0 / THUMB_LONG_SIDE as f32);
+                            let selected = look.is_applied(p);
+                            let tip = if look.note.is_empty() { look.name.clone() } else { format!("{}\n{}", look.name, look.note) };
+                            let resp = ui
+                                .add(egui::Button::image(egui::Image::new((tex.id(), size))).selected(selected))
+                                .on_hover_text(tip);
+                            if resp.clicked() {
+                                look.apply(p);
+                            }
+                        }
+                    });
+                });
+            }
             ui.add_enabled_ui(p.mixer != IDENTITY3, |ui| {
                 resettable(ui, &mut p.mixer_strength, d.mixer_strength, |ui, v| {
                     ui.add(egui::Slider::new(v, 0.0..=1.5).text("Look strength"))

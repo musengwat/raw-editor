@@ -313,3 +313,18 @@ full-resolution noise at a quarter of the size — IR looks that subtract
 channels looked far worse on screen than in their exports.
 `downscaled_view_averages_instead_of_point_sampling` fails (38 levels off)
 if the chain is dropped.
+
+## Aerochrome effects and look thumbnails
+
+`Look` can also carry `hsl`, `contrast` and `blacks` (all `Option`, serde
+default), so a built-in can be a finished effect; `Look::finish` fills them.
+The #16 Aerochrome effects use `WB_ORANGE_16_CLOUDS` (red gain 0.72) instead
+of the asphalt balance — `orange_16_aerochrome_effect_keeps_clouds_white`
+fails with 0.63. Looks never set exposure. Tuning was done by exporting
+sidecar variants through `target/release/export` and comparing contact sheets
+of P1320278 (f/3.9, 0 EV) and P1320294 (f/20, +1 EV).
+
+Thumbnails: `histogram::box_downsample` (box-averaged; the histogram's own
+`downsample` point-samples on purpose) → `looks::thumbnail` → `render_cpu`
+with detail off. `App::update_thumbs` re-renders only when params changed
+and no pointer button is down.

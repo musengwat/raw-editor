@@ -127,11 +127,22 @@ grass, conifers, a maple, asphalt):
 |---|---|---|
 | Full spectrum — natural | none | normal colour, warm IR glow on foliage |
 | Full spectrum — vivid | none | cyan sky, copper-red trees |
+| Full spectrum — Aerochrome | none | red foliage, natural blue sky |
 | Full spectrum — IR mono | none | black and white, dark sky, glowing trees |
-| #16 orange — Aerochrome | Tiffen #16 | red foliage, blue sky |
+| #16 orange — Aerochrome | Tiffen #16 | **Kodak Aerochrome**: crimson foliage, blue sky, white clouds |
+| #16 orange — Aerochrome deep | Tiffen #16 | the same, more contrast, darker reds |
+| #16 orange — Aerochrome faded | Tiffen #16 | like an old scan: pink, soft, lifted blacks |
+| #16 orange — channel mix only | Tiffen #16 | just the Aerochrome mix — a base to build your own |
 | #16 orange — gold & blue | Tiffen #16 | golden foliage, blue sky |
 | #16 orange — IR mono | Tiffen #16 | black and white from the IR estimate |
 | IR Chrome — … | IR Chrome | derived, **untested** |
+
+The Aerochrome effects are complete: white balance (neutral on *clouds* —
+clouds reflect more IR than asphalt and otherwise turn pink), channel mix,
+saturation, contrast and per-colour work. They leave exposure alone, because
+that depends on the aperture and light: an f/20 frame through the #16 wants
+about +1 EV, an f/3.9 one none. *Look previews* (under the Look menu) shows
+every look as a thumbnail on the current photo — click one to apply it.
 
 Behind the #16 the blue photosites see IR plus a steady orange leak (~17% of
 green), so the #16 looks estimate IR as blue minus some green. With no
