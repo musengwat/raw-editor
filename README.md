@@ -229,9 +229,17 @@ network; keep it that way.
 
 Every push to `master` builds the executable on a Windows runner
 (`.github/workflows/windows.yml`) and attaches `raw-editor-windows-x86_64.zip`
-to the run — download it from the Actions tab, unzip, double-click. It is
-portable: no installer, no runtime to install, and wgpu picks DX12 on Windows.
-`workflow_dispatch` lets you trigger a build by hand.
+to the run (uploaded with `archive: false`, so it is one zip, not a zip in a
+zip). Pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`) also
+publishes the Windows and macOS zips to a **GitHub Release** — the easiest
+place to download from. Unzip, double-click. It is portable: no installer, no
+runtime to install, and wgpu picks DX12 on Windows. `workflow_dispatch` lets
+you trigger a build by hand.
+
+The executable is not code-signed, so Chrome may call the download
+"uncommon" or "dangerous" (open the downloads page, ⋮ → *Keep*) and Windows
+SmartScreen may say "Windows protected your PC" (*More info* → *Run anyway*).
+Only a code-signing certificate removes those warnings.
 
 Cross-compiling from Linux was avoided: rustc has a known crash cross-compiling
 egui to `x86_64-pc-windows-gnu`, and a native MSVC build is what we want to ship
