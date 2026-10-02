@@ -182,7 +182,8 @@ mod tests {
         assert_eq!(initial(&raw, &config, &CameraIds::default()).unwrap().1, Origin::Neutral);
 
         let (p, origin) = initial(&raw, &config, &body("F92")).unwrap();
-        assert_eq!(origin, Origin::BodyLook("Red–blue swap".into()));
+        // Stored under the built-in's pre-rename name; resolves to the new one.
+        assert_eq!(origin, Origin::BodyLook("IR Chrome — red–blue swap".into()));
         assert_eq!(p.mixer, [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]);
         assert_eq!(p.colour_mode, crate::pipeline::ColourMode::SensorRgb);
 

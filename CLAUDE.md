@@ -151,6 +151,20 @@ enforces it. The built-ins are reasoned from the filter physics (behind IR
 Chrome the blue photosites see ~pure IR; Aerochrome = IR→R, R→G, G→B), not
 tuned on real daylight shots. Retune them when those exist.
 
+## Tuned looks (IR-5)
+
+The *Full spectrum* and *#16 orange* built-ins were tuned on real frames in
+`testdata/fs` (P1320275–295; P1320083 is the same view on the stock camera).
+The looks tests pin them to region means measured on those frames
+(`ORANGE_16` / `UNFILTERED` in `looks.rs`), so retuning must keep those
+tests' claims true or change them deliberately. Built-ins were renamed with a
+filter prefix; `looks::RENAMED` keeps old names resolving (`find_builtin`) and
+`Config::migrated` rewrites stored body-look names on load. Tuning method: dump
+1/8-scale camera RGB per file, average hand-picked regions, prototype
+WB + mixer in numpy, then confirm with full-res exports through
+`target/release/export` using hand-written sidecars (XDG_CONFIG_HOME pointed at
+a scratch dir).
+
 ## Saved looks and per-body looks (IR-3)
 
 `Config.looks` holds saved looks; `Config.body_looks` maps body serial → look

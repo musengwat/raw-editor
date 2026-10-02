@@ -65,8 +65,21 @@ impl Config {
     /// built-in of the same name.
     pub fn find_look(&self, name: &str) -> Option<Look> {
         self.looks.iter().find(|l| l.name == name).cloned().or_else(|| {
-            crate::looks::builtin().into_iter().find(|l| l.name == name)
+            crate::looks::find_builtin(name)
         })
+    }
+
+    /// Point body looks saved under a built-in's old name at its new name,
+    /// unless a saved look of the old name exists (that one wins, as in
+    /// [`Config::find_look`]).
+    pub fn migrated(mut self) -> Self {
+        for name in self.body_looks.values_mut() {
+            let saved = self.looks.iter().any(|l| &l.name == name);
+            if let (false, Some((_, new))) = (saved, crate::looks::RENAMED.iter().find(|(old, _)| old == name)) {
+                *name = new.to_string();
+            }
+        }
+        self
     }
 
     /// The look a photo from this body starts in, if one is set and still exists.
@@ -103,8 +116,9 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text)
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(text) => serde_json::from_str::<Self>(&text)
+                .with_context(|| format!("parsing {}", path.display()))
+                .map(Self::migrated),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -140,6 +154,17 @@ fn restrict_permissions(_path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_looks_under_old_builtin_names_are_migrated() {
+        let mut c = Config::default();
+        c.body_looks.insert("A".into(), "Red–blue swap".into());
+        c.body_looks.insert("B".into(), "IR mono".into());
+        c.looks.push(look("IR mono", 0.0)); // a saved look by that name wins
+        let c = c.migrated();
+        assert_eq!(c.body_looks["A"], "IR Chrome — red–blue swap");
+        assert_eq!(c.body_looks["B"], "IR mono");
+    }
 
     #[test]
     fn debug_never_reveals_the_key() {

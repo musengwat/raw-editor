@@ -74,6 +74,10 @@ Infrared (the GF1 is now a full-spectrum conversion):
   to photos with no sidecar of their own. The serial identifies the *body*,
   not the conversion, so the GF1's pre-conversion shots also open in its IR
   look — Reset on such a photo saves a neutral sidecar and opts it out
+- [x] IR-5 — looks tuned on real daylight frames, grouped by filter:
+  *Full spectrum* (no filter: natural, vivid, IR mono) and *#16 orange*
+  (Aerochrome, gold & blue, IR mono). The IR Chrome looks stay as derived,
+  untested starting points. See **Looks** below
 - [x] IR-4 — hot-spot correction: a radial model (amount, radius, centre,
   per-channel colour) plus a per-lens flat field made from one evenly lit,
   defocused frame (*Optics → Make from this photo*). A lens with a flat field
@@ -109,6 +113,34 @@ under warm light needs). *As shot* returns to the camera's white balance.
 *Camera* mode applies the file's camera→sRGB matrix; *Sensor RGB* skips it,
 because a matrix calibrated for visible light scrambles hues once the sensor
 sees infrared. Temp and tint still apply on top as fine trims.
+
+**Looks**: the *Look* menu holds false-colour starting points for the
+full-spectrum GF1, named by the filter they are for — hover one to see what
+it does. Each sets white balance (asphalt neutral in daylight) and a channel
+mixer; the eyedropper on a road or grey card refines the white balance
+afterwards. Tuned on the Oct 2 2026 frames P1320275–295 (window view: water,
+grass, conifers, a maple, asphalt):
+
+| Look | Filter | Result |
+|---|---|---|
+| Full spectrum — natural | none | normal colour, warm IR glow on foliage |
+| Full spectrum — vivid | none | cyan sky, copper-red trees |
+| Full spectrum — IR mono | none | black and white, dark sky, glowing trees |
+| #16 orange — Aerochrome | Tiffen #16 | red foliage, blue sky |
+| #16 orange — gold & blue | Tiffen #16 | golden foliage, blue sky |
+| #16 orange — IR mono | Tiffen #16 | black and white from the IR estimate |
+| IR Chrome — … | IR Chrome | derived, **untested** |
+
+Behind the #16 the blue photosites see IR plus a steady orange leak (~17% of
+green), so the #16 looks estimate IR as blue minus some green. With no
+filter the IR lands mostly in red, so red minus green is the IR signal. Both
+subtractions amplify noise: the #16 and mono looks are grainy at ISO 800 —
+shoot at ISO 100 and use NR. The #16 looks also need about +1 EV.
+
+Two hardware facts behind all this: on the GF1 the **dust-shaker glass
+blocks infrared too**, so a conversion has to remove it as well as the IR-cut
+filter (before it came out, daylight frames showed almost no IR); and the
+12-60mm kit lens showed no hot spot from f/3.9 to f/22 on these frames.
 
 **Histogram**: RGB, overlaid, of the output as it currently looks, with the
 percentage of pixels clipping in each channel underneath (orange once it passes

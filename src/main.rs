@@ -722,7 +722,9 @@ impl App {
                 .selected_text(current.as_deref().unwrap_or("Custom"))
                 .show_ui(ui, |ui| {
                     for look in &builtin_looks {
-                        if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
+                        let item = ui.selectable_label(look.is_applied(p), &look.name);
+                        let item = if look.note.is_empty() { item } else { item.on_hover_text(&look.note) };
+                        if item.clicked() {
                             look.apply(p);
                         }
                     }
@@ -735,6 +737,14 @@ impl App {
                         }
                     }
                 });
+            if let Some(note) = builtin_looks
+                .iter()
+                .find(|l| Some(&l.name) == current.as_ref() && !current_saved)
+                .map(|l| &l.note)
+                .filter(|n| !n.is_empty())
+            {
+                ui.label(egui::RichText::new(note).weak().small());
+            }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(look_name).hint_text("Look name").desired_width(120.0));
                 let name = look_name.trim().to_string();
