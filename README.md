@@ -349,10 +349,20 @@ the build machine's macOS version and won't launch on an old one.
 
 **First launch.** The app is ad-hoc signed, not signed with an Apple developer
 ID, so Gatekeeper blocks a plain double-click. Unzip it, move `raw-editor.app`
-to Applications, then **right-click → Open → Open** once; after that it opens
-normally. (On macOS 15 and later: try to open it, then *System Settings →
-Privacy & Security → Open Anyway*.) Alternatively
-`xattr -dr com.apple.quarantine /Applications/raw-editor.app`.
+to Applications, then do **one** of these once (after that it opens normally):
+
+- **macOS 15 Sequoia and later** — the warning dialog has no "Open Anyway"
+  button any more. Double-click the app, dismiss the warning, then open
+  *System Settings → Privacy & Security*, scroll to the bottom, click
+  **Open Anyway** next to "raw-editor was blocked", and confirm with your
+  password.
+- **macOS 14 and earlier** — right-click the app → *Open* → *Open*.
+- **Any version, in Terminal** —
+  `xattr -dr com.apple.quarantine /Applications/raw-editor.app`
+  (removes the "downloaded from the internet" flag that triggers the check).
+
+Only an Apple Developer ID certificate plus notarization (Apple Developer
+Program, US$99/year) makes the warning go away for good.
 
 **Opening files.** Use *File → Open…* or drag a `.rw2` onto the window.
 Double-clicking a raw in Finder, *Open With*, or dropping onto the Dock icon do
