@@ -1,5 +1,5 @@
-//! JSON sidecar persistence. Edits live in `<name>.rw2.edit.json` next to the
-//! raw file; the `.rw2` itself is never touched.
+//! JSON sidecar persistence. Edits live in `<name>.<ext>.edit.json` next to
+//! the photo (`P1320071.rw2.edit.json`); the photo itself is never touched.
 
 use std::path::{Path, PathBuf};
 
@@ -16,20 +16,34 @@ pub enum Origin {
     Sidecar,
     /// No sidecar; its camera body is set to start in this look.
     BodyLook(String),
-    /// No sidecar and no body look: neutral.
+    /// No sidecar and no body look: the default look for new photos.
+    DefaultLook(String),
+    /// No sidecar, no body look, and either the default is "None" or the
+    /// file is a TIFF (already a finished image): neutral.
     Neutral,
 }
 
-/// What opening a photo with no sidecar gives: neutral, or the look assigned
-/// to its camera body, with the flat field on if its lens has one. Also the
-/// baseline the GUI compares against to decide whether a sidecar is needed.
-pub fn baseline(config: &Config, ids: &CameraIds) -> (AdjustParams, Origin) {
+/// What opening a photo with no sidecar gives, with the flat field on if its
+/// lens has one: the look assigned to its camera body, else the default look
+/// (`Config::default_look`, normally "Everyday — Natural"), else neutral.
+/// TIFFs always start neutral — they are finished images, and a tone curve
+/// on top of one would apply a second curve. Also the baseline the GUI
+/// compares against to decide whether a sidecar is needed, and what "Reset
+/// all" returns to.
+pub fn baseline(config: &Config, ids: &CameraIds, photo: &Path) -> (AdjustParams, Origin) {
     let mut p = AdjustParams::default();
+    if crate::formats::is_tiff(photo) {
+        return (p, Origin::Neutral);
+    }
     p.flat_field = config.flat_for(ids.lens.as_deref()).is_some();
-    match config.body_look(ids.serial.as_deref()) {
+    if let Some(look) = config.body_look(ids.serial.as_deref()) {
+        look.apply(&mut p);
+        return (p, Origin::BodyLook(look.name));
+    }
+    match config.default_look() {
         Some(look) => {
             look.apply(&mut p);
-            (p, Origin::BodyLook(look.name))
+            (p, Origin::DefaultLook(look.name))
         }
         None => (p, Origin::Neutral),
     }
@@ -41,7 +55,7 @@ pub fn baseline(config: &Config, ids: &CameraIds) -> (AdjustParams, Origin) {
 pub fn initial(raw: &Path, config: &Config, ids: &CameraIds) -> Result<(AdjustParams, Origin)> {
     Ok(match load(raw)? {
         Some(p) => (p, Origin::Sidecar),
-        None => baseline(config, ids),
+        None => baseline(config, ids, raw),
     })
 }
 
@@ -178,14 +192,21 @@ mod tests {
     }
 
     #[test]
-    fn initial_params_prefer_sidecar_then_body_look_then_neutral() {
+    fn initial_params_prefer_sidecar_then_body_look_then_default_look() {
         let raw = scratch("initial");
         let mut config = Config::default();
         config.body_looks.insert("F92".into(), "Red–blue swap".into());
 
         let body = |s: &str| CameraIds { serial: Some(s.into()), lens: None };
-        assert_eq!(initial(&raw, &config, &body("XEL")).unwrap(), (AdjustParams::default(), Origin::Neutral));
-        assert_eq!(initial(&raw, &config, &CameraIds::default()).unwrap().1, Origin::Neutral);
+        let natural = Origin::DefaultLook(crate::looks::DEFAULT_LOOK.into());
+        let (p, origin) = initial(&raw, &config, &body("XEL")).unwrap();
+        assert_eq!(origin, natural);
+        assert_eq!(p.tone_curve, 1.0, "the default look brings the camera tone curve");
+        assert_eq!(initial(&raw, &config, &CameraIds::default()).unwrap().1, natural);
+
+        // A default of "None" opens neutral.
+        let neutral = Config { default_look: Some("None".into()), ..config.clone() };
+        assert_eq!(initial(&raw, &neutral, &body("XEL")).unwrap(), (AdjustParams::default(), Origin::Neutral));
 
         let (p, origin) = initial(&raw, &config, &body("F92")).unwrap();
         // Stored under the built-in's pre-rename name; resolves to the new one.
@@ -208,7 +229,19 @@ mod tests {
             crate::flatfield::FlatField { lens: lens.into(), width: 1, height: 1, gains: vec![[1.0; 3]] },
         );
         let ids = |l: &str| CameraIds { serial: None, lens: Some(l.into()) };
-        assert!(baseline(&config, &ids(lens)).0.flat_field);
-        assert!(!baseline(&config, &ids("LUMIX G VARIO 7-14/F4.0")).0.flat_field);
+        let raw = Path::new("/photos/P1.rw2");
+        assert!(baseline(&config, &ids(lens), raw).0.flat_field);
+        assert!(!baseline(&config, &ids("LUMIX G VARIO 7-14/F4.0"), raw).0.flat_field);
+    }
+
+    #[test]
+    fn tiffs_start_neutral_whatever_the_settings() {
+        let mut config = Config::default();
+        config.body_looks.insert("F92".into(), "Red–blue swap".into());
+        let ids = CameraIds { serial: Some("F92".into()), lens: None };
+        for name in ["scan.tif", "P1_edit.TIFF"] {
+            assert_eq!(baseline(&config, &ids, Path::new(name)), (AdjustParams::default(), Origin::Neutral), "{name}");
+        }
+        assert_ne!(baseline(&config, &ids, Path::new("P1.ARW")).1, Origin::Neutral);
     }
 }

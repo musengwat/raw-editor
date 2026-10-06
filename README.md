@@ -109,6 +109,10 @@ Everyday use:
   Sony A7 IV and Panasonic G85 raws (within ~0.1 EV of both from deep shadow
   to highlight), on a 0–1 strength slider. The linear render was ~1 stop
   darker in the mid-tones than either camera's JPEG
+- [x] P1b — 28 everyday / film / black-and-white / creative looks in a
+  grouped picker and thumbnail grid; raws open in *Everyday — Natural* by
+  default (changeable, per body as before); *Reset all* returns to the
+  starting look, *Reset to neutral* clears everything
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -119,9 +123,12 @@ trap in the MHC paper's figure, are worked out in
 **Resetting**: every slider gets a small ↺ beside it once it has moved off
 neutral; click it, or double-click the slider, to put that one control back.
 Each section heading (Colour, Basic, Tonal range, Lift / Gamma / Gain, Detail,
-Optics) has its own *Reset*, enabled while anything under it has changed, and
-*Reset all* at the bottom (also *Edit → Reset adjustments*) clears everything.
-All of them reset to neutral, not to the photo's camera look.
+Optics) has its own *Reset* to neutral, enabled while anything under it has
+changed. *Reset all* at the bottom (also *Edit → Reset to how it opened*)
+returns the photo to its starting look — normally *Everyday — Natural*.
+*Edit → Reset to neutral (linear)* clears everything, tone curve included;
+that is saved as the photo's edit, so it also opts one photo out of its
+camera's look. Holding **B** shows how the photo opened.
 
 **Undo**: **Ctrl+Z** (⌘Z on macOS) undoes, **Ctrl+Shift+Z** or **Ctrl+Y**
 redoes; both are also in the *Edit* menu. A whole slider drag is one step.
@@ -140,9 +147,32 @@ under warm light needs). *As shot* returns to the camera's white balance.
 because a matrix calibrated for visible light scrambles hues once the sensor
 sees infrared. Temp and tint still apply on top as fine trims.
 
-**Looks**: the *Look* menu holds false-colour starting points for the
-full-spectrum GF1, named by the filter they are for — hover one to see what
-it does. Each sets white balance (asphalt neutral in daylight) and a channel
+**Looks**: the *Look* section at the top of the panel has a grouped menu and
+a thumbnail of every look on the current photo (click one to apply it; hover
+for what it does). Raw files open in **Everyday — Natural** — the camera's
+own tone curve (measured, see P1a) and a little colour — unless their camera
+body has a look of its own; *Use for new photos* makes the current look the
+default instead (pick *None* for the old linear rendering). TIFFs always open
+neutral. Everyday, film, black-and-white and creative looks each set *every*
+look control (unset ones to neutral), so switching looks never leaves a
+previous look's split tone or colour shift behind; they keep the photo's
+white balance and exposure. *None* clears all of it.
+
+| Group | Looks |
+|---|---|
+| Everyday | Natural, Vivid, Portrait, Landscape, Soft (flat base for grading), Night |
+| Film | Portra-, Ektar-, Velvia-, Kodachrome-, Fuji 400H-, Gold- and CineStill 800T-style |
+| Black & white | Neutral, High contrast, Red filter (dark skies), Noir, Soft matte, Sepia, Selenium |
+| Creative | Faded matte, Teal & orange, Bleach bypass, Cross-process, Warm vintage, Cool & moody, Golden hour |
+| Infrared | the GF1 looks below |
+
+The film looks are impressions of how those stocks are usually remembered,
+built from the editor's own controls (tone curve, contrast, per-colour HSL,
+lift/gamma/gain) — not measured emulations. *Save look* stores the colour and
+tone settings (everything but exposure, detail, optics and crop).
+
+The **Infrared** group holds false-colour starting points for the
+full-spectrum GF1, named by the filter they are for. Each sets white balance (asphalt neutral in daylight) and a channel
 mixer; the eyedropper on a road or grey card refines the white balance
 afterwards. Tuned on the Oct 2 2026 frames P1320275–295 (window view: water,
 grass, conifers, a maple, asphalt):
@@ -165,8 +195,9 @@ The Aerochrome effects are complete: white balance (neutral on *clouds* —
 clouds reflect more IR than asphalt and otherwise turn pink), channel mix,
 saturation, contrast and per-colour work. They leave exposure alone, because
 that depends on the aperture and light: an f/20 frame through the #16 wants
-about +1 EV, an f/3.9 one none. *Look previews* (under the Look menu) shows
-every look as a thumbnail on the current photo — click one to apply it.
+about +1 EV, an f/3.9 one none. The infrared looks only set what they name,
+so they do not add the tone curve; a body set to start in one (the GF1) opens
+exactly as before.
 
 Behind the #16 the blue photosites see IR plus a steady orange leak (~17% of
 green), so the #16 looks estimate IR as blue minus some green. With no

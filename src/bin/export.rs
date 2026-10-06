@@ -154,6 +154,7 @@ fn export_one(
     match origin {
         sidecar::Origin::Sidecar => println!("params:    {params:?}"),
         sidecar::Origin::BodyLook(name) => println!("params:    no sidecar; camera look \"{name}\""),
+        sidecar::Origin::DefaultLook(name) => println!("params:    no sidecar; default look \"{name}\""),
         sidecar::Origin::Neutral => println!("params:    neutral (no sidecar)"),
     }
 

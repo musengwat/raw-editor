@@ -146,10 +146,10 @@ shader, histogram, eyedropper and export get it for free — there is no mixer
 code in the shader, and none should be added. `parity_channel_mixer_looks`
 covers it on the GPU.
 
-`src/looks.rs` holds `Look` (mixer + optional colour mode / WB / saturation;
-`None`/`LookWb::Keep` leave the photo's value alone) and the built-ins. Every
-built-in row sums to 1 so white-balanced neutrals stay neutral — a test
-enforces it. The built-ins are reasoned from the filter physics (behind IR
+`src/looks.rs` holds `Look` (mixer + optional colour mode / WB / saturation
+and, since P1b, every other tone/colour field; `None`/`LookWb::Keep` leave
+the photo's value alone) and the built-ins. Every built-in row sums to 1 so
+white-balanced neutrals stay neutral — a test enforces it. The built-ins are reasoned from the filter physics (behind IR
 Chrome the blue photosites see ~pure IR; Aerochrome = IR→R, R→G, G→B), not
 tuned on real daylight shots. Retune them when those exist.
 
@@ -432,3 +432,30 @@ crush. Saturation: with the curve, the Sony JPEGs match at +0.15 and the
 G85's (muted "Standard") at ≤ 0 — Natural uses +0.1.
 `tone_curve_is_identity_at_zero_and_camera_like_at_one` pins the measured
 points to within 0.2 EV; redo the measurement before changing the constants.
+
+## Looks for every camera and the default look (P1b)
+
+- `Look.group` (`LookGroup`, `#[serde(skip)]` → saved looks are always
+  `Saved`) orders the picker; `builtin()` must stay grouped in
+  `LookGroup::ALL` order (`every_builtin_has_a_note_and_a_group_in_picker_order`).
+- Non-IR built-ins are made with `Look::general`, which sets **every** look
+  field (unset = neutral, `tone_curve` = 1, `colour_mode` = Camera, WB Keep),
+  so switching looks never leaves part of the previous one behind
+  (`general_looks_replace_the_previous_look_completely`). "None" is a
+  general look with `tone_curve` 0 and `colour_mode` None — it clears every
+  look field and keeps WB/colour mode. IR built-ins (`Look::builtin`) still
+  set only what they name; do not convert them, or the GF1's body look would
+  change.
+- `Config.default_look` (`None` = `looks::DEFAULT_LOOK`, "Everyday —
+  Natural"; `Some("None")` = neutral). `sidecar::baseline(config, ids, path)`
+  decides: TIFF → neutral; body look; default look (`Origin::DefaultLook`);
+  else neutral. It needs the path for the TIFF rule — every caller passes it
+  (`App::refresh_baseline` after settings changes).
+- GUI: *Reset all* and Edit → *Reset to how it opened* go to `baseline`;
+  Edit → *Reset to neutral* goes to `AdjustParams::default()` (and so writes a
+  neutral sidecar, the per-photo opt-out). The B compare shows `baseline`.
+- Tuning: contact sheets of every look on the A7 IV L frame, P1050090 and
+  P1050019 via `looks::thumbnail` (a throwaway example binary). Thumbnails
+  for all 42 looks take ~20 ms per refresh on this box.
+- The grey-ramp ordering test skips the IR group: "#16 orange — Aerochrome"
+  dips to −0.004 next to black on a grey ramp (meaningless input for it).

@@ -20,7 +20,7 @@ use raw_editor::pipeline::{
 use raw_editor::config::Config;
 use raw_editor::history::History;
 use raw_editor::immich;
-use raw_editor::looks::Look;
+use raw_editor::looks::{Look, LookGroup};
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
 use raw_editor::widgets::{ColorWheel, CropGrab, drag_crop, fit_aspect, resettable, section_header};
@@ -101,6 +101,8 @@ enum LookAction {
     /// Body serial, look name.
     Assign(String, String),
     Unassign(String),
+    /// Look new photos open in (`"None"` = neutral).
+    SetDefault(String),
 }
 
 struct App {
@@ -274,10 +276,11 @@ impl App {
                     drop(renderer);
 
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let (baseline, _) = sidecar::baseline(&self.config, &camera);
+                    let (baseline, _) = sidecar::baseline(&self.config, &camera, &path);
                     let (params, note) = match sidecar::initial(&path, &self.config, &camera) {
                         Ok((p, Origin::Sidecar)) => (p, " — edits restored".to_string()),
                         Ok((p, Origin::BodyLook(name))) => (p, format!(" — this camera starts in \"{name}\"")),
+                        Ok((p, Origin::DefaultLook(name))) => (p, format!(" — {name}")),
                         Ok((p, Origin::Neutral)) => (p, String::new()),
                         Err(e) => {
                             eprintln!("sidecar: {e:#}");
@@ -668,8 +671,19 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                let changed = !self.params.is_neutral();
-                if ui.add_enabled(changed, egui::Button::new("Reset adjustments")).clicked() {
+                if ui
+                    .add_enabled(self.params != self.baseline, egui::Button::new("Reset to how it opened"))
+                    .on_hover_text("Back to the photo's starting look, as if it had never been edited")
+                    .clicked()
+                {
+                    self.params = self.baseline;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!self.params.is_neutral(), egui::Button::new("Reset to neutral (linear)"))
+                    .on_hover_text("Every control to zero, no look and no tone curve. Saved as this photo's edit, so it also opts the photo out of its camera's look")
+                    .clicked()
+                {
                     self.params = AdjustParams::default();
                     ui.close();
                 }
@@ -726,6 +740,8 @@ impl App {
         let picking_wb = &mut self.picking_wb;
         let builtin_looks = raw_editor::looks::builtin();
         let saved_looks = self.config.looks.clone();
+        let default_look = self.config.default_look_name().to_string();
+        let baseline = self.baseline;
         let serial = self.camera.serial.clone();
         let body_look = serial.as_ref().and_then(|s| self.config.body_looks.get(s).cloned());
         let look_name = &mut self.look_name;
@@ -747,6 +763,150 @@ impl App {
         };
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // --- Look: the first thing most photos need -------------------
+            ui.label(egui::RichText::new("Look").strong());
+            // Saved looks first: a saved look may share a built-in's name and
+            // is the one `Config::find_look` resolves to.
+            let current = saved_looks
+                .iter()
+                .chain(&builtin_looks)
+                .find(|l| l.is_applied(p))
+                .map(|l| l.name.clone());
+            let current_saved = saved_looks.iter().any(|l| Some(&l.name) == current.as_ref());
+            let current_group = if current_saved {
+                Some(LookGroup::Saved)
+            } else {
+                builtin_looks.iter().find(|l| Some(&l.name) == current.as_ref()).map(|l| l.group)
+            };
+            let in_group = |group: LookGroup| -> Vec<&Look> {
+                if group == LookGroup::Saved {
+                    saved_looks.iter().collect()
+                } else {
+                    builtin_looks.iter().filter(|l| l.group == group).collect()
+                }
+            };
+            egui::ComboBox::from_id_salt("look")
+                .selected_text(current.as_deref().unwrap_or("Custom"))
+                .height(520.0)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for group in LookGroup::ALL {
+                        let looks = in_group(group);
+                        if looks.is_empty() {
+                            continue;
+                        }
+                        ui.label(egui::RichText::new(group.label()).weak().small());
+                        for look in looks {
+                            let item = ui.selectable_label(look.is_applied(p), &look.name);
+                            let item = if look.note.is_empty() { item } else { item.on_hover_text(&look.note) };
+                            if item.clicked() {
+                                look.apply(p);
+                            }
+                        }
+                    }
+                });
+            if let Some(note) = saved_looks
+                .iter()
+                .chain(&builtin_looks)
+                .find(|l| Some(&l.name) == current.as_ref())
+                .map(|l| &l.note)
+                .filter(|n| !n.is_empty())
+            {
+                ui.label(egui::RichText::new(note).weak().small());
+            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("New photos open in: {default_look}")).weak().small());
+                if let Some(name) = current.as_ref().filter(|n| **n != default_look) {
+                    if ui
+                        .small_button("Use for new photos")
+                        .on_hover_text(format!("Raw files with no edits yet open in \"{name}\" (unless their camera has its own look). TIFFs always open neutral"))
+                        .clicked()
+                    {
+                        look_action = Some(LookAction::SetDefault(name.clone()));
+                    }
+                }
+            });
+            if !thumbs.is_empty() {
+                for group in LookGroup::ALL {
+                    let in_thumbs: Vec<&(Look, egui::TextureHandle)> =
+                        thumbs.iter().filter(|(l, _)| l.group == group).collect();
+                    if in_thumbs.is_empty() {
+                        continue;
+                    }
+                    // Everyday is open to start with, and so is whichever group
+                    // the photo's look comes from (Infrared for an IR body).
+                    let open = group == LookGroup::Everyday || Some(group) == current_group;
+                    egui::CollapsingHeader::new(group.label())
+                        .id_salt(("look-group", group.label()))
+                        .default_open(open)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for (look, tex) in in_thumbs {
+                                    // Scale by the long side so portrait crops fit too.
+                                    let size = tex.size_vec2() * (92.0 / tex.size_vec2().max_elem());
+                                    let selected = look.is_applied(p);
+                                    let tip = if look.note.is_empty() {
+                                        look.name.clone()
+                                    } else {
+                                        format!("{}\n{}", look.name, look.note)
+                                    };
+                                    let resp = ui
+                                        .add(egui::Button::image(egui::Image::new((tex.id(), size))).selected(selected))
+                                        .on_hover_text(tip);
+                                    if resp.clicked() {
+                                        look.apply(p);
+                                    }
+                                }
+                            });
+                        });
+                }
+            }
+            ui.add_enabled_ui(p.mixer != IDENTITY3, |ui| {
+                resettable(ui, &mut p.mixer_strength, d.mixer_strength, |ui, v| {
+                    ui.add(egui::Slider::new(v, 0.0..=1.5).text("Look strength"))
+                        .on_hover_text("Blend the look's channel mix with the plain image; past 1 exaggerates it")
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(look_name).hint_text("Look name").desired_width(120.0));
+                let name = look_name.trim().to_string();
+                if ui
+                    .add_enabled(!name.is_empty(), egui::Button::new("Save look"))
+                    .on_hover_text("Saves the colour and tone settings (not exposure, detail, optics or crop); replaces a saved look of the same name")
+                    .clicked()
+                {
+                    look_action = Some(LookAction::Save(Look::from_params(&name, p)));
+                }
+                if let (true, Some(name)) = (current_saved, &current) {
+                    if ui.button("Delete").on_hover_text(format!("Delete the saved look \"{name}\"")).clicked() {
+                        look_action = Some(LookAction::Delete(name.clone()));
+                    }
+                }
+            });
+            if let Some(serial) = &serial {
+                let starts = body_look.clone().unwrap_or_else(|| format!("the default ({default_look})"));
+                ui.label(egui::RichText::new(format!("Camera {serial} starts in: {starts}")).weak().small());
+                ui.horizontal(|ui| {
+                    let assignable = current.as_ref().filter(|n| n.as_str() != "None");
+                    let label = match assignable {
+                        Some(n) => format!("Start this camera in \"{n}\""),
+                        None => "Start this camera in this look".into(),
+                    };
+                    if ui
+                        .add_enabled(assignable.is_some() && assignable != body_look.as_ref(), egui::Button::new(label))
+                        .on_hover_text("Photos from this body open in this look until they have edits of their own — e.g. an infrared-converted camera")
+                        .on_disabled_hover_text("Pick or save a named look first")
+                        .clicked()
+                    {
+                        look_action = assignable.map(|n| LookAction::Assign(serial.clone(), n.clone()));
+                    }
+                    if body_look.is_some() && ui.button("Clear").clicked() {
+                        look_action = Some(LookAction::Unassign(serial.clone()));
+                    }
+                });
+            }
+            ui.add_space(8.0);
+
             header(ui, "Colour", Section::Colour, p);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut p.colour_mode, ColourMode::Camera, "Camera")
@@ -776,104 +936,6 @@ impl App {
                 p.wb_gains = Some(g);
             }
 
-            ui.add_space(6.0);
-            // Saved looks first: a saved look may share a built-in's name and
-            // is the one `Config::find_look` resolves to.
-            let current = saved_looks
-                .iter()
-                .chain(&builtin_looks)
-                .find(|l| l.is_applied(p))
-                .map(|l| l.name.clone());
-            let current_saved = saved_looks.iter().any(|l| Some(&l.name) == current.as_ref());
-            egui::ComboBox::from_label("Look")
-                .selected_text(current.as_deref().unwrap_or("Custom"))
-                .show_ui(ui, |ui| {
-                    for look in &builtin_looks {
-                        let item = ui.selectable_label(look.is_applied(p), &look.name);
-                        let item = if look.note.is_empty() { item } else { item.on_hover_text(&look.note) };
-                        if item.clicked() {
-                            look.apply(p);
-                        }
-                    }
-                    if !saved_looks.is_empty() {
-                        ui.separator();
-                        for look in &saved_looks {
-                            if ui.selectable_label(look.is_applied(p), &look.name).clicked() {
-                                look.apply(p);
-                            }
-                        }
-                    }
-                });
-            if !thumbs.is_empty() {
-                egui::CollapsingHeader::new("Look previews").default_open(true).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for (look, tex) in &thumbs {
-                            // Scale by the long side so portrait crops fit too.
-                            let size = tex.size_vec2() * (92.0 / tex.size_vec2().max_elem());
-                            let selected = look.is_applied(p);
-                            let tip = if look.note.is_empty() { look.name.clone() } else { format!("{}\n{}", look.name, look.note) };
-                            let resp = ui
-                                .add(egui::Button::image(egui::Image::new((tex.id(), size))).selected(selected))
-                                .on_hover_text(tip);
-                            if resp.clicked() {
-                                look.apply(p);
-                            }
-                        }
-                    });
-                });
-            }
-            ui.add_enabled_ui(p.mixer != IDENTITY3, |ui| {
-                resettable(ui, &mut p.mixer_strength, d.mixer_strength, |ui, v| {
-                    ui.add(egui::Slider::new(v, 0.0..=1.5).text("Look strength"))
-                        .on_hover_text("Blend the look's channel mix with the plain image; past 1 exaggerates it")
-                });
-            });
-            if let Some(note) = builtin_looks
-                .iter()
-                .find(|l| Some(&l.name) == current.as_ref() && !current_saved)
-                .map(|l| &l.note)
-                .filter(|n| !n.is_empty())
-            {
-                ui.label(egui::RichText::new(note).weak().small());
-            }
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(look_name).hint_text("Look name").desired_width(120.0));
-                let name = look_name.trim().to_string();
-                if ui
-                    .add_enabled(!name.is_empty(), egui::Button::new("Save look"))
-                    .on_hover_text("Saves white balance, colour mode, mixer and saturation; replaces a saved look of the same name")
-                    .clicked()
-                {
-                    look_action = Some(LookAction::Save(Look::from_params(&name, p)));
-                }
-                if let (true, Some(name)) = (current_saved, &current) {
-                    if ui.button("Delete").on_hover_text(format!("Delete the saved look \"{name}\"")).clicked() {
-                        look_action = Some(LookAction::Delete(name.clone()));
-                    }
-                }
-            });
-            if let Some(serial) = &serial {
-                let starts = body_look.as_deref().unwrap_or("no look");
-                ui.label(egui::RichText::new(format!("Camera {serial} starts in: {starts}")).weak().small());
-                ui.horizontal(|ui| {
-                    let assignable = current.as_ref().filter(|n| n.as_str() != "None");
-                    let label = match assignable {
-                        Some(n) => format!("Start this camera in \"{n}\""),
-                        None => "Start this camera in this look".into(),
-                    };
-                    if ui
-                        .add_enabled(assignable.is_some() && assignable != body_look.as_ref(), egui::Button::new(label))
-                        .on_hover_text("Photos from this body open in this look until they have edits of their own")
-                        .on_disabled_hover_text("Pick or save a named look first")
-                        .clicked()
-                    {
-                        look_action = assignable.map(|n| LookAction::Assign(serial.clone(), n.clone()));
-                    }
-                    if body_look.is_some() && ui.button("Clear").clicked() {
-                        look_action = Some(LookAction::Unassign(serial.clone()));
-                    }
-                });
-            }
             egui::CollapsingHeader::new("Channel mixer").show(ui, |ui| {
                 egui::Grid::new("mixer").num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
                     ui.label("");
@@ -1075,11 +1137,11 @@ impl App {
 
             ui.add_space(12.0);
             reset = ui
-                .add_enabled(!p.is_neutral(), egui::Button::new("Reset all"))
-                .on_hover_text("Each slider also has its own ↺, or double-click a slider to reset it")
+                .add_enabled(*p != baseline, egui::Button::new("Reset all"))
+                .on_hover_text("Back to how the photo opened. Each slider also has its own ↺ (or double-click it); Edit → Reset to neutral clears everything")
                 .clicked();
             ui.label(
-                egui::RichText::new(format!("Hold {} to compare with the original", COMPARE_KEY.name()))
+                egui::RichText::new(format!("Hold {} to compare with how it opened", COMPARE_KEY.name()))
                     .weak()
                     .small(),
             );
@@ -1115,7 +1177,7 @@ impl App {
         });
 
         if reset {
-            self.params = AdjustParams::default();
+            self.params = self.baseline;
         } else if let Some(section) = reset_section {
             self.params.reset_section(section);
         }
@@ -1167,9 +1229,17 @@ impl App {
             r.set_image(&self.render_state.device, &self.render_state.queue, img);
         }
         drop(renderer);
-        self.baseline = sidecar::baseline(&self.config, &self.camera).0;
+        self.refresh_baseline();
         if let Err(e) = self.config.save() {
             self.status = format!("Couldn't save settings: {e:#}");
+        }
+    }
+
+    /// Recompute what the open photo starts with after a settings change
+    /// (body look, default look, flat field).
+    fn refresh_baseline(&mut self) {
+        if let Some(path) = &self.current {
+            self.baseline = sidecar::baseline(&self.config, &self.camera, path).0;
         }
     }
 
@@ -1178,7 +1248,11 @@ impl App {
             LookAction::Save(look) => format!("Saved look \"{}\"", look.name),
             LookAction::Delete(name) => format!("Deleted look \"{name}\""),
             LookAction::Assign(serial, name) => format!("Camera {serial} now starts in \"{name}\""),
-            LookAction::Unassign(serial) => format!("Camera {serial} now starts neutral"),
+            LookAction::Unassign(serial) => {
+                format!("Camera {serial} now starts in the default look (\"{}\")", self.config.default_look_name())
+            }
+            LookAction::SetDefault(name) if name == "None" => "New photos now open neutral (linear)".into(),
+            LookAction::SetDefault(name) => format!("New photos now open in \"{name}\""),
         };
         match action {
             LookAction::Save(look) => {
@@ -1192,9 +1266,12 @@ impl App {
             LookAction::Unassign(serial) => {
                 self.config.body_looks.remove(&serial);
             }
+            LookAction::SetDefault(name) => {
+                self.config.default_look = (name != raw_editor::looks::DEFAULT_LOOK).then_some(name);
+            }
         }
         // The open photo's no-sidecar baseline may have changed with it.
-        self.baseline = sidecar::baseline(&self.config, &self.camera).0;
+        self.refresh_baseline();
         if let Err(e) = self.config.save() {
             self.status = format!("Couldn't save settings: {e:#}");
         }
@@ -1420,7 +1497,8 @@ impl App {
         // The geometry stays, so before and after line up.
         let comparing = shortcut(ui.ctx(), COMPARE_KEY, true);
         let mut uniforms = if comparing {
-            let before = AdjustParams { rotation: shown.rotation, straighten: shown.straighten, crop: shown.crop, ..Default::default() };
+            // How the photo opened (its starting look), in the current framing.
+            let before = AdjustParams { rotation: shown.rotation, straighten: shown.straighten, crop: shown.crop, ..self.baseline };
             Uniforms::new(&before, &colour, view, target_is_srgb)
         } else {
             Uniforms::new(&shown, &colour, view, target_is_srgb)

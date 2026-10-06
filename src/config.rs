@@ -29,6 +29,10 @@ pub struct Config {
     pub body_looks: std::collections::BTreeMap<String, String>,
     /// Lens model → flat field made from a reference shot with that lens.
     pub flat_fields: std::collections::BTreeMap<String, FlatField>,
+    /// The look raws open in when they have no sidecar and their body has no
+    /// look of its own. `None` = the built-in default (`looks::DEFAULT_LOOK`);
+    /// `Some("None")` = open neutral (linear).
+    pub default_look: Option<String>,
 }
 
 /// Redacts the key, so a stray `{:?}` cannot leak it.
@@ -41,6 +45,7 @@ impl std::fmt::Debug for Config {
             .field("looks", &self.looks.iter().map(|l| &l.name).collect::<Vec<_>>())
             .field("body_looks", &self.body_looks)
             .field("flat_fields", &self.flat_fields.keys().collect::<Vec<_>>())
+            .field("default_look", &self.default_look)
             .finish()
     }
 }
@@ -87,6 +92,20 @@ impl Config {
         self.find_look(self.body_looks.get(serial?)?)
     }
 
+    /// Name of the look new photos open in.
+    pub fn default_look_name(&self) -> &str {
+        self.default_look.as_deref().unwrap_or(crate::looks::DEFAULT_LOOK)
+    }
+
+    /// The look new photos open in, or `None` to open them neutral. A default
+    /// naming a look that no longer exists falls back to the built-in one.
+    pub fn default_look(&self) -> Option<Look> {
+        match self.default_look_name() {
+            "None" => None,
+            name => self.find_look(name).or_else(|| crate::looks::find_builtin(crate::looks::DEFAULT_LOOK)),
+        }
+    }
+
     /// The flat field for a lens, if one has been made.
     pub fn flat_for(&self, lens: Option<&str>) -> Option<std::sync::Arc<FlatField>> {
         self.flat_fields.get(lens?).cloned().map(std::sync::Arc::new)
@@ -100,10 +119,14 @@ impl Config {
         }
     }
 
-    /// Delete a saved look, and any body that started in it.
+    /// Delete a saved look, any body that started in it, and the default if
+    /// it was this look (back to the built-in default).
     pub fn delete_look(&mut self, name: &str) {
         self.looks.retain(|l| l.name != name);
         self.body_looks.retain(|_, v| v != name);
+        if self.default_look.as_deref() == Some(name) && crate::looks::find_builtin(name).is_none() {
+            self.default_look = None;
+        }
     }
 
     pub fn path() -> Result<PathBuf> {
@@ -281,4 +304,32 @@ mod tests {
         assert!(c.flat_for(Some("LUMIX G VARIO 7-14/F4.0")).is_none());
         assert!(c.flat_for(None).is_none());
     }
+
+    #[test]
+    fn default_look_is_natural_until_changed() {
+        let mut c = Config::default();
+        assert_eq!(c.default_look().map(|l| l.name), Some(crate::looks::DEFAULT_LOOK.to_string()));
+        c.default_look = Some("None".into());
+        assert!(c.default_look().is_none(), "\"None\" opens photos neutral");
+        c.default_look = Some("Film — Portra-style".into());
+        assert_eq!(c.default_look().unwrap().name, "Film — Portra-style");
+        // A config from before default looks existed gets the built-in default.
+        let old: Config = serde_json::from_str(r#"{"immich_url":"x"}"#).unwrap();
+        assert_eq!(old.default_look_name(), crate::looks::DEFAULT_LOOK);
+    }
+
+    #[test]
+    fn deleting_the_default_saved_look_falls_back_to_the_builtin() {
+        let mut c = Config::default();
+        c.save_look(look("Mine", 0.2));
+        c.default_look = Some("Mine".into());
+        assert_eq!(c.default_look().unwrap().name, "Mine");
+        c.delete_look("Mine");
+        assert_eq!(c.default_look, None);
+        // And a default pointing at a look that vanished some other way still
+        // resolves to something sensible.
+        c.default_look = Some("Gone".into());
+        assert_eq!(c.default_look().unwrap().name, crate::looks::DEFAULT_LOOK);
+    }
+
 }
