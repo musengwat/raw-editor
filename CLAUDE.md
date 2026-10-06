@@ -384,3 +384,27 @@ the adapter's `max_texture_dimension_2d` and `max_buffer_size` instead of the
 `gpu::check_fits` refuses an image that still does not fit before it reaches
 wgpu, where it would abort the app; the GUI checks on load, export checks in
 `render_gpu`. A 33 MP Sony export peaks at ~2 GB of RAM.
+
+## Full-colour input: TIFF and reduced-size raws (S2)
+
+`src/rgb_input.rs` builds a `DevelopedImage` without a demosaic.
+
+- **cpp = 3 raws** (Sony M/S lossless): `develop` hands them to
+  `develop_linear_raw`. The reported white level is wrong for these files, so
+  `rgb_ceiling` finds the clip plateau from the histogram (most common value
+  in the top half, standing ≥8x above values 30–60 away, corroborated by two
+  channels within 1%; else the maximum). The first version demanded 0.05% of
+  the frame and missed the A7 IV samples' 0.04% patch of blown sky.
+  `RAW_EDITOR_DEBUG=1` prints black / ceiling. As-shot WB is unit (baked in);
+  the camera matrix still applies.
+- **TIFF**: `metadata::develop_file` routes `formats::is_tiff` files to
+  `open_tiff` (via `image`, `into_rgb32f`): integer files are sRGB-decoded to
+  linear, float files are used as is, colour is `ImageColour::LINEAR_SRGB`.
+  `metadata::read` reads TIFF tags with little_exif (`read_tiff`) so
+  orientation and camera/lens info survive. ICC profiles are not applied;
+  `tiff_profile_note` produces the status-bar warning for non-sRGB ones.
+- Clip flag for both: **all three** channels ≥ 0.995. Never "any channel" —
+  these pixels are already balanced or finished, and a pure red would turn
+  white. `tests/tiff_input.rs` covers it and checks that an unedited 16-bit
+  export re-opens and exports to within 2/65535 of itself.
+- `.dng` stays a raw (rawler), even though it is a TIFF container.

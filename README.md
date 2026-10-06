@@ -3,7 +3,7 @@
 A basic GPU-accelerated RAW image editor with DaVinci-Resolve-style color
 adjustments. Rust + wgpu + egui. It opens every raw format rawler decodes —
 Sony `.arw`, Panasonic `.rw2`, Canon, Nikon, Fujifilm, Olympus, Pentax, DNG
-and more. It was built around a Panasonic GF1/G85 and is tested on those and
+and more — plus 8/16-bit and float TIFFs. It was built around a Panasonic GF1/G85 and is tested on those and
 on a Sony A7 IV.
 
 ## Architecture
@@ -99,6 +99,12 @@ Everyday use:
   of a window stuck on "Loading…"; the GPU device asks for the adapter's real
   texture/buffer limits (the defaults stop at 8192 px / 256 MiB, which 50+ MP
   bodies exceed) and an image that still does not fit is refused with a message
+- [x] S2 — full-colour input: **TIFF** (8/16-bit sRGB-encoded, greyscale,
+  32-bit float taken as linear; tags such as camera/lens/date are read and
+  carried into exports) and Sony **M/S lossless** raws, which are already
+  demosaiced and white balanced. Both skip the demosaic. An embedded non-sRGB
+  ICC profile is *not* converted — the status bar says so. Batch export skips
+  the editor's own `*_edit.tif` outputs
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -399,7 +405,11 @@ Two bodies are exercised by the test files in `testdata/` (gitignored):
   area 7040×4688 (7032 for lossless), camera crop 7008×4672 at (12,8), which
   is what develops. Samples from raw.pixls.us in `testdata/sony` cover
   uncompressed, compressed and lossless L/M/S; M and S lossless are
-  full-colour, not a mosaic (see S2). Only a D65 matrix is embedded.
+  full-colour, not a mosaic (see S2): rawler converts their YCbCr to RGB,
+  reports black 1024 / white 15360 and unit WB, but blown areas actually sit
+  on a plateau near 18877 in all three channels. Normalized to that plateau,
+  the S frame lands ~¼ stop darker than the L frame of the same scene, with
+  the same colour. Only a D65 matrix is embedded.
 
 The Panasonic bodies embed D65 + StdA colour matrices, and on both the deprecated `xyz_to_cam`
 field is zeroed, so `RawImage::color_matrix` is the one to read. Stray samples

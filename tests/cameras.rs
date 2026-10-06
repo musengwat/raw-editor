@@ -72,3 +72,30 @@ fn garbage_with_a_raw_extension_is_an_error() {
     assert!(metadata::develop_file(&p).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// M and S lossless are full-colour (YCbCr in the file), already white
+/// balanced, with a clip plateau far above the reported white level. They
+/// skip the demosaic, develop to the camera crop, and land within a stop of
+/// the L frame of the same scene.
+#[test]
+fn a7iv_reduced_size_lossless_develops_without_a_mosaic() {
+    let Some(l) = sony("ILCE-7M4_DSC06674_FullFrame-LossLess-Compressed-Large.ARW") else { return };
+    let mean = |img: &raw_editor::develop::DevelopedImage| {
+        // Green after as-shot WB, i.e. roughly what the screen shows.
+        let wb = img.colour.as_shot_wb[1];
+        img.data.chunks(3).map(|p| (p[1] * wb) as f64).sum::<f64>() / (img.data.len() / 3) as f64
+    };
+    let large = mean(&metadata::develop_file(&l).unwrap());
+    for (name, size) in [
+        ("ILCE-7M4_DSC06675_FullFrame-LossLess-Compressed-Medium.ARW", (4608, 3072)),
+        ("ILCE-7M4_DSC06676_FullFrame-LossLess-Compressed-Small.ARW", (3504, 2336)),
+    ] {
+        let Some(path) = sony(name) else { continue };
+        let img = metadata::develop_file(&path).unwrap();
+        assert_eq!((img.width, img.height), size, "{name}");
+        assert_eq!(img.colour.as_shot_wb, [1.0; 3], "{name}: WB is baked in");
+        assert!(!img.clip.is_empty(), "{name}: the blown sky should be found and flagged");
+        let ratio = mean(&img) / large;
+        assert!((0.5..2.0).contains(&ratio), "{name}: {ratio:.2}x the L frame's brightness");
+    }
+}

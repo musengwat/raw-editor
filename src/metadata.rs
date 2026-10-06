@@ -42,6 +42,34 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_owned())
 }
 
+/// The same fields from a TIFF's own tags (its IFD0 and EXIF sub-IFD) —
+/// rawler only reads raws. A TIFF with no tags at all is fine: everything
+/// comes back empty.
+fn read_tiff(path: &Path) -> Result<ExportMetadata> {
+    let meta = Metadata::new_from_path(path).map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("reading tags from {}", path.display()))?;
+    let mut m = ExportMetadata::default();
+    let rat = |v: &[uR64]| v.first().map(|r| (r.nominator, r.denominator));
+    for tag in &meta {
+        match tag {
+            ExifTag::Make(v) => m.make = non_empty(v),
+            ExifTag::Model(v) => m.model = non_empty(v),
+            ExifTag::LensMake(v) => m.lens_make = non_empty(v),
+            ExifTag::LensModel(v) => m.lens_model = non_empty(v),
+            ExifTag::DateTimeOriginal(v) => m.date_time_original = non_empty(v),
+            ExifTag::ExposureTime(v) => m.exposure_time = rat(v),
+            ExifTag::FNumber(v) => m.fnumber = rat(v),
+            ExifTag::FocalLength(v) => m.focal_length = rat(v),
+            ExifTag::ISO(v) => m.iso = v.first().copied().map(Into::into),
+            ExifTag::Orientation(v) => m.orientation = v.first().copied(),
+            ExifTag::Artist(v) => m.artist = non_empty(v),
+            ExifTag::Copyright(v) => m.copyright = non_empty(v),
+            _ => {}
+        }
+    }
+    Ok(m)
+}
+
 impl ExportMetadata {
     /// Clockwise quarter turns that show the frame upright, from the EXIF
     /// orientation (6 = 90° clockwise, 3 = 180°, 8 = 90° anticlockwise).
@@ -76,6 +104,13 @@ pub fn develop_file(path: &Path) -> Result<crate::develop::DevelopedImage> {
 }
 
 fn develop_file_inner(path: &Path) -> Result<crate::develop::DevelopedImage> {
+    if crate::formats::is_tiff(path) {
+        let mut img = crate::rgb_input::open_tiff(path)?;
+        if let Ok(m) = read(path) {
+            img.colour.turns = m.turns();
+        }
+        return Ok(img);
+    }
     let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
     let mut img = crate::develop::develop(&raw)?;
     match read(path) {
@@ -88,6 +123,9 @@ fn develop_file_inner(path: &Path) -> Result<crate::develop::DevelopedImage> {
 
 /// Read the metadata out of a raw file without decoding any pixels.
 pub fn read(path: &Path) -> Result<ExportMetadata> {
+    if crate::formats::is_tiff(path) {
+        return read_tiff(path);
+    }
     let src = RawSource::new(path).with_context(|| format!("opening {}", path.display()))?;
     let loader = rawler::RawLoader::new();
     let decoder = loader

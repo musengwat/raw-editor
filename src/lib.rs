@@ -11,5 +11,6 @@ pub mod immich;
 pub mod looks;
 pub mod metadata;
 pub mod pipeline;
+pub mod rgb_input;
 pub mod sidecar;
 pub mod widgets;

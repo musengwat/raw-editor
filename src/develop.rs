@@ -170,6 +170,10 @@ pub fn black_pedestal(make: &str) -> f32 {
 }
 
 pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
+    if raw.cpp == 3 {
+        let m = srgb_from_cam_matrix(raw)?;
+        return crate::rgb_input::develop_linear_raw(raw, m, orientation_turns(raw.orientation));
+    }
     if raw.cpp != 1 {
         bail!("expected bayer CFA data (cpp=1), got cpp={}", raw.cpp);
     }

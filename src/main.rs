@@ -284,7 +284,11 @@ impl App {
                             (baseline, " — sidecar unreadable, starting fresh".to_string())
                         }
                     };
-                    self.status = format!("{name} — {}x{}{note}", img.width, img.height);
+                    let profile = raw_editor::formats::is_tiff(&path)
+                        .then(|| raw_editor::rgb_input::tiff_profile_note(&path))
+                        .flatten()
+                        .map_or(String::new(), |n| format!(" — {n}"));
+                    self.status = format!("{name} — {}x{}{note}{profile}", img.width, img.height);
                     self.preview =
                         Some(raw_editor::histogram::downsample(&img, raw_editor::histogram::PREVIEW_LONG_SIDE));
                     self.thumb_src = Some(raw_editor::histogram::box_downsample(&img, THUMB_LONG_SIDE));

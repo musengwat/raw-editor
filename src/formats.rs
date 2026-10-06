@@ -12,6 +12,9 @@ pub const RAW_EXTENSIONS: &[&str] = &[
     "raf", "rw2", "srw", "3fr", "dcr", "x3f",
 ];
 
+/// Finished images, opened as linear sRGB (see `rgb_input::open_tiff`).
+pub const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
+
 fn extension(path: &Path) -> Option<String> {
     path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
 }
@@ -20,19 +23,33 @@ pub fn is_raw(path: &Path) -> bool {
     extension(path).is_some_and(|e| RAW_EXTENSIONS.contains(&e.as_str()))
 }
 
+pub fn is_tiff(path: &Path) -> bool {
+    extension(path).is_some_and(|e| TIFF_EXTENSIONS.contains(&e.as_str()))
+}
+
 /// Anything the editor can open.
 pub fn is_supported(path: &Path) -> bool {
-    is_raw(path)
+    is_raw(path) || is_tiff(path)
+}
+
+/// One of this editor's own exports (`<name>_edit.tif`). Batch export skips
+/// them, or a second run over a folder would re-edit its own output.
+pub fn is_own_export(path: &Path) -> bool {
+    is_tiff(path) && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("_edit"))
 }
 
 /// Extensions for a file dialog filter, lower and upper case (GTK's filter is
 /// case-sensitive).
 pub fn dialog_extensions() -> Vec<String> {
-    RAW_EXTENSIONS.iter().flat_map(|e| [e.to_string(), e.to_ascii_uppercase()]).collect()
+    RAW_EXTENSIONS
+        .iter()
+        .chain(TIFF_EXTENSIONS)
+        .flat_map(|e| [e.to_string(), e.to_ascii_uppercase()])
+        .collect()
 }
 
 /// Every supported photo directly inside `dir`, sorted, matched
-/// case-insensitively.
+/// case-insensitively, leaving out the editor's own TIFF exports.
 ///
 /// Subdirectories are not walked: batch export is a "do this folder" action,
 /// and quietly recursing into a photo library would be a nasty surprise.
@@ -40,7 +57,7 @@ pub fn photos_in(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
-        if path.is_file() && is_supported(&path) {
+        if path.is_file() && is_supported(&path) && !is_own_export(&path) {
             out.push(path);
         }
     }
@@ -67,7 +84,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("raw-editor-discover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["b.rw2", "a.RW2", "c.ARW", "note.txt", "old_edit.jpg", "a.RW2.edit.json"] {
+        for name in ["b.rw2", "a.RW2", "c.ARW", "note.txt", "old_edit.jpg", "a.RW2.edit.json", "scan.TIF", "a_edit.tif"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         std::fs::create_dir_all(dir.join("nested")).unwrap();
@@ -75,8 +92,15 @@ mod tests {
 
         let found = photos_in(&dir).unwrap();
         let names: Vec<String> = found.iter().map(|p| p.file_name().unwrap().to_string_lossy().into()).collect();
-        assert_eq!(names, vec!["a.RW2", "b.rw2", "c.ARW"]);
+        assert_eq!(names, vec!["a.RW2", "b.rw2", "c.ARW", "scan.TIF"], "own exports skipped");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tiffs_are_supported_but_dng_is_a_raw() {
+        assert!(is_tiff(Path::new("scan.tiff")) && is_supported(Path::new("scan.TIF")));
+        assert!(is_raw(Path::new("x.dng")) && !is_tiff(Path::new("x.dng")));
+        assert!(is_own_export(Path::new("P1_edit.tif")) && !is_own_export(Path::new("P1_edit.jpg")));
     }
 
     #[test]
