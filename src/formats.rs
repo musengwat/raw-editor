@@ -1,0 +1,87 @@
+//! Which files the editor opens. One list, so the open dialog, drag and drop,
+//! batch export and the CLI agree.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+/// Raw formats rawler decodes. DNG is technically a TIFF but belongs here: it
+/// is a raw mosaic and goes through the raw decoder.
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "arw", "cr2", "cr3", "crw", "dng", "erf", "iiq", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef",
+    "raf", "rw2", "srw", "3fr", "dcr", "x3f",
+];
+
+fn extension(path: &Path) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
+}
+
+pub fn is_raw(path: &Path) -> bool {
+    extension(path).is_some_and(|e| RAW_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Anything the editor can open.
+pub fn is_supported(path: &Path) -> bool {
+    is_raw(path)
+}
+
+/// Extensions for a file dialog filter, lower and upper case (GTK's filter is
+/// case-sensitive).
+pub fn dialog_extensions() -> Vec<String> {
+    RAW_EXTENSIONS.iter().flat_map(|e| [e.to_string(), e.to_ascii_uppercase()]).collect()
+}
+
+/// Every supported photo directly inside `dir`, sorted, matched
+/// case-insensitively.
+///
+/// Subdirectories are not walked: batch export is a "do this folder" action,
+/// and quietly recursing into a photo library would be a nasty surprise.
+pub fn photos_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_file() && is_supported(&path) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_extensions_match_case_insensitively() {
+        for name in ["a.rw2", "a.RW2", "DSC06674.ARW", "x.Nef", "x.cr3", "x.dng"] {
+            assert!(is_raw(Path::new(name)), "{name}");
+        }
+        for name in ["a.jpg", "a", "a.rw2.edit.json", "arw"] {
+            assert!(!is_raw(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn discovery_is_sorted_skips_other_files_and_does_not_recurse() {
+        let dir = std::env::temp_dir().join(format!("raw-editor-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.rw2", "a.RW2", "c.ARW", "note.txt", "old_edit.jpg", "a.RW2.edit.json"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/deep.rw2"), b"x").unwrap();
+
+        let found = photos_in(&dir).unwrap();
+        let names: Vec<String> = found.iter().map(|p| p.file_name().unwrap().to_string_lossy().into()).collect();
+        assert_eq!(names, vec!["a.RW2", "b.rw2", "c.ARW"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dialog_lists_both_cases() {
+        let e = dialog_extensions();
+        assert!(e.contains(&"arw".to_string()) && e.contains(&"ARW".to_string()));
+    }
+}

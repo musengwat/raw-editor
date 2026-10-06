@@ -126,10 +126,7 @@ pub fn render_gpu(
 ) -> Result<Rendered> {
     let (w, h) = (img.width, img.height);
     let geom = Geometry::resolve(params, &img.colour, w, h);
-    let limit = device.limits().max_texture_dimension_2d as usize;
-    if w > limit || h > limit {
-        anyhow::bail!("image {w}x{h} exceeds the device's {limit}px texture limit");
-    }
+    crate::gpu::check_fits(device, w, h)?;
 
     // Rgba16Float is renderable everywhere and matches the source texture's
     // precision; the shader writes sRGB-encoded values into it.
@@ -395,29 +392,6 @@ pub fn output_path(raw: &Path, format: ExportFormat) -> std::path::PathBuf {
     raw.with_file_name(format!("{stem}_edit.{}", format.extension()))
 }
 
-/// Every raw file directly inside `dir`, sorted, matched case-insensitively.
-///
-/// Subdirectories are not walked: batch export is a "do this folder" action,
-/// and quietly recursing into a photo library would be a nasty surprise.
-pub fn raw_files_in(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_raw = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("rw2"));
-        if is_raw {
-            out.push(path);
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
 /// Where a batch export writes `raw`'s result, given an optional output
 /// directory. Without one the file lands beside its raw, as before.
 pub fn batch_output_path(
@@ -465,24 +439,6 @@ mod tests {
             batch_output_path(raw, Some(Path::new("/out")), ExportFormat::Jpeg),
             Path::new("/out/P1320071_edit.jpg")
         );
-    }
-
-    #[test]
-    fn raw_discovery_is_case_insensitive_and_skips_other_files() {
-        let dir = std::env::temp_dir().join(format!("raw-editor-discover-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["b.rw2", "a.RW2", "note.txt", "old_edit.jpg"] {
-            std::fs::write(dir.join(name), b"x").unwrap();
-        }
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("nested/deep.rw2"), b"x").unwrap();
-
-        let found = raw_files_in(&dir).unwrap();
-        let names: Vec<String> =
-            found.iter().map(|p| p.file_name().unwrap().to_string_lossy().into()).collect();
-        assert_eq!(names, vec!["a.RW2", "b.rw2"], "sorted, raws only, no recursion");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,7 +1,10 @@
 # raw-editor
 
-A basic GPU-accelerated RAW image editor for Panasonic `.rw2` files, with
-DaVinci-Resolve-style color adjustments. Rust + wgpu + egui.
+A basic GPU-accelerated RAW image editor with DaVinci-Resolve-style color
+adjustments. Rust + wgpu + egui. It opens every raw format rawler decodes —
+Sony `.arw`, Panasonic `.rw2`, Canon, Nikon, Fujifilm, Olympus, Pentax, DNG
+and more. It was built around a Panasonic GF1/G85 and is tested on those and
+on a Sony A7 IV.
 
 ## Architecture
 
@@ -87,6 +90,15 @@ Infrared (the GF1 is now a full-spectrum conversion):
   defocused frame (*Optics → Make from this photo*). A lens with a flat field
   opens with it on. Not yet tried on a real IR hot spot — none of the test
   shots has one
+
+Everyday use:
+
+- [x] S1 — any raw format rawler decodes (open dialog, drag and drop, batch
+  export, CLI); the camera's own crop instead of the wider active area (Sony:
+  7008×4672, not 7040×4688); a decoder crash becomes an error message instead
+  of a window stuck on "Loading…"; the GPU device asks for the adapter's real
+  texture/buffer limits (the defaults stop at 8192 px / 256 MiB, which 50+ MP
+  bodies exceed) and an image that still does not fit is refused with a message
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -364,7 +376,7 @@ to Applications, then do **one** of these once (after that it opens normally):
 Only an Apple Developer ID certificate plus notarization (Apple Developer
 Program, US$99/year) makes the warning go away for good.
 
-**Opening files.** Use *File → Open…* or drag a `.rw2` onto the window.
+**Opening files.** Use *File → Open…* or drag a raw file onto the window.
 Double-clicking a raw in Finder, *Open With*, or dropping onto the Dock icon do
 **not** work: macOS delivers those as an Apple Event, which winit (under eframe)
 doesn't expose, so the app deliberately doesn't claim `.rw2` files at all.
@@ -382,7 +394,14 @@ Two bodies are exercised by the test files in `testdata/` (gitignored):
   black level 128, reported whitelevel 4095 — but see *Clipped highlights*: at
   ISO 100 it really saturates near 2880.
 
-Both embed D65 + StdA colour matrices, and on both the deprecated `xyz_to_cam`
+- **Sony ILCE-7M4 (A7 IV)**: RGGB, black 512, reported whitelevel 15360
+  (uncompressed files run to 16383, so the top ~0.1 stop is clamped). Active
+  area 7040×4688 (7032 for lossless), camera crop 7008×4672 at (12,8), which
+  is what develops. Samples from raw.pixls.us in `testdata/sony` cover
+  uncompressed, compressed and lossless L/M/S; M and S lossless are
+  full-colour, not a mosaic (see S2). Only a D65 matrix is embedded.
+
+The Panasonic bodies embed D65 + StdA colour matrices, and on both the deprecated `xyz_to_cam`
 field is zeroed, so `RawImage::color_matrix` is the one to read. Stray samples
 above the reported whitelevel are normal (hot pixels) and are not evidence of
 where the sensor clips.

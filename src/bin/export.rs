@@ -1,10 +1,10 @@
 //! Headless full-resolution export, using the same GPU pipeline as the GUI.
 //!
 //! ```text
-//! export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR] [--upload]
+//! export <photo | dir> [jpg|tif] [quality] [--out DIR] [--upload]
 //! ```
 //!
-//! Adjustments come from each file's `<name>.rw2.edit.json` sidecar, so
+//! Adjustments come from each file's `<name>.<ext>.edit.json` sidecar, so
 //! pointing this at a folder applies every saved edit in one go. A file with
 //! no sidecar starts in its camera body's look, if one is set in the app's
 //! settings — exactly what the GUI would show. It is also the
@@ -23,7 +23,7 @@ use raw_editor::metadata;
 use raw_editor::sidecar;
 
 const USAGE: &str =
-    "usage: export <file.rw2 | dir> [jpg|tif] [quality] [--out DIR] [--upload]";
+    "usage: export <photo | dir> [jpg|tif] [quality] [--out DIR] [--upload]";
 
 struct Args {
     input: PathBuf,
@@ -93,11 +93,11 @@ fn main() -> Result<()> {
     };
 
     let files = if args.input.is_dir() {
-        let found = export::raw_files_in(&args.input)?;
+        let found = raw_editor::formats::photos_in(&args.input)?;
         if found.is_empty() {
-            anyhow::bail!("no .rw2 files in {}", args.input.display());
+            anyhow::bail!("no supported photos in {}", args.input.display());
         }
-        println!("found {} raw files in {}", found.len(), args.input.display());
+        println!("found {} photos in {}", found.len(), args.input.display());
         found
     } else {
         vec![args.input.clone()]
@@ -210,5 +210,5 @@ fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         ..Default::default()
     }))
     .ok()?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    pollster::block_on(adapter.request_device(&raw_editor::gpu::device_descriptor(&adapter))).ok()
 }

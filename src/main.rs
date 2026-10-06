@@ -57,6 +57,13 @@ fn main() -> eframe::Result {
     let path = std::env::args().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
+                device_descriptor: std::sync::Arc::new(raw_editor::gpu::device_descriptor),
+                ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+            }),
+            ..Default::default()
+        },
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
@@ -192,7 +199,7 @@ impl App {
             dirty_since: None,
             image: None,
             current: None,
-            status: "Open an .rw2: pass a path or drop a file here".into(),
+            status: "Open a raw file: pass a path or drop a file here".into(),
             loader_tx,
             loader_rx,
             loading: false,
@@ -255,6 +262,9 @@ impl App {
         while let Ok((path, result)) = self.loader_rx.try_recv() {
             self.loading = false;
             match result {
+                Ok((img, _)) if let Err(e) = raw_editor::gpu::check_fits(&self.render_state.device, img.width, img.height) => {
+                    self.status = format!("Can't open {}: {e:#}", path.display());
+                }
                 Ok((mut img, camera)) => {
                     img.flat = self.config.flat_for(camera.lens.as_deref());
                     let mut renderer = self.render_state.renderer.write();
@@ -545,7 +555,8 @@ impl App {
     /// Ask for a raw to open. The dialog blocks the UI thread while it is up,
     /// which is the usual arrangement for a small egui app.
     fn pick_and_open(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::FileDialog::new().add_filter("Panasonic raw", &["rw2", "RW2"]);
+        let mut dialog =
+            rfd::FileDialog::new().add_filter("Photos", &raw_editor::formats::dialog_extensions()).add_filter("All files", &["*"]);
         if let Some(dir) = self.current.as_ref().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
@@ -580,10 +591,10 @@ impl App {
         }
         let Some(input) = dialog.pick_folder() else { return };
 
-        let files = match export::raw_files_in(&input) {
+        let files = match raw_editor::formats::photos_in(&input) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => {
-                self.status = format!("No .rw2 files in {}", input.display());
+                self.status = format!("No supported photos in {}", input.display());
                 return;
             }
             Err(e) => {
@@ -1469,8 +1480,12 @@ impl eframe::App for App {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).next_back()
         });
         if let Some(path) = dropped {
-            let ctx = ui.ctx().clone();
-            self.start_load(path, &ctx);
+            if raw_editor::formats::is_supported(&path) {
+                let ctx = ui.ctx().clone();
+                self.start_load(path, &ctx);
+            } else {
+                self.status = format!("Can't open {}: not a supported photo format", path.display());
+            }
         }
 
         egui::Panel::top("menu").show(ui, |ui| {

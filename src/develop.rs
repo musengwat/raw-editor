@@ -180,7 +180,9 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
 
     let raw_w = raw.width;
     let raw_h = raw.height;
-    let area = raw.active_area.unwrap_or(rawler::imgop::Rect {
+    // The camera's own crop where there is one (Sony frames carry a 12x8 px
+    // border of edge pixels inside the active area), else the active area.
+    let area = raw.crop_area.or(raw.active_area).unwrap_or(rawler::imgop::Rect {
         p: rawler::imgop::Point { x: 0, y: 0 },
         d: rawler::imgop::Dim2 { w: raw_w, h: raw_h },
     });

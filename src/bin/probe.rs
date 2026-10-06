@@ -7,7 +7,7 @@ use rawler::{RawImageData, decode_file};
 use raw_editor::develop::develop;
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("usage: probe <file.rw2> [out.png]")?;
+    let path = std::env::args().nth(1).context("usage: probe <raw file> [out.png]")?;
     let raw = decode_file(&path).with_context(|| format!("decoding {path}"))?;
 
     println!("camera:      {} {}", raw.clean_make, raw.clean_model);

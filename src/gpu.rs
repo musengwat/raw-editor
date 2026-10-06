@@ -9,6 +9,36 @@ use rayon::prelude::*;
 use crate::develop::DevelopedImage;
 use crate::pipeline::Uniforms;
 
+/// Device limits to ask for: wgpu's defaults, but with the adapter's own
+/// texture-size and buffer-size ceilings. The defaults (8192 px, 256 MiB)
+/// are below what full-frame bodies need once you get past ~33 MP — a 61 MP
+/// frame is 9504 px wide, and its 16-bit export readback is ~470 MB.
+pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let a = adapter.limits();
+    let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    } else {
+        wgpu::Limits::default()
+    };
+    wgpu::Limits { max_texture_dimension_2d: a.max_texture_dimension_2d, max_buffer_size: a.max_buffer_size, ..base }
+}
+
+/// The descriptor every device in this program is created with.
+pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor { label: Some("raw-editor"), required_limits: device_limits(adapter), ..Default::default() }
+}
+
+/// Whether a `width`x`height` image fits in one texture on `device`. An image
+/// that does not would fail inside wgpu, where it takes the app down instead
+/// of producing an error message.
+pub fn check_fits(device: &wgpu::Device, width: usize, height: usize) -> anyhow::Result<()> {
+    let limit = device.limits().max_texture_dimension_2d as usize;
+    if width > limit || height > limit {
+        anyhow::bail!("{width}x{height} is larger than this graphics card can display ({limit} px per side)");
+    }
+    Ok(())
+}
+
 pub struct ImageRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,

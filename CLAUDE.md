@@ -12,7 +12,9 @@ Read `README.md` first: architecture, phase status, and reference-camera facts
 - Scene-referred linear RGB f32, unclamped, until the final sRGB transfer.
   Never bake clamps into intermediate stages except the whitelevel clamp at
   normalize time.
-- Test RW2s are in `testdata/` (gitignored — never commit raw files).
+- Test raws are in `testdata/` (gitignored — never commit raw files):
+  Panasonic RW2 at the top and in `ir/`, `fs/`, `portrait/`; Sony A7 IV ARW
+  samples (raw.pixls.us) in `sony/`. Tests that need them skip without them.
   Update README phase checkboxes + this file when behavior changes.
 - `Uniforms` is a hand-packed `#[repr(C)]` block matched by hand to the WGSL
   `struct Uniforms`. `vec4` members must sit on 16-byte offsets, so they go
@@ -365,3 +367,20 @@ turned into a maroon sky and red shadows. Measured by fitting B = k·G + c on
 the least-IR pixels (c went from +0.0015…+0.0043 to ≈0). The GF1's "masked"
 border columns carry image content, so they cannot be used for black.
 Renders of Panasonic files are slightly darker in deep shadow than before.
+
+## Other cameras (S1)
+
+`src/formats.rs` is the one list of what the editor opens (`is_supported`,
+`photos_in`, `dialog_extensions`); the open dialog, drag and drop, batch
+export and the CLI all go through it — do not add extension checks
+elsewhere. `develop` uses `RawImage::crop_area` (falling back to the active
+area); on the Panasonic test bodies the two are identical, so their output
+did not change. `metadata::develop_file` catches decoder panics and returns
+them as errors (`tests/cameras.rs` truncates a real ARW to prove it).
+
+Every wgpu device is created with `gpu::device_descriptor`, which asks for
+the adapter's `max_texture_dimension_2d` and `max_buffer_size` instead of the
+8192 px / 256 MiB defaults (egui-wgpu's default descriptor also pins 8192).
+`gpu::check_fits` refuses an image that still does not fit before it reaches
+wgpu, where it would abort the app; the GUI checks on load, export checks in
+`render_gpu`. A 33 MP Sony export peaks at ~2 GB of RAM.

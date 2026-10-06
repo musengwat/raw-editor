@@ -3,6 +3,7 @@ pub mod detail;
 pub mod develop;
 pub mod export;
 pub mod flatfield;
+pub mod formats;
 pub mod gpu;
 pub mod histogram;
 pub mod history;

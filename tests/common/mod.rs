@@ -27,7 +27,7 @@ fn make_gpu() -> Option<Gpu> {
     }))
     .ok()?;
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        pollster::block_on(adapter.request_device(&raw_editor::gpu::device_descriptor(&adapter))).ok()?;
     Some(Gpu { _instance: instance, device, queue })
 }
 

@@ -60,7 +60,22 @@ impl ExportMetadata {
 /// Decode and develop a raw file, with the camera's orientation applied from
 /// its EXIF (see [`ExportMetadata::turns`]). Every caller that renders a file
 /// should come through here, or portrait shots export sideways.
+///
+/// A decoder panic (rawler indexes past the end of some truncated or unusual
+/// files) comes back as an error: in the GUI it would otherwise kill the
+/// loader thread silently and leave the window on "Loading…" for good.
 pub fn develop_file(path: &Path) -> Result<crate::develop::DevelopedImage> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| develop_file_inner(path))).unwrap_or_else(|panic| {
+        let why = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".into());
+        anyhow::bail!("{} could not be decoded ({why})", path.display())
+    })
+}
+
+fn develop_file_inner(path: &Path) -> Result<crate::develop::DevelopedImage> {
     let raw = rawler::decode_file(path).with_context(|| format!("decoding {}", path.display()))?;
     let mut img = crate::develop::develop(&raw)?;
     match read(path) {
