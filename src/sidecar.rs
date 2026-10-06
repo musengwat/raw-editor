@@ -125,6 +125,7 @@ mod tests {
             temp: 0.3,
             tint: -0.15,
             saturation: 0.2,
+            tone_curve: 0.75,
             highlights: -0.8,
             shadows: 0.65,
             whites: 0.1,

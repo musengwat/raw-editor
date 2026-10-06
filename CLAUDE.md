@@ -299,7 +299,7 @@ between the two nearest `HSL_BANDS` centres (cyclic, magenta→red wraps), weigh
 `v − v·s·clamp(min(k, 4−k))`. Keep the tie order of the max-channel branches
 identical on both sides. `Uniforms.hsl` is `array<vec4, 8>` (uniform arrays
 need 16-byte strides, so vec4) and `hsl[0].w` is the "active" flag the shader
-early-outs on; Uniforms is now 368 bytes. `parity_hsl_and_look_strength`
+early-outs on; Uniforms was then 368 bytes (400 now — see crop and the tone curve). `parity_hsl_and_look_strength`
 covers both. `mixer_strength` is folded into the matrix in `Colour::resolve`
 (lerp towards identity), so the shader has no code for it.
 
@@ -408,3 +408,27 @@ wgpu, where it would abort the app; the GUI checks on load, export checks in
   white. `tests/tiff_input.rs` covers it and checks that an unedited 16-bit
   export re-opens and exports to within 2/65535 of itself.
 - `.dng` stays a raw (rawler), even though it is a TIFF container.
+
+## Tone curve (P1a)
+
+`AdjustParams.tone_curve` (0..1, default 0 so old sidecars render exactly as
+before) blends in `pipeline::filmic`, a Hill curve
+`(1 + (K/W)^n) · x^n / (x^n + K^n)` with n = 1.6, K = 0.25, W = 1.0, per
+channel, as step 3b of `apply` (after the tonal ranges, before lift/gamma/
+gain). The shader twin is `filmic()` in `shader.wgsl`; the strength rides in
+`Uniforms.curve.x` (the old `_pad` slot, so the block is still 400 bytes);
+`parity_tone_curve` covers it.
+
+The constants are **fitted, not chosen**: neutral exports of the G85 files
+and three A7 IV frames were compared with the full-size JPEGs embedded in the
+same raws (largest JPEG found by scanning for FFD8FF; Sony embeds full
+resolution, the G85 1920×1440), centre 60% of the frame, binned by our linear
+luminance → median camera luminance. Both bodies give nearly the same curve
+(our 0.106 → 0.24, 0.185 → 0.43, 0.43 → 0.73, 0.73 → 0.90; deep shadows
+darkened). A grid search in log space fit n, K, W to ~0.11 EV RMS; W = 1 costs
+nothing and puts the clip level on white. An earlier hand-picked Hable curve
+was ~0.5 EV too dark in the mid-tones and lifted the shadows the cameras
+crush. Saturation: with the curve, the Sony JPEGs match at +0.15 and the
+G85's (muted "Standard") at ≤ 0 — Natural uses +0.1.
+`tone_curve_is_identity_at_zero_and_camera_like_at_one` pins the measured
+points to within 0.2 EV; redo the measurement before changing the constants.

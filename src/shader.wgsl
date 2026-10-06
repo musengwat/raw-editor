@@ -18,7 +18,7 @@ struct Uniforms {
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
-    _pad: vec2<f32>,
+    curve: vec2<f32>,      // .x = tone-curve strength (0 = linear)
     exposure_ev: f32,
     contrast: f32,
     temp: f32,
@@ -50,6 +50,16 @@ struct VsOut {
 };
 
 const CONTRAST_PIVOT: f32 = 0.18;
+
+// Tone curve — mirrors `pipeline::filmic` (Hill curve fitted to camera JPEGs).
+const TONE_N: f32 = 1.6;
+const TONE_K: f32 = 0.25;
+const TONE_WHITE: f32 = 1.0;
+
+fn filmic(x: vec3<f32>) -> vec3<f32> {
+    let xn = pow(x, vec3(TONE_N));
+    return (1.0 + pow(TONE_K / TONE_WHITE, TONE_N)) * xn / (xn + pow(TONE_K, TONE_N));
+}
 
 // Tonal-range mask shape — must match the constants in src/pipeline.rs.
 const MASK_GAMMA: f32 = 2.2;
@@ -256,6 +266,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let m_black = 1.0 - smoothstep(BLACK_LO, BLACK_HI, d);
     let tone_gain = exp2(u.highlights * m_high + u.shadows * m_shad + u.whites * WHITES_EV * m_white);
     c = c * tone_gain + u.blacks * BLACKS_LIFT * m_black;
+
+    // 3b. Tone curve (filmic shoulder), blended in by strength.
+    if u.curve.x != 0.0 {
+        let xc = max(c, vec3(0.0));
+        c = xc + u.curve.x * (filmic(xc) - xc);
+    }
 
     // 4. Lift / gamma / gain:  out = gain * (in + lift*(1-in))^(1/gamma)
     let x = max(c, vec3(0.0));

@@ -541,6 +541,19 @@ fn parity_hsl_and_look_strength() {
     assert_image_parity(&camera_source(), p);
 }
 
+/// The tone curve at full and partial strength, with exposure pushing part
+/// of the frame past the curve's white point and contrast/tonal moves before
+/// it — the shoulder, the blend and the step order all have to match.
+#[test]
+fn parity_tone_curve() {
+    for p in [
+        AdjustParams { tone_curve: 1.0, ..Default::default() },
+        AdjustParams { tone_curve: 0.6, exposure_ev: 1.5, contrast: 0.2, highlights: -0.4, saturation: 0.2, ..Default::default() },
+    ] {
+        assert_image_parity(&camera_source(), p);
+    }
+}
+
 // --- IR-4: hot spot and flat field --------------------------------------
 
 /// A flat field with real structure: brighter gain towards one corner and a

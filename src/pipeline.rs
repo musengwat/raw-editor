@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTRAST_PIVOT: f32 = 0.18;
 
+// --- Tone curve -----------------------------------------------------------
+// A Hill (log-logistic) curve, `f(x) = (1 + (K/W)^n) · x^n / (x^n + K^n)`,
+// fitted to what cameras actually do: the embedded JPEGs of a Sony A7 IV
+// (3 frames) and a Panasonic G85 (5 frames) against this editor's linear
+// render of the same raws. Both bodies follow nearly the same curve; the fit
+// is within ~0.1 EV of it from 0.5% to 94% (deep shadows darkened, mid-tones
+// lifted ~1.1 EV, a long highlight shoulder). `W` = 1 puts the sensor's clip
+// level on white; above it the curve keeps rolling off towards 1.11 instead
+// of clipping hard. Mirrored in `shader.wgsl`.
+pub const TONE_N: f32 = 1.6;
+pub const TONE_K: f32 = 0.25;
+pub const TONE_WHITE: f32 = 1.0;
+
+/// The full-strength tone curve on one linear channel value (≥ 0).
+pub fn filmic(x: f32) -> f32 {
+    let xn = x.powf(TONE_N);
+    (1.0 + (TONE_K / TONE_WHITE).powf(TONE_N)) * xn / (xn + TONE_K.powf(TONE_N))
+}
+
 // --- Tonal-range mask shape (display-domain luminance thresholds) ----------
 // Masks are evaluated on `d = clamp(luma, 0, 1)^(1/2.2)`, an approximate
 // display-referred position, so the ranges line up with what the eye sees
@@ -80,6 +99,10 @@ pub struct AdjustParams {
     pub tint: f32,
     /// -1..1, luma-preserving saturation.
     pub saturation: f32,
+    /// 0..1, how much of the filmic tone curve ([`filmic`]) applies: 0 =
+    /// linear (the original rendering), 1 = camera-like mid-tones and a
+    /// highlight shoulder. The everyday looks set it.
+    pub tone_curve: f32,
     /// -1..1 EV applied through a broad upper-range mask.
     pub highlights: f32,
     /// -1..1 EV applied through a broad lower-range mask.
@@ -152,6 +175,7 @@ impl Default for AdjustParams {
             temp: 0.0,
             tint: 0.0,
             saturation: 0.0,
+            tone_curve: 0.0,
             highlights: 0.0,
             shadows: 0.0,
             whites: 0.0,
@@ -199,6 +223,7 @@ impl AdjustParams {
                 self.temp = d.temp;
                 self.tint = d.tint;
                 self.saturation = d.saturation;
+                self.tone_curve = d.tone_curve;
             }
             Section::Tonal => {
                 self.highlights = d.highlights;
@@ -460,7 +485,8 @@ pub struct Uniforms {
     pub offset: [f32; 2],
     /// 1 / source texture size, so the shader can step in source pixels.
     pub texel: [f32; 2],
-    pub _pad: [f32; 2],
+    /// `.x` = tone-curve strength, `.y` unused (pad).
+    pub curve: [f32; 2],
     pub exposure_ev: f32,
     pub contrast: f32,
     pub temp: f32,
@@ -569,7 +595,7 @@ impl Uniforms {
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
-            _pad: [0.0, 0.0],
+            curve: [p.tone_curve, 0.0],
             exposure_ev: p.exposure_ev,
             contrast: p.contrast,
             temp: p.temp,
@@ -648,6 +674,16 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
     let black_lift = p.blacks * BLACKS_LIFT * mb;
     for v in &mut c {
         *v = *v * tone_gain + black_lift;
+    }
+
+    // 3b. Tone curve, blended in by strength: brighter mid-tones and a
+    //     highlight shoulder, per channel (bright colours desaturate towards
+    //     white as they roll off, as on film).
+    if p.tone_curve != 0.0 {
+        for v in &mut c {
+            let x = v.max(0.0);
+            *v = x + p.tone_curve * (filmic(x) - x);
+        }
     }
 
     // 4. Lift / gamma / gain, per channel:  out = gain * (in + lift*(1-in))^(1/gamma)
@@ -791,6 +827,7 @@ mod tests {
             temp: 0.1,
             tint: -0.1,
             saturation: 0.3,
+            tone_curve: 0.8,
             highlights: -0.4,
             shadows: 0.4,
             whites: 0.1,
@@ -1298,5 +1335,32 @@ mod tests {
         let m = AdjustParams { mixer: [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], ..Default::default() };
         assert_eq!(serde_json::from_str::<AdjustParams>(&serde_json::to_string(&m).unwrap()).unwrap(), m);
     }
+
+    #[test]
+    fn tone_curve_is_identity_at_zero_and_camera_like_at_one() {
+        let px = [0.03, 0.12, 0.6];
+        let out = apply(&AdjustParams::default(), px);
+        assert!(out.iter().zip(px).all(|(a, b)| (a - b).abs() < 1e-6), "strength 0 must not touch anything: {out:?}");
+        // Points measured off the A7 IV / G85 camera JPEGs (ours → camera,
+        // linear); the curve must stay within 0.2 EV of each.
+        for (x, cam) in [(0.0195, 0.0170), (0.045, 0.067), (0.106, 0.238), (0.185, 0.426), (0.43, 0.735), (0.73, 0.906)] {
+            let ev = (filmic(x) / cam).log2();
+            assert!(ev.abs() < 0.2, "{x}: {} vs camera {cam} ({ev:+.2} EV)", filmic(x));
+        }
+        assert!((filmic(TONE_WHITE) - 1.0).abs() < 1e-6, "clip level lands on white");
+        assert!(filmic(0.0).abs() < 1e-6);
+        // Monotonic, and compressive at the top: a stop above clip adds far
+        // less than a stop.
+        let mut last = -1.0;
+        for i in 0..400 {
+            let y = filmic(i as f32 / 100.0);
+            assert!(y > last, "not increasing at {i}");
+            last = y;
+        }
+        assert!(filmic(2.0) / filmic(1.0) < 1.15);
+        let half = apply(&AdjustParams { tone_curve: 0.5, ..Default::default() }, [0.12; 3])[0];
+        assert!((half - (0.12 + filmic(0.12)) / 2.0).abs() < 1e-4, "{half}");
+    }
+
 }
 

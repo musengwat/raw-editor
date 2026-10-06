@@ -105,6 +105,10 @@ Everyday use:
   demosaiced and white balanced. Both skip the demosaic. An embedded non-sRGB
   ICC profile is *not* converted — the status bar says so. Batch export skips
   the editor's own `*_edit.tif` outputs
+- [x] P1a — tone curve: a Hill curve fitted to the camera JPEGs embedded in
+  Sony A7 IV and Panasonic G85 raws (within ~0.1 EV of both from deep shadow
+  to highlight), on a 0–1 strength slider. The linear render was ~1 stop
+  darker in the mid-tones than either camera's JPEG
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -190,8 +194,11 @@ rest. *Show clipping* (or **C**) turns the image into a clipping map: clipped
 pixels show which channels clipped (red, yellow, white…), the rest go dim grey.
 It is a viewing aid only and never reaches an export.
 
-**Basic**: exposure (EV), contrast (power curve about a 0.18 pivot), temp/tint
-(opposing channel gains), saturation (luma-preserving).
+**Basic**: exposure (EV), *tone curve* (0–1: how much of a camera-like curve
+applies — brighter mid-tones, slightly deeper shadows and highlights that
+roll off instead of clipping; 0 is the old linear rendering), contrast (power
+curve about a 0.18 pivot), temp/tint (opposing channel gains), saturation
+(luma-preserving).
 
 **Per colour**: hue, saturation and luminance for eight colour bands (red,
 orange, yellow, green, aqua, blue, purple, magenta), switched with the

@@ -7,6 +7,9 @@
 //! actual GPU work. That is what keeps a plain `cargo test --release` green
 //! without `--test-threads=1`.
 
+// Each test binary uses only part of this module.
+#![allow(dead_code)]
+
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use eframe::wgpu;

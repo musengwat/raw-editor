@@ -906,6 +906,11 @@ impl App {
             ui.add_space(10.0);
             header(ui, "Basic", Section::Basic, p);
             resettable(ui, &mut p.exposure_ev, d.exposure_ev, |ui, v| ui.add(egui::Slider::new(v, -5.0..=5.0).text("Exposure (EV)")));
+            resettable(ui, &mut p.tone_curve, d.tone_curve, |ui, v| {
+                ui.add(egui::Slider::new(v, 0.0..=1.0).text("Tone curve")).on_hover_text(
+                    "Camera-like tone: brighter mid-tones and highlights that roll off instead of clipping. 0 = linear",
+                )
+            });
             resettable(ui, &mut p.contrast, d.contrast, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Contrast")));
             resettable(ui, &mut p.temp, d.temp, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Temp")));
             resettable(ui, &mut p.tint, d.tint, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Tint")));
