@@ -33,7 +33,12 @@ pub struct Config {
     /// look of its own. `None` = the built-in default (`looks::DEFAULT_LOOK`);
     /// `Some("None")` = open neutral (linear).
     pub default_look: Option<String>,
+    /// Recently opened photos, newest first (File → Open Recent).
+    pub recent: Vec<PathBuf>,
 }
+
+/// How many files File → Open Recent remembers.
+pub const RECENT_MAX: usize = 10;
 
 /// Redacts the key, so a stray `{:?}` cannot leak it.
 impl std::fmt::Debug for Config {
@@ -46,6 +51,7 @@ impl std::fmt::Debug for Config {
             .field("body_looks", &self.body_looks)
             .field("flat_fields", &self.flat_fields.keys().collect::<Vec<_>>())
             .field("default_look", &self.default_look)
+            .field("recent", &self.recent.len())
             .finish()
     }
 }
@@ -90,6 +96,14 @@ impl Config {
     /// The look a photo from this body starts in, if one is set and still exists.
     pub fn body_look(&self, serial: Option<&str>) -> Option<Look> {
         self.find_look(self.body_looks.get(serial?)?)
+    }
+
+    /// Put `path` at the top of the recent list (once), keeping at most
+    /// [`RECENT_MAX`].
+    pub fn push_recent(&mut self, path: &std::path::Path) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(RECENT_MAX);
     }
 
     /// Name of the look new photos open in.
@@ -330,6 +344,20 @@ mod tests {
         // resolves to something sensible.
         c.default_look = Some("Gone".into());
         assert_eq!(c.default_look().unwrap().name, crate::looks::DEFAULT_LOOK);
+    }
+
+
+    #[test]
+    fn recent_files_are_newest_first_unique_and_capped() {
+        let mut c = Config::default();
+        for i in 0..15 {
+            c.push_recent(std::path::Path::new(&format!("/p/{i}.ARW")));
+        }
+        c.push_recent(std::path::Path::new("/p/7.ARW"));
+        assert_eq!(c.recent.len(), RECENT_MAX);
+        assert_eq!(c.recent[0], PathBuf::from("/p/7.ARW"));
+        assert_eq!(c.recent[1], PathBuf::from("/p/14.ARW"));
+        assert_eq!(c.recent.iter().filter(|p| p.ends_with("7.ARW")).count(), 1);
     }
 
 }

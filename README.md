@@ -109,6 +109,9 @@ Everyday use:
   Sony A7 IV and Panasonic G85 raws (within ~0.1 EV of both from deep shadow
   to highlight), on a 0–1 strength slider. The linear render was ~1 stop
   darker in the mid-tones than either camera's JPEG
+- [x] E1 — ← / → through the folder (one decode at a time, newest request
+  wins), copy/paste edits (Ctrl+C / Ctrl+V, via the system clipboard), Auto
+  exposure (A), Open recent
 - [x] P1b — 28 everyday / film / black-and-white / creative looks in a
   grouped picker and thumbnail grid; raws open in *Everyday — Natural* by
   default (changeable, per body as before); *Reset all* returns to the
@@ -119,6 +122,25 @@ trap in the MHC paper's figure, are worked out in
 [`docs/phase5-6-algorithms.md`](docs/phase5-6-algorithms.md).
 
 ## Controls
+
+**Moving around**: **→** / **←** (or *File → Next / Previous photo*) open
+the next or previous photo in the same folder — raws and TIFFs, alphabetical,
+skipping this editor's own `_edit.tif` exports. Press them as fast as you
+like: one photo decodes at a time and only the latest request is kept. Edits
+save automatically. *File → Open recent* lists the last 10 photos.
+
+**Copy / paste edits**: **Ctrl+C** copies the photo's edits (also *Edit →
+Copy edits*), **Ctrl+V** pastes them onto another photo — everything except
+its crop, rotation and lens flat field. The edits go on the system clipboard
+as text, so they paste between two editor windows too.
+
+**Auto** (**A**, or the button above Exposure): sets exposure so the
+mid-tones sit near mid grey, through whatever look is applied, then backs off
+if that would blow more than 1% of the frame that was not already clipped
+(by up to 1.5 EV). Brightening past +1 EV is only half applied: a median
+cannot tell an underexposed frame from a deliberately dark one (on the test
+frames, ordinary scenes landed within ±0.45 EV with Natural applied, while
+two low-key ones asked for +2). Only exposure changes; Ctrl+Z undoes it.
 
 **Resetting**: every slider gets a small ↺ beside it once it has moved off
 neutral; click it, or double-click the slider, to put that one control back.

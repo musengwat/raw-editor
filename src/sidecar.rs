@@ -59,6 +59,20 @@ pub fn initial(raw: &Path, config: &Config, ids: &CameraIds) -> Result<(AdjustPa
     })
 }
 
+/// Edits as clipboard text (Copy edits): the params, tagged so Paste can tell
+/// them apart from whatever else is on the clipboard.
+pub fn to_clipboard(p: &AdjustParams) -> String {
+    serde_json::json!({ CLIPBOARD_TAG: p }).to_string()
+}
+
+/// Edits back from clipboard text, or `None` if the text is not ours.
+pub fn from_clipboard(text: &str) -> Option<AdjustParams> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    serde_json::from_value(v.get(CLIPBOARD_TAG)?.clone()).ok()
+}
+
+const CLIPBOARD_TAG: &str = "raw_editor_edits";
+
 /// Suffix appended to the *full* raw filename, so `P1320071.rw2` pairs with
 /// `P1320071.rw2.edit.json` (keeping the raw extension visible avoids
 /// collisions between `foo.rw2` and a hypothetical `foo.jpg`).
@@ -244,4 +258,15 @@ mod tests {
         }
         assert_ne!(baseline(&config, &ids, Path::new("P1.ARW")).1, Origin::Neutral);
     }
+
+    #[test]
+    fn edits_round_trip_through_the_clipboard_and_other_text_is_ignored() {
+        let p = AdjustParams { exposure_ev: 0.7, tone_curve: 1.0, hsl: [[0.1, 0.0, -0.2]; 8], ..Default::default() };
+        assert_eq!(from_clipboard(&to_clipboard(&p)), Some(p));
+        assert_eq!(from_clipboard(&format!("  {}\n", to_clipboard(&p))), Some(p), "whitespace is fine");
+        for other in ["", "hello", "{\"exposure_ev\": 1}", "[1,2]", "{\"raw_editor_edits\": 5}"] {
+            assert_eq!(from_clipboard(other), None, "{other:?}");
+        }
+    }
+
 }

@@ -459,3 +459,30 @@ points to within 0.2 EV; redo the measurement before changing the constants.
   for all 42 looks take ~20 ms per refresh on this box.
 - The grey-ramp ordering test skips the IR group: "#16 orange — Aerochrome"
   dips to −0.004 next to black on a grey ramp (meaningless input for it).
+
+## Everyday conveniences (E1)
+
+- **Loading**: `App::start_load` never runs two decodes at once — while one
+  is in flight the request goes to `queued_load` (newest wins) and
+  `poll_loader` starts it when the current one lands, *without* showing the
+  superseded photo. Holding → on 33 MP files would otherwise run several
+  ~1 GB develops at once and could show them out of order. Successful loads
+  go to `Config.recent` (`push_recent`, max 10).
+- **Folder stepping**: `formats::neighbour` (pure, tested; no wrap; copes with
+  the current file having vanished). Arrow keys are ignored while any widget
+  has focus (a focused slider takes arrows) and in crop mode.
+- **Copy/paste**: egui-winit turns *any* Ctrl+C / Ctrl+V (Shift or not) into
+  `Event::Copy` / `Event::Paste(text)` and returns before emitting a key
+  event, so `consume_shortcut` can never see them, and `Paste` only arrives
+  when the system clipboard holds text. Hence: copy writes
+  `sidecar::to_clipboard` JSON (tagged `raw_editor_edits`) with
+  `ctx.copy_text` and keeps `App.copied`; paste parses the event text with
+  `from_clipboard`, falling back to `copied`. `AdjustParams::pasted` keeps the
+  target's crop/rotation/straighten and `flat_field`.
+- **Auto**: `src/auto.rs`, exposure only. Median sRGB-encoded output luma →
+  0.45 by bisection through the full `apply` (so it respects the look), a
+  ≤1% new-clip guard that may pull back ≤1.5 EV (sensor-clipped pixels
+  excluded), and a soft knee halving brightening beyond +1 EV (two low-key
+  G85 frames asked for +2.0/+2.2 EV). 12k samples × 12 bisection steps: ~35
+  ms on the 512 px preview; the first version (40k × 20) took 200–400 ms,
+  a visible stall on click.

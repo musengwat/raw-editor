@@ -33,6 +33,11 @@ const ZOOM_KEY: egui::Key = egui::Key::Z;
 const PICK_WB_KEY: egui::Key = egui::Key::W;
 /// Toggles the clipping overlay.
 const CLIP_KEY: egui::Key = egui::Key::C;
+/// Auto exposure.
+const AUTO_KEY: egui::Key = egui::Key::A;
+/// Previous / next photo in the folder.
+const PREV_KEY: egui::Key = egui::Key::ArrowLeft;
+const NEXT_KEY: egui::Key = egui::Key::ArrowRight;
 
 /// Long side of a look thumbnail, in pixels.
 const THUMB_LONG_SIDE: usize = 120;
@@ -131,6 +136,12 @@ struct App {
     loader_tx: mpsc::Sender<LoadResult>,
     loader_rx: mpsc::Receiver<LoadResult>,
     loading: bool,
+    /// The photo asked for while another was still loading (arrow keys held
+    /// down, say). Only the latest is kept; it starts when the load in
+    /// flight finishes, so at most one decode runs at a time.
+    queued_load: Option<PathBuf>,
+    /// Edits copied with Copy edits, for Edit → Paste edits.
+    copied: Option<AdjustParams>,
 
     export_tx: mpsc::Sender<ExportResult>,
     export_rx: mpsc::Receiver<ExportResult>,
@@ -205,6 +216,8 @@ impl App {
             loader_tx,
             loader_rx,
             loading: false,
+            queued_load: None,
+            copied: None,
             export_tx,
             export_rx,
             exporting: false,
@@ -240,6 +253,13 @@ impl App {
     // --- loading ---------------------------------------------------------
 
     fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.loading {
+            // One decode at a time (a 33 MP raw takes ~1 GB while it
+            // develops); the newest request wins.
+            self.status = format!("Loading… then {}", path.file_name().unwrap_or_default().to_string_lossy());
+            self.queued_load = Some(path);
+            return;
+        }
         // Don't lose pending edits to the file we're leaving.
         self.flush_sidecar();
         self.loading = true;
@@ -260,9 +280,20 @@ impl App {
         });
     }
 
-    fn poll_loader(&mut self) {
+    fn poll_loader(&mut self, ctx: &egui::Context) {
         while let Ok((path, result)) = self.loader_rx.try_recv() {
             self.loading = false;
+            if let Some(next) = self.queued_load.take() {
+                // Superseded while it loaded: skip showing it, load the latest.
+                self.start_load(next, ctx);
+                continue;
+            }
+            if result.is_ok() {
+                self.config.push_recent(&path);
+                if let Err(e) = self.config.save() {
+                    eprintln!("settings: {e:#}");
+                }
+            }
             match result {
                 Ok((img, _)) if let Err(e) = raw_editor::gpu::check_fits(&self.render_state.device, img.width, img.height) => {
                     self.status = format!("Can't open {}: {e:#}", path.display());
@@ -628,6 +659,33 @@ impl App {
                     ui.close();
                     self.pick_and_open(&ctx);
                 }
+                let recent = self.config.recent.clone();
+                ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                    ui.menu_button("Open recent", |ui| {
+                        for path in recent {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                            if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
+                                ui.close();
+                                if path.exists() {
+                                    self.start_load(path, &ctx);
+                                } else {
+                                    self.status = format!("{} is gone (moved or deleted)", path.display());
+                                    self.config.recent.retain(|p| *p != path);
+                                    let _ = self.config.save();
+                                }
+                            }
+                        }
+                    });
+                });
+                let has_current = self.current.is_some();
+                if ui.add_enabled(has_current, egui::Button::new("Next photo").shortcut_text("→")).clicked() {
+                    ui.close();
+                    self.step_photo(&ctx, 1);
+                }
+                if ui.add_enabled(has_current, egui::Button::new("Previous photo").shortcut_text("←")).clicked() {
+                    ui.close();
+                    self.step_photo(&ctx, -1);
+                }
                 ui.separator();
                 let has_image = self.image.is_some() && !self.exporting;
                 for format in [ExportFormat::Jpeg, ExportFormat::Tiff16] {
@@ -668,6 +726,28 @@ impl App {
                 }
                 if ui.add_enabled(self.history.can_redo(p), egui::Button::new("Redo").shortcut_text(redo)).clicked() {
                     self.redo();
+                    ui.close();
+                }
+                ui.separator();
+                let has_image = self.image.is_some();
+                let copy = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C));
+                let paste = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V));
+                if ui.add_enabled(has_image, egui::Button::new("Copy edits").shortcut_text(copy)).clicked() {
+                    self.copy_edits(&ctx);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_image && self.copied.is_some(), egui::Button::new("Paste edits").shortcut_text(paste))
+                    .on_hover_text("Everything except crop, rotation and the lens flat field")
+                    .clicked()
+                {
+                    if let Some(p) = self.copied {
+                        self.paste_edits(p);
+                    }
+                    ui.close();
+                }
+                if ui.add_enabled(has_image, egui::Button::new("Auto exposure").shortcut_text(AUTO_KEY.name())).clicked() {
+                    self.auto_exposure();
                     ui.close();
                 }
                 ui.separator();
@@ -732,6 +812,7 @@ impl App {
         }
 
         let mut reset = false;
+        let mut auto = false;
         let mut do_export = false;
         let has_image = self.image.is_some();
         let exporting = self.exporting;
@@ -967,6 +1048,12 @@ impl App {
 
             ui.add_space(10.0);
             header(ui, "Basic", Section::Basic, p);
+            ui.horizontal(|ui| {
+                auto = ui
+                    .add_enabled(has_image, egui::Button::new(format!("Auto ({})", AUTO_KEY.name())))
+                    .on_hover_text("Set exposure from the photo: mid-tones to about mid grey, without blowing more highlights. Dark, moody scenes may come out brighter than you want — Ctrl+Z undoes it")
+                    .clicked();
+            });
             resettable(ui, &mut p.exposure_ev, d.exposure_ev, |ui, v| ui.add(egui::Slider::new(v, -5.0..=5.0).text("Exposure (EV)")));
             resettable(ui, &mut p.tone_curve, d.tone_curve, |ui, v| {
                 ui.add(egui::Slider::new(v, 0.0..=1.0).text("Tone curve")).on_hover_text(
@@ -1176,6 +1263,9 @@ impl App {
             ui.add_space(8.0);
         });
 
+        if auto {
+            self.auto_exposure();
+        }
         if reset {
             self.params = self.baseline;
         } else if let Some(section) = reset_section {
@@ -1233,6 +1323,51 @@ impl App {
         if let Err(e) = self.config.save() {
             self.status = format!("Couldn't save settings: {e:#}");
         }
+    }
+
+    /// Open the photo `step` places from the current one in its folder (the
+    /// one already queued, if keys are pressed faster than photos load).
+    fn step_photo(&mut self, ctx: &egui::Context, step: isize) {
+        let Some(from) = self.queued_load.clone().or_else(|| self.current.clone()) else { return };
+        let Some(dir) = from.parent() else { return };
+        let list = match raw_editor::formats::photos_in(dir) {
+            Ok(list) => list,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e:#}", dir.display());
+                return;
+            }
+        };
+        match raw_editor::formats::neighbour(&list, &from, step) {
+            Some(next) => self.start_load(next, ctx),
+            None => self.status = format!("No {} photo in this folder", if step > 0 { "next" } else { "previous" }),
+        }
+    }
+
+    /// Copy edits: kept for Edit → Paste edits and put on the system
+    /// clipboard, so Ctrl+V pastes them here or in another window.
+    fn copy_edits(&mut self, ctx: &egui::Context) {
+        if self.image.is_none() {
+            return;
+        }
+        self.copied = Some(self.params);
+        ctx.copy_text(sidecar::to_clipboard(&self.params));
+        self.status = "Edits copied — open another photo and paste (Ctrl+V)".into();
+    }
+
+    /// Paste edits onto the open photo, keeping its own crop and rotation.
+    fn paste_edits(&mut self, from: AdjustParams) {
+        if self.image.is_none() {
+            return;
+        }
+        self.params = self.params.pasted(&from);
+        self.status = "Edits pasted (crop and rotation kept)".into();
+    }
+
+    fn auto_exposure(&mut self) {
+        let Some(preview) = &self.preview else { return };
+        let before = self.params.exposure_ev;
+        self.params = raw_editor::auto::auto_exposure(preview, &self.params);
+        self.status = format!("Auto exposure: {:+.2} EV (was {before:+.2})", self.params.exposure_ev);
     }
 
     /// Recompute what the open photo starts with after a settings change
@@ -1533,7 +1668,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_loader();
+        self.poll_loader(ui.ctx());
         self.poll_ping();
         self.poll_export();
 
@@ -1549,6 +1684,44 @@ impl eframe::App for App {
             } else if undo {
                 self.undo();
             }
+        }
+
+        // Copy / paste edits ride on the clipboard events egui makes of
+        // Ctrl+C / Ctrl+V (with or without Shift) — they never arrive as key
+        // presses. A focused text field keeps them for itself.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let (copy, paste) = ui.ctx().input(|i| {
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                let paste = i.events.iter().find_map(|e| match e {
+                    egui::Event::Paste(text) => Some(text.clone()),
+                    _ => None,
+                });
+                (copy, paste)
+            });
+            if copy {
+                self.copy_edits(ui.ctx());
+            }
+            if let Some(text) = paste {
+                // Not ours (someone copied other text since): fall back to
+                // what this window copied, if anything.
+                if let Some(p) = sidecar::from_clipboard(&text).or(self.copied) {
+                    self.paste_edits(p);
+                }
+            }
+        }
+
+        // Arrow keys step through the folder — unless a widget (a slider
+        // being nudged, say) has keyboard focus.
+        let nothing_focused = ui.ctx().memory(|m| m.focused().is_none());
+        if nothing_focused && !self.cropping {
+            if shortcut(ui.ctx(), NEXT_KEY, false) {
+                self.step_photo(&ui.ctx().clone(), 1);
+            } else if shortcut(ui.ctx(), PREV_KEY, false) {
+                self.step_photo(&ui.ctx().clone(), -1);
+            }
+        }
+        if shortcut(ui.ctx(), AUTO_KEY, false) && self.image.is_some() {
+            self.auto_exposure();
         }
 
         // Z flips between fit and 1:1.

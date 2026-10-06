@@ -65,6 +65,19 @@ pub fn photos_in(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// The photo `step` places after (or, negative, before) `current` in
+/// `list`, without wrapping round. A `current` missing from the list (just
+/// deleted, say) steps from where it would sort.
+pub fn neighbour(list: &[PathBuf], current: &Path, step: isize) -> Option<PathBuf> {
+    let at = match list.binary_search_by(|p| p.as_path().cmp(current)) {
+        Ok(i) => i as isize,
+        // Not in the list: "next" is the one at the insertion point.
+        Err(i) => i as isize - (step > 0) as isize,
+    };
+    let j = at + step;
+    (0..list.len() as isize).contains(&j).then(|| list[j as usize].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,4 +121,19 @@ mod tests {
         let e = dialog_extensions();
         assert!(e.contains(&"arw".to_string()) && e.contains(&"ARW".to_string()));
     }
+
+    #[test]
+    fn neighbour_steps_without_wrapping() {
+        let list: Vec<PathBuf> = ["/p/a.ARW", "/p/b.rw2", "/p/c.tif"].iter().map(PathBuf::from).collect();
+        let b = Path::new("/p/b.rw2");
+        assert_eq!(neighbour(&list, b, 1), Some(PathBuf::from("/p/c.tif")));
+        assert_eq!(neighbour(&list, b, -1), Some(PathBuf::from("/p/a.ARW")));
+        assert_eq!(neighbour(&list, Path::new("/p/c.tif"), 1), None, "no wrap at the end");
+        assert_eq!(neighbour(&list, Path::new("/p/a.ARW"), -1), None, "no wrap at the start");
+        // The current file vanished from the folder: still step sensibly.
+        assert_eq!(neighbour(&list, Path::new("/p/bb.rw2"), 1), Some(PathBuf::from("/p/c.tif")));
+        assert_eq!(neighbour(&list, Path::new("/p/bb.rw2"), -1), Some(PathBuf::from("/p/b.rw2")));
+        assert_eq!(neighbour(&[], b, 1), None);
+    }
+
 }

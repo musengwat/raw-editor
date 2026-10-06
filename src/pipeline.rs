@@ -206,6 +206,19 @@ impl AdjustParams {
         *self == Self::default()
     }
 
+    /// Another photo's edits pasted onto this one: everything except the
+    /// framing (crop, rotation, straighten — every photo is framed on its
+    /// own) and the flat field switch (that follows this photo's lens).
+    pub fn pasted(&self, src: &AdjustParams) -> AdjustParams {
+        AdjustParams {
+            rotation: self.rotation,
+            straighten: self.straighten,
+            crop: self.crop,
+            flat_field: self.flat_field,
+            ..*src
+        }
+    }
+
     /// Put one panel section's controls back to neutral, leaving the rest.
     pub fn reset_section(&mut self, section: Section) {
         let d = Self::default();
@@ -1360,6 +1373,17 @@ mod tests {
         assert!(filmic(2.0) / filmic(1.0) < 1.15);
         let half = apply(&AdjustParams { tone_curve: 0.5, ..Default::default() }, [0.12; 3])[0];
         assert!((half - (0.12 + filmic(0.12)) / 2.0).abs() < 1e-4, "{half}");
+    }
+
+
+    #[test]
+    fn pasting_edits_keeps_the_target_framing_and_flat_field() {
+        let src = all_moved();
+        let dst = AdjustParams { rotation: 2, straighten: -1.0, crop: [0.2, 0.0, 1.0, 1.0], flat_field: false, ..Default::default() };
+        let out = dst.pasted(&src);
+        assert_eq!((out.rotation, out.straighten, out.crop, out.flat_field), (2, -1.0, [0.2, 0.0, 1.0, 1.0], false));
+        let strip = |p: AdjustParams| AdjustParams { rotation: 0, straighten: 0.0, crop: [0.0, 0.0, 1.0, 1.0], flat_field: false, ..p };
+        assert_eq!(strip(out), strip(src), "everything else comes across");
     }
 
 }
