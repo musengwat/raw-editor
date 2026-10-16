@@ -387,9 +387,13 @@ network; keep it that way.
 Every push to `master` builds the executable on a Windows runner
 (`.github/workflows/windows.yml`) and attaches `raw-editor-windows-x86_64.zip`
 to the run (uploaded with `archive: false`, so it is one zip, not a zip in a
-zip). Pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`) also
-publishes the Windows and macOS zips to a **GitHub Release** — the easiest
-place to download from. Unzip, double-click. It is portable: no installer, no
+zip). Once the tests pass, every push to `master` also publishes the Windows
+and macOS zips to a **GitHub Release** named `build-YYYYMMDD-<sha>` and marked
+*Latest*, so the Releases page always has the newest build — the easiest
+place to download from. Only the ten newest `build-*` releases are kept.
+Pushing a version tag (`git tag v0.3.0 && git push origin v0.3.0`) still cuts a
+named release, which is never pruned. `packaging/publish-release.sh` does the
+publishing for both workflows. Unzip, double-click. It is portable: no installer, no
 runtime to install, and wgpu picks DX12 on Windows. `workflow_dispatch` lets
 you trigger a build by hand.
 

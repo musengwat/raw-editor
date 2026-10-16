@@ -486,3 +486,12 @@ points to within 0.2 EV; redo the measurement before changing the constants.
   G85 frames asked for +2.0/+2.2 EV). 12k samples × 12 bisection steps: ~35
   ms on the 512 px preview; the first version (40k × 20) took 200–400 ms,
   a visible stall on click.
+
+## Releases
+
+Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release
+(marked Latest; ten newest kept) and every `v*` tag a named one, both through
+`packaging/publish-release.sh`, which both platform workflows call after their
+tests pass. The tag is derived from the commit, not the run, so the two
+workflows land on the same release. v0.2.1 predated Sony support — a user on
+an old download reported ARWs "not editable" — so keep releases flowing.

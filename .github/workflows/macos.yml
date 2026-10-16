@@ -9,7 +9,8 @@ name: macos
 on:
   push:
     branches: [master]
-    # A version tag (v0.2.0) also publishes the build to a GitHub Release.
+    # A version tag (v0.2.0) publishes to that tag's Release; a push to
+    # master publishes a build-* Release (see packaging/publish-release.sh).
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -17,7 +18,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# contents: write lets the tag build publish a GitHub Release.
+# contents: write lets master and tag builds publish a GitHub Release.
 permissions:
   contents: write
 
@@ -58,19 +59,10 @@ jobs:
           archive: false
           if-no-files-found: error
 
-      # Both platform workflows attach to the same release, so whichever
-      # finishes first creates it and the other one just uploads.
+      # Every master push and v* tag publishes to a Release; PRs and manual
+      # runs only upload the artifact above.
       - name: Publish to release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "raw-editor $TAG" --generate-notes \
-            || true
-          for i in 1 2 3 4 5; do
-            gh release upload "$TAG" "dist/raw-editor-macos-universal.zip" --clobber && exit 0
-            sleep 5
-          done
-          exit 1
+        run: bash packaging/publish-release.sh "dist/raw-editor-macos-universal.zip"
