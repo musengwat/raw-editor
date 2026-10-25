@@ -18,6 +18,7 @@ use raw_editor::pipeline::{
     WB_GAIN_MIN, straighten_crop,
 };
 use raw_editor::config::Config;
+use raw_editor::hdr::{self, MergeReport, Style};
 use raw_editor::history::History;
 use raw_editor::immich;
 use raw_editor::looks::{Look, LookGroup};
@@ -79,7 +80,9 @@ fn main() -> eframe::Result {
     )
 }
 
-type LoadResult = (PathBuf, anyhow::Result<(DevelopedImage, CameraIds)>);
+/// A loaded photo: the image, its camera, and the bracketed set it belongs
+/// to (if any).
+type LoadResult = (PathBuf, anyhow::Result<(DevelopedImage, CameraIds, Option<Vec<PathBuf>>)>);
 /// Messages from an export or batch-export worker.
 enum ExportMsg {
     /// A single-file export finished, with an optional upload note.
@@ -88,6 +91,12 @@ enum ExportMsg {
     Progress { done: usize, total: usize, name: String },
     /// A batch finished.
     BatchDone { ok: usize, failed: usize, dir: PathBuf },
+    /// What an HDR merge is doing now.
+    HdrStep(String),
+    /// A single HDR merge finished; on success the result is opened.
+    HdrDone(anyhow::Result<(PathBuf, MergeReport)>),
+    /// Merging every set in a folder finished.
+    HdrBatchDone { ok: usize, failed: usize },
 }
 type ExportResult = ExportMsg;
 
@@ -184,6 +193,11 @@ struct App {
     /// Result of the last "Test connection", shown in the settings dialog.
     ping_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
     ping_status: String,
+    /// The exposure-bracketed set the open photo belongs to, found when it
+    /// loads (`bracket::set_containing`).
+    bracket: Option<Vec<PathBuf>>,
+    /// Look the next HDR merge gets.
+    hdr_style: Style,
 }
 
 impl App {
@@ -243,6 +257,8 @@ impl App {
             crop_drag: None,
             ping_rx: None,
             ping_status: String::new(),
+            bracket: None,
+            hdr_style: Style::default(),
         };
         if let Some(p) = path {
             app.start_load(p, &cc.egui_ctx);
@@ -273,7 +289,12 @@ impl App {
                         eprintln!("camera ids: {e:#}");
                         CameraIds::default()
                     });
-                    (img, ids)
+                    // Metadata only, a few ms per neighbour.
+                    let bracket = path
+                        .parent()
+                        .and_then(|dir| raw_editor::formats::photos_in(dir).ok())
+                        .and_then(|list| raw_editor::bracket::set_containing(&list, &path));
+                    (img, ids, bracket)
                 });
             let _ = tx.send((path, result));
             ctx.request_repaint();
@@ -295,10 +316,11 @@ impl App {
                 }
             }
             match result {
-                Ok((img, _)) if let Err(e) = raw_editor::gpu::check_fits(&self.render_state.device, img.width, img.height) => {
+                Ok((img, _, _)) if let Err(e) = raw_editor::gpu::check_fits(&self.render_state.device, img.width, img.height) => {
                     self.status = format!("Can't open {}: {e:#}", path.display());
                 }
-                Ok((mut img, camera)) => {
+                Ok((mut img, camera, bracket)) => {
+                    self.bracket = bracket;
                     img.flat = self.config.flat_for(camera.lens.as_deref());
                     let mut renderer = self.render_state.renderer.write();
                     if let Some(r) = renderer.callback_resources.get_mut::<ImageRenderer>() {
@@ -442,7 +464,7 @@ impl App {
         });
     }
 
-    fn poll_export(&mut self) {
+    fn poll_export(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.export_rx.try_recv() {
             match msg {
                 ExportMsg::Done(result) => {
@@ -455,6 +477,32 @@ impl App {
                 }
                 ExportMsg::Progress { done, total, name } => {
                     self.status = format!("Exporting {done}/{total}: {name}");
+                }
+                ExportMsg::HdrStep(step) => self.status = step,
+                ExportMsg::HdrDone(result) => {
+                    self.exporting = false;
+                    match result {
+                        Ok((path, report)) => {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                            let moved = report.ghosted.iter().cloned().fold(0.0, f32::max);
+                            self.start_load(path, ctx);
+                            // Shown once the merge has loaded.
+                            self.status = format!(
+                                "Merged {name}: +{:.1} stops of range{} — opening…",
+                                report.extra_stops,
+                                if moved > 0.02 { format!(", movement fixed in {:.0}% of the frame", moved * 100.0) } else { String::new() }
+                            );
+                        }
+                        Err(e) => self.status = format!("HDR merge failed: {e:#}"),
+                    }
+                }
+                ExportMsg::HdrBatchDone { ok, failed } => {
+                    self.exporting = false;
+                    self.status = if failed == 0 {
+                        format!("Merged {ok} bracketed sets to HDR")
+                    } else {
+                        format!("Merged {ok} bracketed sets, {failed} failed")
+                    };
                 }
                 ExportMsg::BatchDone { ok, failed, dir } => {
                     self.exporting = false;
@@ -509,6 +557,112 @@ impl App {
             let _ = tx.send(ExportMsg::BatchDone { ok, failed, dir: out_dir });
             ctx.request_repaint();
         });
+    }
+
+    /// Merge one bracketed set in the background, then open the result.
+    fn start_hdr_merge(&mut self, ctx: &egui::Context, set: Vec<PathBuf>) {
+        self.flush_sidecar();
+        let style = self.hdr_style;
+        let tx = self.export_tx.clone();
+        let ctx = ctx.clone();
+        self.exporting = true;
+        self.status = format!("Merging {} frames to HDR…", set.len());
+        std::thread::spawn(move || {
+            let n = set.len();
+            let progress = |step: &str| {
+                let _ = tx.send(ExportMsg::HdrStep(format!("HDR merge of {n} frames: {step}…")));
+                ctx.request_repaint();
+            };
+            let result = hdr::merge_files(&set, style, None, &progress);
+            let _ = tx.send(ExportMsg::HdrDone(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Find every bracketed set in a folder and merge each one, one at a
+    /// time (each takes ~1.5 GB while it runs).
+    fn pick_and_merge_folder(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new().set_title("Merge every bracketed set in…");
+        if let Some(dir) = self.current.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(dir) = dialog.pick_folder() else { return };
+        let list = match raw_editor::formats::photos_in(&dir) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e:#}", dir.display());
+                return;
+            }
+        };
+        let sets = raw_editor::bracket::sets_in(&list);
+        if sets.is_empty() {
+            self.status = format!("No bracketed sets in {}", dir.display());
+            return;
+        }
+        let style = self.hdr_style;
+        let tx = self.export_tx.clone();
+        let ctx = ctx.clone();
+        self.exporting = true;
+        self.status = format!("Merging {} bracketed sets…", sets.len());
+        std::thread::spawn(move || {
+            let total = sets.len();
+            let (mut ok, mut failed) = (0, 0);
+            for (i, set) in sets.iter().enumerate() {
+                let name = set[0].file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let progress = |step: &str| {
+                    let _ = tx.send(ExportMsg::HdrStep(format!("HDR {}/{total} ({name}): {step}…", i + 1)));
+                    ctx.request_repaint();
+                };
+                match hdr::merge_files(set, style, None, &progress) {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        eprintln!("hdr: {name} failed: {e:#}");
+                        failed += 1;
+                    }
+                }
+            }
+            let _ = tx.send(ExportMsg::HdrBatchDone { ok, failed });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The side panel's HDR box, shown when the open photo is one frame of
+    /// a bracketed set.
+    fn bracket_box(&mut self, ui: &mut egui::Ui) {
+        let Some(set) = self.bracket.clone() else { return };
+        let ctx = ui.ctx().clone();
+        let stem = |p: &PathBuf| p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let merged = hdr::output_path(&set);
+        ui.group(|ui| {
+            ui.strong(format!("Bracketed set · {} frames", set.len()));
+            ui.label(format!("{} – {}", stem(&set[0]), stem(&set[set.len() - 1])))
+                .on_hover_text(set.iter().map(stem).collect::<Vec<_>>().join(", "));
+            ui.horizontal(|ui| {
+                ui.label("Style");
+                egui::ComboBox::from_id_salt("hdr_style").selected_text(self.hdr_style.label()).show_ui(ui, |ui| {
+                    for st in Style::ALL {
+                        ui.selectable_value(&mut self.hdr_style, st, st.label());
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                let label = if merged.exists() { "Merge again" } else { "Merge to HDR" };
+                if ui
+                    .add_enabled(!self.exporting, egui::Button::new(label))
+                    .on_hover_text(format!(
+                        "Aligns the frames, removes anything that moved, merges them and tone maps the result into {}",
+                        merged.file_name().unwrap_or_default().to_string_lossy()
+                    ))
+                    .clicked()
+                {
+                    self.start_hdr_merge(&ctx, set.clone());
+                }
+                if merged.exists() && ui.button("Open HDR").clicked() {
+                    self.start_load(merged.clone(), &ctx);
+                }
+            });
+        });
+        ui.add_space(8.0);
     }
 
     /// Non-blocking result of the settings dialog's connection test.
@@ -704,6 +858,18 @@ impl App {
                     self.pick_and_batch_export(&ctx);
                 }
                 ui.separator();
+                let set = self.bracket.clone();
+                if ui.add_enabled(set.is_some() && !self.exporting, egui::Button::new("Merge bracketed set to HDR")).clicked() {
+                    ui.close();
+                    if let Some(set) = set {
+                        self.start_hdr_merge(&ctx, set);
+                    }
+                }
+                if ui.add_enabled(!self.exporting, egui::Button::new("Merge all brackets in folder…")).clicked() {
+                    ui.close();
+                    self.pick_and_merge_folder(&ctx);
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -795,6 +961,7 @@ impl App {
         self.update_thumbs(ui.ctx());
         ui.heading("Adjust");
         ui.add_space(6.0);
+        self.bracket_box(ui);
 
         // Histogram of the output as it looks now; recomputed only when the
         // params have changed (a few ms on the 1/8-scale copy).
@@ -1670,7 +1837,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_loader(ui.ctx());
         self.poll_ping();
-        self.poll_export();
+        self.poll_export(ui.ctx());
 
         // Leave Ctrl+Z alone while a text field has focus: it has its own undo.
         if !ui.ctx().egui_wants_keyboard_input() {

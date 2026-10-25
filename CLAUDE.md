@@ -487,6 +487,48 @@ points to within 0.2 EV; redo the measurement before changing the constants.
   ms on the 512 px preview; the first version (40k × 20) took 200–400 ms,
   a visible stall on click.
 
+## HDR from brackets (H1)
+
+`src/bracket.rs` finds sets, `src/hdr.rs` merges and tone maps,
+`src/bin/hdr.rs` is the CLI, `App::bracket_box` / `start_hdr_merge` /
+`pick_and_merge_folder` the GUI. The merge is CPU-only and produces a file;
+it adds nothing to the shader or `AdjustParams`, so no parity tests apply.
+
+- **Detection** needs `ExportMetadata.sub_sec_time_original` (added for
+  this). Sony keeps "Exposure Bracketing" in its maker note, which rawler
+  does not expose; timing + exposure spread is the camera-agnostic signal.
+  Thomas's real sets are in `testdata/hdr` (copied from Immich,
+  2026-10-20/22/24); several have repeated exposures (ISO 100 floor) and
+  `DSC01350–54` is a 2-frame set 1.36 s before a 3-frame one.
+- **Alignment**: MTB at a *shared percentile*, not always the median — a
+  +2 EV frame can be >50% clipped and its median bitmap is blank (the
+  synthetic test failed exactly that way). Translation-only left visible
+  seams in the corners of handheld 33 MP frames, hence the tiled affine fit
+  (`align_warp`, outlier tiles dropped, |m − I| ≤ 0.03 else fall back).
+  Synthetic test scenes must be non-periodic (value noise): a sine pattern
+  gave MTB a wrong-but-consistent answer.
+- **Weights**: brighter frames ×(1/scale), faded out over max channel
+  0.75–0.95, zero where clipped; non-reference frames feathered over 64 px at
+  their own edges (a frame shifted 70 px otherwise leaves a seam where it
+  runs out); darkest frame is the fallback.
+- **Ghosts**: per 16 px block, |log2 ratio| 0.3–0.6 stops → exclusion, dilated
+  3 blocks, blurred, then `smoothstep(0, 0.5)` — the core must reach 1
+  because a +2 EV frame outweighs the reference 4×.
+- **Tone map** (`local_tone_map`): fast guided filter at ¼ res. Base curve is
+  `d / (1 + k·d)` toe/shoulder around the median (slope 1 at mid-tones —
+  the first, linear squeeze dimmed white walls and looked worse than the
+  single frame). Detail split into clarity (base→fine layer, boosted) and
+  texture (fine→pixel, kept at 1 so ISO 12800 grain is not amplified).
+  `soft_limit` keeps everything ≤ 1 so the 16-bit sRGB TIFF never clips.
+- **Output** is `<first>_hdr.tif`; `formats::is_hdr_merge` makes
+  `sidecar::baseline` open it in the default look (other TIFFs stay
+  neutral). Pixels are *not* turned upright; the camera's Orientation tag
+  is copied so `develop_file` turns them on open.
+- Tuning method: `target/release/hdr testdata/hdr --out <scratch>`, then
+  `target/release/export <scratch> jpg --out <view>` (XDG_CONFIG_HOME at a
+  scratch dir) and side-by-side sheets vs the reference frame's own export,
+  plus 100% corner crops for alignment.
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

@@ -27,12 +27,13 @@ pub enum Origin {
 /// lens has one: the look assigned to its camera body, else the default look
 /// (`Config::default_look`, normally "Everyday — Natural"), else neutral.
 /// TIFFs always start neutral — they are finished images, and a tone curve
-/// on top of one would apply a second curve. Also the baseline the GUI
+/// on top of one would apply a second curve — except this editor's own HDR
+/// merges, which have no curve yet and start like a raw. Also the baseline the GUI
 /// compares against to decide whether a sidecar is needed, and what "Reset
 /// all" returns to.
 pub fn baseline(config: &Config, ids: &CameraIds, photo: &Path) -> (AdjustParams, Origin) {
     let mut p = AdjustParams::default();
-    if crate::formats::is_tiff(photo) {
+    if crate::formats::is_tiff(photo) && !crate::formats::is_hdr_merge(photo) {
         return (p, Origin::Neutral);
     }
     p.flat_field = config.flat_for(ids.lens.as_deref()).is_some();
@@ -257,6 +258,13 @@ mod tests {
             assert_eq!(baseline(&config, &ids, Path::new(name)), (AdjustParams::default(), Origin::Neutral), "{name}");
         }
         assert_ne!(baseline(&config, &ids, Path::new("P1.ARW")).1, Origin::Neutral);
+    }
+
+    #[test]
+    fn hdr_merges_start_in_the_default_look() {
+        let ids = CameraIds::default();
+        let (_, origin) = baseline(&Config::default(), &ids, Path::new("DSC01195_hdr.tif"));
+        assert_eq!(origin, Origin::DefaultLook(crate::looks::DEFAULT_LOOK.into()));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod auto;
+pub mod bracket;
 pub mod config;
 pub mod detail;
 pub mod develop;
@@ -6,6 +7,7 @@ pub mod export;
 pub mod flatfield;
 pub mod formats;
 pub mod gpu;
+pub mod hdr;
 pub mod histogram;
 pub mod history;
 pub mod immich;

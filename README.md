@@ -116,6 +116,11 @@ Everyday use:
   grouped picker and thumbnail grid; raws open in *Everyday — Natural* by
   default (changeable, per body as before); *Reset all* returns to the
   starting look, *Reset to neutral* clears everything
+- [x] H1 — **HDR from exposure brackets**: opening any frame of a bracketed
+  set shows a *Bracketed set* box with *Merge to HDR* (styles Natural / HDR /
+  Dramatic); File → *Merge all brackets in folder…*; `hdr` CLI. Sets are
+  found automatically, frames aligned (shift + rotation), ghosts removed,
+  merged and tone mapped into `<first frame>_hdr.tif`, which opens like a raw
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -356,6 +361,36 @@ rather than bolted on afterwards.
 Because the developed image is uploaded as `rgba16float`, half-float is the
 pipeline's precision floor; the 16-bit TIFF removes 8-bit banding but is not 16
 *significant* bits end to end.
+
+## HDR merging
+
+Shoot an exposure bracket (any count from 2 to 9; tested on the A7 IV's
+3-frame 0 / −2 / +2 EV), open any one of its frames, and click *Merge to
+HDR* in the side panel. Everything else is automatic:
+
+- **Finding the set** (`src/bracket.rs`): consecutive raws from the same
+  camera, each fired within 0.5 s (plus the shutter time) of the previous
+  one by their sub-second EXIF timestamps, spanning at least 0.5 EV. Equal
+  exposures are allowed inside a set — in auto ISO a 0 EV frame already at
+  ISO 100 gives a −2 EV frame that is identical.
+- **Merging** (`src/hdr.rs`): the middle exposure is the reference.
+  Frames are aligned with median-threshold bitmaps (exposure-independent): a
+  global shift, then a 4×4 grid of tiles and a least-squares affine fit, so
+  handheld rotation is corrected too. Exposure ratios start from EXIF and are
+  measured from the pixels. Per pixel, brighter frames weigh more until they
+  near clipping; a frame that disagrees with the reference beyond noise
+  (something moved) is left out there.
+- **Tone mapping**: a guided filter on log luminance splits base / clarity /
+  texture. The base is brought into range with a toe and shoulder (mid-tones
+  untouched in *Natural*, set to mid grey in *HDR* / *Dramatic*), clarity is
+  boosted per style, texture (and noise) is kept as is.
+- **Output**: `<first frame>_hdr.tif`, a 16-bit sRGB TIFF with the reference
+  frame's EXIF, next to the raws. It opens in the default look, like a raw,
+  and edits as usual. A 33 MP set takes ~11 s and ~2 GB of RAM.
+
+From the command line: `hdr <folder>` merges every set in a folder;
+`hdr a.arw b.arw c.arw` merges those frames; `--style natural|hdr|dramatic`,
+`--out DIR`.
 
 ## Uploading to Immich
 

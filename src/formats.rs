@@ -38,6 +38,13 @@ pub fn is_own_export(path: &Path) -> bool {
     is_tiff(path) && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("_edit"))
 }
 
+/// An HDR merge written by this editor (`<name>_hdr.tif`, see
+/// `hdr::output_path`). Unlike other TIFFs it is opened like a raw, in the
+/// default look: the merge is tone mapped but has no tone curve yet.
+pub fn is_hdr_merge(path: &Path) -> bool {
+    is_tiff(path) && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("_hdr"))
+}
+
 /// Extensions for a file dialog filter, lower and upper case (GTK's filter is
 /// case-sensitive).
 pub fn dialog_extensions() -> Vec<String> {
@@ -114,6 +121,8 @@ mod tests {
         assert!(is_tiff(Path::new("scan.tiff")) && is_supported(Path::new("scan.TIF")));
         assert!(is_raw(Path::new("x.dng")) && !is_tiff(Path::new("x.dng")));
         assert!(is_own_export(Path::new("P1_edit.tif")) && !is_own_export(Path::new("P1_edit.jpg")));
+        assert!(is_hdr_merge(Path::new("DSC01195_hdr.tif")) && !is_own_export(Path::new("DSC01195_hdr.tif")));
+        assert!(!is_hdr_merge(Path::new("DSC01195_hdr.arw")) && !is_hdr_merge(Path::new("scan.tif")));
     }
 
     #[test]

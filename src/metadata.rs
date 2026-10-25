@@ -28,6 +28,10 @@ pub struct ExportMetadata {
     pub lens_make: Option<String>,
     pub lens_model: Option<String>,
     pub date_time_original: Option<String>,
+    /// Fraction of a second for `date_time_original`, as the digits the
+    /// camera wrote ("844" = 0.844 s). Bracket detection needs it: a burst's
+    /// frames are ~170 ms apart, inside one whole second.
+    pub sub_sec_time_original: Option<String>,
     pub exposure_time: Option<(u32, u32)>,
     pub fnumber: Option<(u32, u32)>,
     pub focal_length: Option<(u32, u32)>,
@@ -57,6 +61,7 @@ fn read_tiff(path: &Path) -> Result<ExportMetadata> {
             ExifTag::LensMake(v) => m.lens_make = non_empty(v),
             ExifTag::LensModel(v) => m.lens_model = non_empty(v),
             ExifTag::DateTimeOriginal(v) => m.date_time_original = non_empty(v),
+            ExifTag::SubSecTimeOriginal(v) => m.sub_sec_time_original = non_empty(v),
             ExifTag::ExposureTime(v) => m.exposure_time = rat(v),
             ExifTag::FNumber(v) => m.fnumber = rat(v),
             ExifTag::FocalLength(v) => m.focal_length = rat(v),
@@ -145,6 +150,7 @@ pub fn read(path: &Path) -> Result<ExportMetadata> {
         lens_make: meta.lens.as_ref().and_then(|l| non_empty(&l.lens_make)),
         lens_model: meta.lens.as_ref().and_then(|l| non_empty(&l.lens_model)),
         date_time_original: e.date_time_original.as_deref().and_then(non_empty),
+        sub_sec_time_original: e.sub_sec_time_original.as_deref().and_then(non_empty),
         exposure_time: e.exposure_time.as_ref().map(rat),
         fnumber: e.fnumber.as_ref().map(rat),
         focal_length: e.focal_length.as_ref().map(rat),
