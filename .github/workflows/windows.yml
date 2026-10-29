@@ -18,9 +18,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# contents: write lets master and tag builds publish a GitHub Release.
+# contents: write lets master and tag builds publish a GitHub Release;
+# actions: write lets a run delete the artifacts older runs left behind.
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -56,6 +58,23 @@ jobs:
           path: raw-editor-windows-x86_64.zip
           archive: false
           if-no-files-found: error
+
+      # Keep only the newest build: delete copies of this artifact uploaded by
+      # earlier runs, so old zips don't sit in Actions storage for 90 days.
+      # Run IDs only increase, so a slow older run never deletes a newer zip.
+      - name: Delete older artifacts
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: raw-editor-windows-x86_64.zip
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME&per_page=100" \
+            -q ".artifacts[] | select(.workflow_run.id < $GITHUB_RUN_ID) | .id")
+          for id in $ids; do
+            echo "Deleting artifact $id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+          done
 
       # Every master push and v* tag publishes to a Release; PRs and manual
       # runs only upload the artifact above.
