@@ -736,6 +736,28 @@ detail stage, before exposure. Shader twin: `local_gain`, binding 4
   median for that reason.
 - Uniforms are 2048 bytes.
 
+## Colour grading (T4)
+
+`pipeline::grade` / shader `grade`, step 3d (after the point curves, before
+lift/gamma/gain). `AdjustParams.grade_{shadows,midtones,highlights}` are RGB
+triples around 0 exactly as `widgets::ColorWheel` writes them (mean =
+master, remainder = chroma), plus `grade_blending` and `grade_balance`.
+
+- `grade_weights(d, blending, balance)` on display-domain luminance
+  (`MASK_GAMMA`): shadows `1 − smoothstep(0, 0.25 + b/2)`, highlights
+  `smoothstep(0.75 − b/2, 1)`, mid-tones the rest; they always sum to 1.
+  Balance is an exponent on `d` (`2^−balance`, precomputed into
+  `grade_info.y`).
+- The blended triple's chroma multiplies the pixel (so black stays black),
+  the result is rescaled to the original luminance, then the master applies
+  as `2^(master · GRADE_LUM_EV)`. The wheel's chroma sums to zero but is
+  *not* luminance-neutral (a blue tint darkens), hence the rescale.
+- Uniforms are 2112 bytes (`grade_s`, `grade_m`, `grade_h`, `grade_info`).
+- GUI: `Section::Grading`; the lift/gamma/gain wheels (`Section::Wheels`)
+  are unchanged in the pipeline and sit in a `CollapsingHeader` with a dot
+  when non-neutral — they still apply when collapsed, so the dot matters.
+- Tests: `grading_*` in `pipeline::tests`, `parity_colour_grading`.
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

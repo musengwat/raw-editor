@@ -1119,3 +1119,34 @@ fn texture_and_clarity_need_the_bases() {
     let (a, b) = (raw_editor::export::render_cpu(&img, &p), raw_editor::export::render_cpu(&img, &AdjustParams::default()));
     assert_eq!(a.data, b.data);
 }
+
+// --- Colour grading ---------------------------------------------------------
+
+#[test]
+fn parity_colour_grading() {
+    for (blending, balance) in [(0.5, 0.0), (0.0, 0.6), (1.0, -1.0), (0.8, 1.0)] {
+        let p = AdjustParams {
+            grade_shadows: [-0.25, 0.05, 0.3],
+            grade_midtones: [0.1, 0.15, -0.1],
+            grade_highlights: [0.35, 0.1, -0.3],
+            grade_blending: blending,
+            grade_balance: balance,
+            ..Default::default()
+        };
+        // Black to above white, every hue.
+        assert_image_parity(&range_source(), p);
+        assert_parity(AdjustParams { exposure_ev: 0.5, lift: [0.02, 0.0, 0.0], saturation: 0.2, ..p });
+        assert_image_parity(&mask_source(), AdjustParams { tone_curve: 1.0, contrast: 0.2, ..p });
+        let img = range_source();
+        let (with, without) = (raw_editor::export::render_cpu(&img, &p), raw_editor::export::render_cpu(&img, &AdjustParams::default()));
+        assert!(with.data.iter().zip(&without.data).filter(|(a, b)| a.abs_diff(**b) > 600).count() > with.data.len() / 10);
+    }
+    // One wheel at a time, at the extremes the wheel allows.
+    for p in [
+        AdjustParams { grade_shadows: [0.5, -0.25, -0.25], ..Default::default() },
+        AdjustParams { grade_midtones: [-0.5, -0.5, -0.5], ..Default::default() },
+        AdjustParams { grade_highlights: [-0.5, 0.0, 1.0], ..Default::default() },
+    ] {
+        assert_image_parity(&range_source(), p);
+    }
+}

@@ -36,6 +36,10 @@ struct Uniforms {
     effects: vec4<f32>,    // grain amount, grain size, vibrance
     local0: vec4<f32>,     // .rgb = base luminance weights on camera RGB, .w = bases bound
     local1: vec4<f32>,     // texture, clarity
+    grade_s: vec4<f32>,    // colour grading: shadows triple
+    grade_m: vec4<f32>,    // mid-tones
+    grade_h: vec4<f32>,    // highlights
+    grade_info: vec4<f32>, // blending, balance exponent, active
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -400,6 +404,35 @@ fn locals(uv: vec2<f32>, c: vec3<f32>) -> Locals {
     return l;
 }
 
+// --- Colour grading — mirrors src/pipeline.rs::grade -----------------------
+
+const GRADE_TINT: f32 = 1.0;
+const GRADE_LUM_EV: f32 = 2.0;
+
+// Shadows / mid-tones / highlights weights at display brightness `d`.
+// Mirrors `pipeline::grade_weights`.
+fn grade_weights(d_in: f32) -> vec3<f32> {
+    let d = pow(clamp(d_in, 0.0, 1.0), u.grade_info.y);
+    let b = u.grade_info.x;
+    let shadows = 1.0 - smoothstep(0.0, 0.25 + 0.5 * b, d);
+    let highlights = smoothstep(0.75 - 0.5 * b, 1.0, d);
+    return vec3(shadows, max(1.0 - shadows - highlights, 0.0), highlights);
+}
+
+fn grade(c: vec3<f32>) -> vec3<f32> {
+    let y = dot(c, LUMA_709);
+    let w = grade_weights(pow(clamp(y, 0.0, 1.0), 1.0 / MASK_GAMMA));
+    let t = u.grade_s.rgb * w.x + u.grade_m.rgb * w.y + u.grade_h.rgb * w.z;
+    let master = (t.r + t.g + t.b) / 3.0;
+    var out = c * max(vec3(1.0) + GRADE_TINT * (t - vec3(master)), vec3(0.0));
+    let tinted = dot(out, LUMA_709);
+    var scale = 1.0;
+    if tinted > 1e-6 && y > 0.0 {
+        scale = y / tinted;
+    }
+    return out * (scale * exp2(master * GRADE_LUM_EV));
+}
+
 // --- Texture and clarity — mirrors src/local.rs ---------------------------
 
 const TEXTURE_GAIN: f32 = 1.0;
@@ -564,6 +597,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 3c. Point curves.
     if any(u.curve_info > vec4(0.0)) {
         c = curves(c);
+    }
+
+    // 3d. Colour grading by tonal range.
+    if u.grade_info.z > 0.5 {
+        c = grade(c);
     }
 
     // 4. Lift / gamma / gain:  out = gain * (in + lift*(1-in))^(1/gamma)

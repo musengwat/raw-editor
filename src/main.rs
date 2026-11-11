@@ -1623,12 +1623,39 @@ impl App {
             }
 
             ui.add_space(10.0);
-            header(ui, "Lift / Gamma / Gain", Section::Wheels, p);
+            header(ui, "Colour grading", Section::Grading, p);
             ui.horizontal(|ui| {
-                ColorWheel::new("Lift", &mut p.lift, 0.0, 0.5).show(ui);
-                ColorWheel::new("Gamma", &mut p.gamma, 1.0, 0.5).show(ui);
-                ColorWheel::new("Gain", &mut p.gain, 1.0, 0.5).show(ui);
+                ColorWheel::new("Shadows", &mut p.grade_shadows, 0.0, 0.5).show(ui);
+                ColorWheel::new("Midtones", &mut p.grade_midtones, 0.0, 0.5).show(ui);
+                ColorWheel::new("Highlights", &mut p.grade_highlights, 0.0, 0.5).show(ui);
             });
+            resettable(ui, &mut p.grade_blending, d.grade_blending, |ui, v| {
+                ui.add(egui::Slider::new(v, 0.0..=1.0).text("Blending"))
+                    .on_hover_text("How far the shadow and highlight colours reach into the mid-tones")
+            });
+            resettable(ui, &mut p.grade_balance, d.grade_balance, |ui, v| {
+                ui.add(egui::Slider::new(v, -1.0..=1.0).text("Balance"))
+                    .on_hover_text("Left: more of the photo counts as shadow. Right: more counts as highlight")
+            });
+            ui.label(
+                egui::RichText::new("Drag a wheel towards a colour to tint that range; the value under it is its brightness. Double-click a wheel to reset it.")
+                    .weak()
+                    .small(),
+            );
+
+            ui.add_space(6.0);
+            // The older per-channel wheels: still applied, kept out of the way.
+            let wheels_moved = !p.section_is_neutral(Section::Wheels);
+            egui::CollapsingHeader::new(if wheels_moved { "Advanced: lift / gamma / gain •" } else { "Advanced: lift / gamma / gain" })
+                .id_salt("lgg")
+                .show(ui, |ui| {
+                    header(ui, "Lift / Gamma / Gain", Section::Wheels, p);
+                    ui.horizontal(|ui| {
+                        ColorWheel::new("Lift", &mut p.lift, 0.0, 0.5).show(ui);
+                        ColorWheel::new("Gamma", &mut p.gamma, 1.0, 0.5).show(ui);
+                        ColorWheel::new("Gain", &mut p.gain, 1.0, 0.5).show(ui);
+                    });
+                });
 
             ui.add_space(10.0);
             header(ui, "Detail", Section::Detail, p);

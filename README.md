@@ -138,7 +138,8 @@ Everyday use:
   roundness), **film grain** (amount, size) and **vibrance**
 - [x] T3 — **texture** (fine surface detail) and **clarity** (local
   contrast), both ways, without halos at hard edges
-- [ ] T4 — shadows / midtones / highlights colour grading
+- [x] T4 — **colour grading**: shadows / mid-tones / highlights wheels with
+  blending and balance (lift / gamma / gain moved under *Advanced*)
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -182,6 +183,16 @@ the left a soft glow. Neither shifts the photo's overall exposure, and strong
 edges such as a horizon are left alone rather than ringed with a halo. They
 compare each pixel with a smoothed copy of the photo that is prepared when
 it opens (about a tenth of a second on a 33 MP file).
+
+**Colour grading**: three wheels tint the *Shadows*, *Midtones* and
+*Highlights* separately — drag a wheel's dot towards a colour (teal shadows
+and orange highlights is the classic) and use the value under it to brighten
+or darken just that range. A tint never changes how bright a tone is, and
+black stays black. *Blending* sets how far the shadow and highlight colours
+reach into the mid-tones; *Balance* moves the dividing line, so more of the
+photo counts as shadow (left) or highlight (right). Double-click a wheel to
+reset it. The older per-channel *lift / gamma / gain* wheels are still
+there, folded under *Advanced* (a dot marks it when they are in use).
 
 **Effects**: *Vignette* darkens (left) or brightens (right) the corners of
 the frame *as cropped*; *Midpoint* is how far in it reaches, *Feather* how

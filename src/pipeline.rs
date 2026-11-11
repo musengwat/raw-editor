@@ -125,6 +125,19 @@ pub struct AdjustParams {
     pub whites: f32,
     /// -1..1, additive lift/crush at the very bottom of the range.
     pub blacks: f32,
+    /// Colour grading (see [`grade`]): a tint and a brightness for the
+    /// shadows, the mid-tones and the highlights. Each is an RGB triple
+    /// around 0, as the colour wheels write it: the mean of the three is the
+    /// brightness, what is left is the colour.
+    pub grade_shadows: [f32; 3],
+    pub grade_midtones: [f32; 3],
+    pub grade_highlights: [f32; 3],
+    /// 0..1: how far the three ranges reach into each other. 0 keeps them
+    /// apart, 1 lets shadows and highlights meet in the middle.
+    pub grade_blending: f32,
+    /// -1..1: moves the split towards the shadows (-) or the highlights
+    /// (+), so more of the picture takes the other range's grade.
+    pub grade_balance: f32,
     /// Resolve-style lift, per channel. Neutral = 0.
     pub lift: [f32; 3],
     /// Resolve-style gamma, per channel. Neutral = 1.
@@ -218,6 +231,11 @@ impl Default for AdjustParams {
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            grade_shadows: [0.0; 3],
+            grade_midtones: [0.0; 3],
+            grade_highlights: [0.0; 3],
+            grade_blending: 0.5,
+            grade_balance: 0.0,
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
@@ -354,6 +372,13 @@ impl AdjustParams {
             }
             Section::Masks => self.masks = d.masks,
             Section::Curve => self.curves = d.curves,
+            Section::Grading => {
+                self.grade_shadows = d.grade_shadows;
+                self.grade_midtones = d.grade_midtones;
+                self.grade_highlights = d.grade_highlights;
+                self.grade_blending = d.grade_blending;
+                self.grade_balance = d.grade_balance;
+            }
             Section::Effects => {
                 self.vignette_amount = d.vignette_amount;
                 self.vignette_midpoint = d.vignette_midpoint;
@@ -387,10 +412,11 @@ pub enum Section {
     Masks,
     Curve,
     Effects,
+    Grading,
 }
 
 impl Section {
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Colour,
         Section::Basic,
         Section::Hsl,
@@ -402,6 +428,7 @@ impl Section {
         Section::Masks,
         Section::Curve,
         Section::Effects,
+        Section::Grading,
     ];
 }
 
@@ -578,7 +605,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 2048 bytes.
+/// Total size 2112 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -623,6 +650,12 @@ pub struct Uniforms {
     pub local0: [f32; 4],
     /// `[texture, clarity, _, _]`.
     pub local1: [f32; 4],
+    /// Colour grading: the shadows, mid-tones and highlights triples
+    /// (`.rgb`) and `[blending, balance exponent, active, _]`.
+    pub grade_s: [f32; 4],
+    pub grade_m: [f32; 4],
+    pub grade_h: [f32; 4],
+    pub grade_info: [f32; 4],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -841,6 +874,15 @@ impl Uniforms {
             effects: [p.grain_amount.max(0.0), p.grain_size.max(crate::effects::GRAIN_MIN_SIZE), p.vibrance, 0.0],
             local0: [0.0; 4],
             local1: [p.texture, p.clarity, 0.0, 0.0],
+            grade_s: v4(p.grade_shadows),
+            grade_m: v4(p.grade_midtones),
+            grade_h: v4(p.grade_highlights),
+            grade_info: [
+                p.grade_blending.clamp(0.0, 1.0),
+                (-p.grade_balance.clamp(-1.0, 1.0)).exp2(),
+                if grade_active(p) { 1.0 } else { 0.0 },
+                0.0,
+            ],
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -1000,6 +1042,11 @@ pub fn apply_local(p: &AdjustParams, l: &Locals, rgb: [f32; 3]) -> [f32; 3] {
     // 3c. Point curves, in the display-encoded domain.
     c = p.curves.apply(c);
 
+    // 3d. Colour grading by tonal range.
+    if grade_active(p) {
+        c = grade(p, c);
+    }
+
     // 4. Lift / gamma / gain, per channel:  out = gain * (in + lift*(1-in))^(1/gamma)
     for i in 0..3 {
         let x = c[i].max(0.0);
@@ -1025,6 +1072,50 @@ pub fn apply_local(p: &AdjustParams, l: &Locals, rgb: [f32; 3]) -> [f32; 3] {
         c = hsl_adjust(&p.hsl, c);
     }
     c
+}
+
+/// A colour wheel at full deflection scales a channel by 1 ± this much of
+/// its chroma value.
+pub const GRADE_TINT: f32 = 1.0;
+/// Stops of brightness per unit of a grading wheel's master value.
+pub const GRADE_LUM_EV: f32 = 2.0;
+
+pub fn grade_active(p: &AdjustParams) -> bool {
+    [p.grade_shadows, p.grade_midtones, p.grade_highlights].iter().flatten().any(|&v| v != 0.0)
+}
+
+/// How much of the shadows, mid-tones and highlights grade a pixel of
+/// display-domain brightness `d` (0..1) gets; the three add up to 1.
+/// `blending` widens the shadow and highlight ranges towards each other,
+/// `balance` slides the whole split. Mirrors `grade_weights` in the shader.
+pub fn grade_weights(d: f32, blending: f32, balance: f32) -> [f32; 3] {
+    let d = d.clamp(0.0, 1.0).powf((-balance.clamp(-1.0, 1.0)).exp2());
+    let b = blending.clamp(0.0, 1.0);
+    let shadows = 1.0 - smoothstep(0.0, 0.25 + 0.5 * b, d);
+    let highlights = smoothstep(0.75 - 0.5 * b, 1.0, d);
+    [shadows, (1.0 - shadows - highlights).max(0.0), highlights]
+}
+
+/// Colour grading: tint and brighten the shadows, mid-tones and highlights
+/// separately. The three wheels' values are blended by the pixel's
+/// brightness into one triple; its mean is a brightness change in stops, the
+/// rest a per-channel tint — applied as a ratio (so black stays black) and
+/// then rescaled so the tint alone leaves the luminance where it was.
+/// Mirrors `grade` in the shader.
+pub fn grade(p: &AdjustParams, c: [f32; 3]) -> [f32; 3] {
+    let y = luma(c);
+    let d = y.clamp(0.0, 1.0).powf(1.0 / MASK_GAMMA);
+    let w = grade_weights(d, p.grade_blending, p.grade_balance);
+    let t: [f32; 3] = std::array::from_fn(|i| p.grade_shadows[i] * w[0] + p.grade_midtones[i] * w[1] + p.grade_highlights[i] * w[2]);
+    let master = (t[0] + t[1] + t[2]) / 3.0;
+    let mut out: [f32; 3] = std::array::from_fn(|i| c[i] * (1.0 + GRADE_TINT * (t[i] - master)).max(0.0));
+    let tinted = luma(out);
+    let scale = if tinted > 1e-6 && y > 0.0 { y / tinted } else { 1.0 };
+    let gain = scale * (master * GRADE_LUM_EV).exp2();
+    for v in &mut out {
+        *v *= gain;
+    }
+    out
 }
 
 /// The per-colour bands: name and centre hue in degrees. Spacing follows
@@ -1168,6 +1259,11 @@ mod tests {
             rotation: 1,
             straighten: 2.0,
             crop: [0.1, 0.1, 0.9, 0.8],
+            grade_shadows: [-0.05, 0.0, 0.1],
+            grade_midtones: [0.02, 0.02, 0.02],
+            grade_highlights: [0.1, 0.05, -0.1],
+            grade_blending: 0.7,
+            grade_balance: -0.2,
             texture: 0.3,
             clarity: -0.2,
             vibrance: 0.2,
@@ -1398,8 +1494,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_2048_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 2048);
+    fn uniforms_layout_is_2112_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 2112);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -1425,6 +1521,8 @@ mod tests {
             &u.effects as *const _ as usize,
             &u.local0 as *const _ as usize,
             &u.local1 as *const _ as usize,
+            &u.grade_s as *const _ as usize,
+            &u.grade_info as *const _ as usize,
             &u.scale as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
@@ -1686,6 +1784,56 @@ mod tests {
         assert!((z - 1.0).abs() < 1e-6);
         assert_eq!(Zoom::Scale(0.3).step(-1, OUT, VIEWPORT), Zoom::Fit);
         assert_eq!(Zoom::Scale(8.0).step(1, OUT, VIEWPORT), Zoom::Scale(8.0));
+    }
+
+    #[test]
+    fn grading_weights_split_the_tones_and_always_add_up() {
+        for blending in [0.0, 0.5, 1.0] {
+            for balance in [-1.0, 0.0, 1.0] {
+                for i in 0..=20 {
+                    let w = grade_weights(i as f32 / 20.0, blending, balance);
+                    assert!((w[0] + w[1] + w[2] - 1.0).abs() < 1e-5 && w.iter().all(|&v| (0.0..=1.0).contains(&v)), "{w:?}");
+                }
+            }
+        }
+        assert_eq!(grade_weights(0.0, 0.5, 0.0), [1.0, 0.0, 0.0]);
+        assert_eq!(grade_weights(1.0, 0.5, 0.0), [0.0, 0.0, 1.0]);
+        // No blending: the middle half of the range is all mid-tone.
+        assert_eq!(grade_weights(0.5, 0.0, 0.0), [0.0, 1.0, 0.0]);
+        // Full blending: shadows and highlights both reach the middle.
+        let w = grade_weights(0.5, 1.0, 0.0);
+        assert!(w[0] > 0.2 && w[2] > 0.2 && (w[0] - w[2]).abs() < 1e-5);
+        // Balance towards the highlights: the same tone counts as brighter.
+        assert!(grade_weights(0.4, 0.5, 1.0)[2] > grade_weights(0.4, 0.5, 0.0)[2]);
+        assert!(grade_weights(0.4, 0.5, -1.0)[0] > grade_weights(0.4, 0.5, 0.0)[0]);
+    }
+
+    #[test]
+    fn grading_tints_each_range_and_keeps_luminance() {
+        // Teal shadows, orange highlights: pure colour (the triples sum to 0).
+        let p = AdjustParams { grade_shadows: [-0.2, 0.05, 0.15], grade_highlights: [0.2, 0.0, -0.2], ..Default::default() };
+        let (dark, bright) = ([0.01f32; 3], [0.85f32; 3]);
+        let (d, b) = (apply(&p, dark), apply(&p, bright));
+        assert!(d[2] > d[0] && d[1] > d[0], "shadows go teal: {d:?}");
+        assert!(b[0] > b[1] && b[1] > b[2], "highlights go orange: {b:?}");
+        assert!((luma(d) - luma(dark)).abs() < 1e-6 && (luma(b) - luma(bright)).abs() < 1e-5, "tint alone keeps luminance");
+        // A mid-tone is left alone by both (blending 0.5 leaves a gap at 0.5).
+        let mid = [0.5f32.powf(MASK_GAMMA); 3];
+        let m = apply(&p, mid);
+        assert!((m[0] - mid[0]).abs() < 1e-6 && (m[2] - mid[2]).abs() < 1e-6, "{m:?}");
+        // The master value is brightness, in stops, for that range only.
+        let lift = AdjustParams { grade_shadows: [0.25; 3], ..Default::default() };
+        let l = apply(&lift, dark);
+        // (A 1% grey is 85% "shadow" at the default blending.)
+        let share = grade_weights(dark[0].powf(1.0 / MASK_GAMMA), 0.5, 0.0)[0];
+        assert!(share > 0.8 && share < 0.9);
+        assert!((l[0] / dark[0] - 2f32.powf(0.25 * GRADE_LUM_EV * share)).abs() < 1e-3 && l[0] == l[1], "{l:?}");
+        assert_eq!(apply(&lift, bright), bright);
+        // Black stays black whatever the tint, and neutral wheels do nothing.
+        assert_eq!(apply(&p, [0.0; 3]), [0.0; 3]);
+        assert!(!grade_active(&AdjustParams::default()));
+        let px = [0.3, 0.2, 0.1];
+        assert_eq!(apply(&AdjustParams { grade_blending: 1.0, grade_balance: 0.7, ..Default::default() }, px), px);
     }
 
     #[test]
