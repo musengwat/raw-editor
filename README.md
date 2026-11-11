@@ -129,7 +129,9 @@ Everyday use:
   with its own exposure, contrast, highlights, shadows, whites, blacks,
   temp, tint, saturation, sharpening and noise reduction; handles on the
   photo, red overlay, invert, amount, feather
-- [ ] M2 — luminance and colour range on masks
+- [x] M2 — **brightness and colour ranges**: any mask can be limited to a
+  range of tones and / or one colour, picked from the photo; a range on its
+  own is a mask over the whole frame ("only the blues", "only the shadows")
 - [ ] T1 — point tone curve (RGB + per channel)
 - [ ] T2 — vignette, grain, vibrance
 - [ ] T3 — texture and clarity
@@ -169,6 +171,20 @@ on the photo to place it:
   pin moves the whole gradient;
 - radial: the red pin moves it, the four white dots change its width and
   height, the blue dot turns it. *Feather* sets how soft the edge is.
+
+A mask can also be limited by what is *in* the picture. *+ Add mask →
+Brightness range* or *Colour range* makes a mask with no shape and arms an
+eyedropper: click the photo on the tone or colour you mean (the sky's blue,
+the deep shadows) and everything like it, anywhere in the frame, is
+selected. *From* / *To* set the darkest and brightest tones included, *Colour*
+and *Width* the hue and how far either side of it counts, *Smoothness* how
+gradually the mask fades out at those limits; *Pick from photo* re-arms the
+eyedropper. Greys never belong to a colour range. The same two tick boxes
+— *Only a brightness range*, *Only one colour* — are on every gradient too,
+so "this gradient, but only where it is blue" keeps a darkened sky off the
+trees in front of it. Ranges follow the main Exposure, Temp / Tint and the
+look's tone curve (they are judged on roughly what you see), but not the
+mask's own sliders, so a mask never chases its own effect.
 
 Then move the mask's sliders — they are *added* to the main sliders inside
 the mask, so Exposure +1 there is one stop brighter than the rest of the

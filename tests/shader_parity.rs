@@ -11,7 +11,7 @@ use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
-use raw_editor::masks::{self, Mask, MaskAdjust};
+use raw_editor::masks::{self, Mask, MaskAdjust, MaskRange, RangeRef};
 use raw_editor::pipeline::{ColourMode, 
     AdjustParams, ImageColour, Uniforms, View, apply, apply_at, clip_view, srgb_encode,
 };
@@ -809,7 +809,14 @@ fn parity_mask_overlay() {
         return;
     };
     let img = mask_source();
-    let shown = Mask { enabled: false, feather: 0.6, ..Mask::radial([0.5, 0.5], 0.4) };
+    // A shape and a range together, so the overlay shows the selection and
+    // not just the outline.
+    let shown = Mask {
+        enabled: false,
+        feather: 0.6,
+        range: MaskRange { luma_on: true, luma: [0.55, 1.0], luma_feather: 0.15, ..Default::default() },
+        ..Mask::radial([0.5, 0.5], 0.4)
+    };
     let p = with_masks(&[Mask { adjust: every_offset(), ..Mask::linear([0.5, 0.2], [0.5, 0.8]) }, shown]);
     let view = View::one_to_one([1.0 / img.width as f32, 1.0 / img.height as f32]);
     let mut uniforms = Uniforms::new(&p, &img.colour, view, false);
@@ -821,7 +828,9 @@ fn parity_mask_overlay() {
     let mut tinted = 0;
     for i in 0..w * h {
         let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-        let shape = masks::shape(&shown, uv, aspect);
+        let o = i * 3;
+        let px = RangeRef::of(&p, [img.data[o], img.data[o + 1], img.data[o + 2]]);
+        let shape = masks::selection(&shown, uv, aspect, &px);
         tinted += (shape > 0.5) as usize;
         // The CPU render is sRGB-encoded; the overlay mixes in linear.
         let lin = |v: u16| {
@@ -835,4 +844,104 @@ fn parity_mask_overlay() {
         }
     }
     assert!(tinted > w * h / 10, "the overlay covers a real area");
+}
+
+// --- Mask ranges ------------------------------------------------------------
+
+/// Every hue round the circle across the frame, dark to bright down it, with
+/// saturation rising from the left — so brightness and colour ranges both
+/// have edges to get wrong.
+fn range_source() -> DevelopedImage {
+    let (w, h) = (48usize, 32usize);
+    let mut data = vec![0f32; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let hue = x as f32 / w as f32 * 6.0;
+            let k = |n: f32| {
+                let t = (n + hue) % 6.0;
+                1.0 - t.min(4.0 - t).clamp(0.0, 1.0)
+            };
+            let sat = 0.15 + 0.8 * ((x * 7 + y * 3) % 11) as f32 / 10.0;
+            let v = 0.03 + 0.9 * y as f32 / h as f32;
+            let o = (y * w + x) * 3;
+            for (c, n) in [5.0, 3.0, 1.0].into_iter().enumerate() {
+                data[o + c] = v * (1.0 - sat * (1.0 - k(n)));
+            }
+        }
+    }
+    DevelopedImage::linear_srgb(w, h, data)
+}
+
+#[test]
+fn parity_mask_brightness_range() {
+    let img = range_source();
+    for (luma, feather) in [([0.0, 0.4], 0.1), ([0.5, 1.0], 0.05), ([0.3, 0.6], 0.2)] {
+        let m = Mask {
+            range: MaskRange { luma_on: true, luma, luma_feather: feather, ..Default::default() },
+            adjust: every_offset(),
+            ..Mask::whole()
+        };
+        // Global exposure, white balance and curve move what the range sees.
+        for p in [with_masks(&[m]), AdjustParams { exposure_ev: 0.7, temp: 0.3, tint: -0.2, tone_curve: 1.0, ..with_masks(&[m]) }] {
+            assert_masks_change_the_render(&img, &p);
+            assert_geometry_parity(&img, p, 3);
+        }
+    }
+}
+
+#[test]
+fn parity_mask_colour_range() {
+    let img = range_source();
+    // Red sits on the hue seam; the others on each side of it.
+    for hue in [0.0, 350.0, 120.0, 215.0, 300.0] {
+        let m = Mask {
+            range: MaskRange { colour_on: true, hue, hue_width: 25.0, hue_feather: 30.0, ..Default::default() },
+            adjust: MaskAdjust { exposure_ev: 0.9, saturation: -0.8, ..Default::default() },
+            ..Mask::whole()
+        };
+        let p = with_masks(&[m]);
+        assert_masks_change_the_render(&img, &p);
+        // The hue is discontinuous where two channels tie for the maximum;
+        // the feathered range keeps the two sides within a few levels.
+        assert_geometry_parity(&img, p, 4);
+    }
+}
+
+/// A gradient limited to a colour and a brightness, inverted, next to a
+/// plain one — and through a rotation and crop, where the range still reads
+/// the right pixel.
+#[test]
+fn parity_mask_range_inside_a_shape() {
+    let img = range_source();
+    let limited = Mask {
+        range: MaskRange {
+            luma_on: true,
+            luma: [0.35, 0.9],
+            luma_feather: 0.1,
+            colour_on: true,
+            hue: 200.0,
+            hue_width: 60.0,
+            hue_feather: 40.0,
+        },
+        adjust: every_offset(),
+        ..Mask::radial([0.5, 0.5], 0.45)
+    };
+    let plain = Mask { adjust: MaskAdjust { exposure_ev: -0.6, ..Default::default() }, ..Mask::linear([0.2, 0.5], [0.8, 0.5]) };
+    for m in [limited, Mask { invert: true, ..limited }] {
+        let p = with_masks(&[m, plain]);
+        assert_masks_change_the_render(&img, &p);
+        assert_geometry_parity(&img, p, 4);
+        assert_geometry_parity(&img, AdjustParams { rotation: 1, crop: [0.125, 0.25, 0.875, 1.0], ..p }, 4);
+    }
+}
+
+/// Ranges are judged on the pixel *before* the detail stage on both sides.
+#[test]
+fn parity_mask_range_with_detail() {
+    let m = Mask {
+        range: MaskRange { luma_on: true, luma: [0.5, 1.0], luma_feather: 0.1, ..Default::default() },
+        adjust: MaskAdjust { sharpen: 1.5, nr_luma: 0.6, exposure_ev: 0.4, ..Default::default() },
+        ..Mask::whole()
+    };
+    assert_geometry_parity(&mask_source(), AdjustParams { sharpen_amount: 0.5, ..with_masks(&[m]) }, 3);
 }

@@ -830,9 +830,11 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
 
 /// [`apply`] for a photo with masks: the pixel at source uv `uv` of an image
 /// `aspect` (width / height) wide gets the global sliders plus whatever its
-/// masks add there.
+/// masks add there. `rgb` doubles as the pixel the masks' ranges are judged
+/// on, so this is for callers with no detail stage in between (histogram,
+/// Auto); the export path keeps the two apart.
 pub fn apply_at(p: &AdjustParams, uv: [f32; 2], aspect: f32, rgb: [f32; 3]) -> [f32; 3] {
-    apply_local(p, &crate::masks::locals(p, uv, aspect), rgb)
+    apply_local(p, &crate::masks::locals(p, uv, aspect, rgb), rgb)
 }
 
 /// The chain with the per-pixel slider values given: `l` for everything a

@@ -120,7 +120,8 @@ pub fn apply(width: usize, height: usize, data: &[f32], p: &AdjustParams) -> Vec
         for x in 0..width {
             let l = if masked {
                 let uv = [(x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32];
-                masks::locals(p, uv, aspect)
+                let o = (y * width + x) * 3;
+                masks::locals(p, uv, aspect, [data[o], data[o + 1], data[o + 2]])
             } else {
                 global
             };

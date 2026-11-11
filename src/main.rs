@@ -21,7 +21,7 @@ use raw_editor::config::Config;
 use raw_editor::hdr::{self, MergeReport, Style};
 use raw_editor::history::History;
 use raw_editor::immich;
-use raw_editor::masks::{self, Mask, MaskGrab, MaskKind};
+use raw_editor::masks::{self, Mask, MaskGrab, MaskKind, RangeRef};
 use raw_editor::looks::{Look, LookGroup};
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
@@ -133,10 +133,39 @@ enum ZoomCmd {
     Step(i32),
 }
 
+/// The kinds of mask the Add menu offers.
+#[derive(Clone, Copy, PartialEq)]
+enum NewMask {
+    Linear,
+    Radial,
+    Brightness,
+    Colour,
+}
+
+impl NewMask {
+    const ALL: [NewMask; 4] = [NewMask::Linear, NewMask::Radial, NewMask::Brightness, NewMask::Colour];
+
+    fn label(self) -> &'static str {
+        match self {
+            NewMask::Linear => "Linear gradient",
+            NewMask::Radial => "Radial gradient",
+            NewMask::Brightness => "Brightness range",
+            NewMask::Colour => "Colour range",
+        }
+    }
+}
+
+/// Which of a mask's ranges the eyedropper is about to set.
+#[derive(Clone, Copy, PartialEq)]
+enum RangePick {
+    Brightness,
+    Colour,
+}
+
 /// What the Masks section asked for; carried out after the panel is drawn,
 /// where the image's geometry is at hand.
 enum MaskAction {
-    Add(MaskKind),
+    Add(NewMask),
     Duplicate(usize),
     Remove(usize),
 }
@@ -242,6 +271,9 @@ struct App {
     mask_sel: Option<usize>,
     /// Tint the selected mask's area red (a viewing aid, never exported).
     mask_overlay: bool,
+    /// The range eyedropper is armed: the next click on the image sets this
+    /// mask's brightness or colour range from that spot.
+    mask_pick: Option<(usize, RangePick)>,
     /// Handle drag in progress: what was grabbed, the mask and the pointer
     /// (source uv) when it began.
     mask_drag: Option<(MaskGrab, Mask, [f32; 2])>,
@@ -330,6 +362,7 @@ impl App {
             pan: [0.0, 0.0],
             mask_sel: None,
             mask_overlay: false,
+            mask_pick: None,
             mask_drag: None,
             zoom_cmd: None,
             zoom_percent: 100.0,
@@ -460,6 +493,7 @@ impl App {
                     self.show_before = false;
                     self.mask_sel = None;
                     self.mask_drag = None;
+                    self.mask_pick = None;
                     self.cropping = false;
                     self.crop_drag = None;
                     self.dirty_since = None;
@@ -1124,7 +1158,7 @@ impl App {
         let mut optics_action: Option<OpticsAction> = None;
         let hsl_tab = &mut self.hsl_tab;
         let (cropping, crop_before, crop_aspect) = (&mut self.cropping, &mut self.crop_before, &mut self.crop_aspect);
-        let (mask_sel, mask_overlay) = (&mut self.mask_sel, &mut self.mask_overlay);
+        let (mask_sel, mask_overlay, mask_pick) = (&mut self.mask_sel, &mut self.mask_overlay, &mut self.mask_pick);
         let mut mask_action: Option<MaskAction> = None;
         let source = self.image.as_ref().map(|img| (img.width as f32, img.height as f32, img.colour.turns));
         let thumbs: Vec<(Look, egui::TextureHandle)> = self.thumbs.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
@@ -1389,7 +1423,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(has_image && used < masks::MAX_MASKS, |ui| {
                     ui.menu_button("+ Add mask", |ui| {
-                        for kind in [MaskKind::Linear, MaskKind::Radial] {
+                        for kind in NewMask::ALL {
                             if ui.button(kind.label()).clicked() {
                                 mask_action = Some(MaskAction::Add(kind));
                                 ui.close();
@@ -1417,7 +1451,7 @@ impl App {
                 let selected = *mask_sel == Some(i);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut p.masks[i].enabled, "").on_hover_text("Turn this mask on or off");
-                    let name = format!("{} · {}", i + 1, p.masks[i].kind.label());
+                    let name = format!("{} · {}", i + 1, p.masks[i].label());
                     if ui.selectable_label(selected, name).on_hover_text("Show this mask's controls and handles").clicked() {
                         *mask_sel = if selected { None } else { Some(i) };
                     }
@@ -1448,6 +1482,58 @@ impl App {
                             ui.add(egui::Slider::new(v, 0.0..=1.0).text("Feather")).on_hover_text("How soft the edge is")
                         });
                     }
+                    // --- Ranges: which pixels inside the shape ---
+                    let (r, rd) = (&mut m.range, md.range);
+                    let mut pick_button = |ui: &mut egui::Ui, which: RangePick| {
+                        let armed = *mask_pick == Some((i, which));
+                        if ui.selectable_label(armed, "Pick from photo").on_hover_text("Then click the photo where the mask should apply").clicked() {
+                            *mask_pick = if armed { None } else { Some((i, which)) };
+                            *picking_wb = false;
+                        }
+                    };
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut r.luma_on, "Only a brightness range")
+                            .on_hover_text("Limit the mask to tones between two brightnesses — only the shadows, say");
+                        if r.luma_on {
+                            pick_button(ui, RangePick::Brightness);
+                        }
+                    });
+                    if r.luma_on {
+                        resettable(ui, &mut r.luma[0], rd.luma[0], |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).fixed_decimals(2).text("From (dark)")));
+                        resettable(ui, &mut r.luma[1], rd.luma[1], |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).fixed_decimals(2).text("To (bright)")));
+                        if r.luma[1] < r.luma[0] {
+                            r.luma[1] = r.luma[0];
+                        }
+                        resettable(ui, &mut r.luma_feather, rd.luma_feather, |ui, v| {
+                            ui.add(egui::Slider::new(v, 0.0..=0.5).fixed_decimals(2).text("Smoothness")).on_hover_text("How gradually the mask fades out past the two ends")
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut r.colour_on, "Only one colour")
+                            .on_hover_text("Limit the mask to hues around one colour — only the blue of the sky, say. Greys are left out");
+                        if r.colour_on {
+                            pick_button(ui, RangePick::Colour);
+                        }
+                    });
+                    if r.colour_on {
+                        resettable(ui, &mut r.hue, rd.hue, |ui, v| {
+                            ui.horizontal(|ui| {
+                                let swatch: egui::Color32 = egui::ecolor::Hsva::new(*v / 360.0, 0.85, 0.9, 1.0).into();
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 3.0, swatch);
+                                ui.add(egui::Slider::new(v, 0.0..=360.0).suffix("°").fixed_decimals(0).text("Colour"))
+                            })
+                            .inner
+                        });
+                        resettable(ui, &mut r.hue_width, rd.hue_width, |ui, v| {
+                            ui.add(egui::Slider::new(v, 2.0..=120.0).suffix("°").fixed_decimals(0).text("Width"))
+                                .on_hover_text("How far either side of the colour is fully included")
+                        });
+                        resettable(ui, &mut r.hue_feather, rd.hue_feather, |ui, v| {
+                            ui.add(egui::Slider::new(v, 0.0..=90.0).suffix("°").fixed_decimals(0).text("Smoothness"))
+                                .on_hover_text("How gradually the mask fades out beyond that")
+                        });
+                    }
                     ui.add_space(4.0);
                     let a = &mut m.adjust;
                     let slider = |ui: &mut egui::Ui, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
@@ -1464,11 +1550,12 @@ impl App {
                     slider(ui, &mut a.saturation, -1.0..=1.0, "Saturation");
                     slider(ui, &mut a.sharpen, -3.0..=3.0, "Sharpen");
                     slider(ui, &mut a.nr_luma, -1.0..=1.0, "NR luminance");
-                    ui.label(
-                        egui::RichText::new("Added to the sliders above, inside the mask. Drag the handles on the photo to place it.")
-                            .weak()
-                            .small(),
-                    );
+                    let hint = if m.kind == MaskKind::Range {
+                        "Added to the sliders above, wherever the range applies."
+                    } else {
+                        "Added to the sliders above, inside the mask. Drag the handles on the photo to place it."
+                    };
+                    ui.label(egui::RichText::new(hint).weak().small());
                 });
                 // The overlay is for placing the mask; once its sliders
                 // move, what matters is the result.
@@ -1741,15 +1828,37 @@ impl App {
                 // Placed in the middle of the frame as it is cropped and
                 // turned now, then stored in source uv.
                 let geom = Geometry::resolve(&self.params, &img.colour, img.width, img.height);
-                let mask = match kind {
-                    MaskKind::Linear => Mask::linear(geom.source_uv([0.5, 0.2]), geom.source_uv([0.5, 0.55])),
-                    _ => Mask::radial(geom.source_uv([0.5, 0.5]), 0.3 * geom.width.min(geom.height) as f32 / img.height as f32),
+                let mut mask = match kind {
+                    NewMask::Linear => Mask::linear(geom.source_uv([0.5, 0.2]), geom.source_uv([0.5, 0.55])),
+                    NewMask::Radial => {
+                        Mask::radial(geom.source_uv([0.5, 0.5]), 0.3 * geom.width.min(geom.height) as f32 / img.height as f32)
+                    }
+                    NewMask::Brightness | NewMask::Colour => Mask::whole(),
+                };
+                // A range mask starts with the eyedropper armed: clicking the
+                // photo is the natural way to say which tones or colour.
+                let pick = match kind {
+                    NewMask::Brightness => {
+                        mask.range.luma_on = true;
+                        Some(RangePick::Brightness)
+                    }
+                    NewMask::Colour => {
+                        mask.range.colour_on = true;
+                        Some(RangePick::Colour)
+                    }
+                    _ => None,
                 };
                 match masks::add(&mut self.params.masks, mask) {
                     Some(i) => {
                         self.mask_sel = Some(i);
                         self.mask_overlay = true;
-                        self.status = format!("{} added — drag its handles on the photo, then move its sliders", kind.label());
+                        self.mask_pick = pick.map(|which| (i, which));
+                        self.picking_wb = false;
+                        self.status = if pick.is_some() {
+                            format!("{} added — click the photo where it should apply, then move its sliders", kind.label())
+                        } else {
+                            format!("{} added — drag its handles on the photo, then move its sliders", kind.label())
+                        };
                     }
                     None => self.status = "All mask slots are in use".into(),
                 }
@@ -1768,6 +1877,66 @@ impl App {
                     Some(s) if s > i => Some(s - 1),
                     other => other,
                 };
+                self.mask_pick = None;
+            }
+        }
+    }
+
+    /// The range eyedropper: a click on the image centres the armed mask's
+    /// brightness or colour range on what is there.
+    fn handle_range_pick(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        view: View,
+        geom: Geometry,
+        size: [usize; 2],
+    ) {
+        let Some((slot, which)) = self.mask_pick.filter(|&(i, _)| self.params.masks[i].kind != MaskKind::Off) else {
+            self.mask_pick = None;
+            return;
+        };
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.mask_pick = None;
+            return;
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let hint = match which {
+            RangePick::Brightness => "Click the brightness to select  ·  Esc cancels",
+            RangePick::Colour => "Click the colour to select  ·  Esc cancels",
+        };
+        let badge = egui::Rect::from_min_size(rect.center_top() + egui::vec2(-170.0, 12.0), egui::vec2(340.0, 24.0));
+        ui.painter().rect_filled(badge, 4.0, egui::Color32::from_black_alpha(180));
+        ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+
+        if !response.clicked() {
+            return;
+        }
+        let (Some(pos), Some(img)) = (response.interact_pointer_pos(), self.image.clone()) else {
+            return;
+        };
+        let ndc = [(pos.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (pos.y - rect.top()) / rect.height() * 2.0];
+        let Some([x, y]) = view.quad_uv(ndc).and_then(|uv| geom.source_pixel(uv, size[0], size[1])) else {
+            self.status = "Missed the image — click on the photo".into();
+            return;
+        };
+        let px = RangeRef::of(&self.params, img.working_patch(x, y, &self.params));
+        let range = &mut self.params.masks[slot].range;
+        match which {
+            RangePick::Brightness => {
+                range.pick_luma(px.luma);
+                self.status = format!("Brightness range set around {:.0}% — adjust From / To to taste", px.luma * 100.0);
+                self.mask_pick = None;
+            }
+            // A grey has no hue: stay armed so the next click can do better.
+            RangePick::Colour if px.sat < 0.03 => self.status = "That spot is grey — click something with colour".into(),
+            RangePick::Colour => {
+                range.pick_hue(px.hue);
+                self.status = format!("Colour range set around {:.0}° — adjust Width to taste", px.hue * 360.0);
+                self.mask_pick = None;
             }
         }
     }
@@ -2121,9 +2290,13 @@ impl App {
         let mut pan = on_screen.offset;
         let comparing = self.show_before || shortcut(ui.ctx(), COMPARE_KEY, true);
         // Mask handles get first claim on the pointer.
+        if self.cropping || comparing || self.picking_wb {
+            self.mask_pick = None;
+        }
+        let range_picking = self.mask_pick.is_some();
         let masking = !self.cropping && !self.picking_wb && !comparing;
         let aspect = iw as f32 / ih as f32;
-        let mask_grab = if masking {
+        let mask_grab = if masking && !range_picking {
             self.mask_interact(ui, &response, &MaskMap { rect, view: on_screen, geom, aspect })
         } else {
             self.mask_drag = None;
@@ -2162,7 +2335,7 @@ impl App {
                     zoom_to(&mut zoom, &mut pan, to, cursor);
                 }
                 // The eyedropper clicks, so a double-click is not a zoom then.
-                if response.double_clicked() && !self.picking_wb && !on_handle {
+                if response.double_clicked() && !self.picking_wb && !range_picking && !on_handle {
                     let to = toggled(zoom);
                     zoom_to(&mut zoom, &mut pan, to, cursor);
                 }
@@ -2186,7 +2359,7 @@ impl App {
         if !self.cropping {
             self.pan = view.offset;
             let pannable = view.scale[0] > 1.0 || view.scale[1] > 1.0;
-            if pannable && response.hovered() && !self.picking_wb && !on_handle {
+            if pannable && response.hovered() && !self.picking_wb && !range_picking && !on_handle {
                 let held = response.is_pointer_button_down_on();
                 ui.ctx().set_cursor_icon(if held { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
             }
@@ -2211,10 +2384,12 @@ impl App {
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
 
-        if masking {
+        if masking && !range_picking {
             self.mask_draw(ui, &MaskMap { rect, view, geom, aspect }, mask_grab);
         }
-        if self.picking_wb {
+        if range_picking {
+            self.handle_range_pick(ui, rect, &response, view, geom, [iw, ih]);
+        } else if self.picking_wb {
             self.handle_wb_pick(ui, rect, &response, view, geom, [iw, ih]);
         } else if self.cropping {
             self.crop_overlay(ui, rect, &response, view, [ow, oh]);

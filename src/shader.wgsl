@@ -4,13 +4,13 @@
 // One mask slot — packed by `masks::uniforms` in src/masks.rs.
 struct MaskU {
     v0: vec4<f32>,  // a.xy, b.xy (linear: the two ends; radial: centre, semi-axes)
-    v1: vec4<f32>,  // cos, sin, feather, kind (0 off, 1 linear, 2 radial)
+    v1: vec4<f32>,  // cos, sin, feather, kind (0 off, 1 linear, 2 radial, 3 range)
     v2: vec4<f32>,  // amount, invert, sharpen, nr_luma
     v3: vec4<f32>,  // exposure, contrast, temp, tint
     v4: vec4<f32>,  // saturation, highlights, shadows, whites
     v5: vec4<f32>,  // blacks
-    v6: vec4<f32>,  // reserved: luminance range
-    v7: vec4<f32>,  // reserved: colour range
+    v6: vec4<f32>,  // brightness range: from, to, feather, on
+    v7: vec4<f32>,  // colour range: hue, width, feather (fractions of the circle), on
 };
 
 struct Uniforms {
@@ -220,25 +220,71 @@ struct Locals {
 const MASK_OVERLAY_OPACITY: f32 = 0.55;
 const MASK_OVERLAY_COLOUR: vec3<f32> = vec3(1.0, 0.08, 0.08);
 
-// The shape of mask `i` at a source uv, inverted if the mask is, not scaled
+// The shape of mask `i` at a source uv: no range, not inverted, not scaled
 // by its amount. Mirrors `masks::shape`. Distances are in "aspect space" (u
 // times width / height), so circles are round.
 fn mask_shape(i: u32, uv: vec2<f32>) -> f32 {
     let m = u.masks[i];
     let asp = vec2(u.optics.z, 1.0);
     let p = uv * asp;
-    var w = 0.0;
     if m.v1.w == 1.0 {
         let a = m.v0.xy * asp;
         let ab = m.v0.zw * asp - a;
         let t = dot(p - a, ab) / max(dot(ab, ab), 1e-12);
-        w = 1.0 - smoothstep(0.0, 1.0, t);
+        return 1.0 - smoothstep(0.0, 1.0, t);
     } else if m.v1.w == 2.0 {
         let d = p - m.v0.xy * asp;
         let r = vec2(m.v1.x * d.x + m.v1.y * d.y, -m.v1.y * d.x + m.v1.x * d.y) / m.v0.zw;
-        w = 1.0 - smoothstep(1.0 - m.v1.z, 1.0, length(r));
+        return 1.0 - smoothstep(1.0 - m.v1.z, 1.0, length(r));
+    } else if m.v1.w == 3.0 {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// HSV hue (0..1) and saturation; (0, 0) for a grey. Mirrors `masks::hue_sat`.
+fn hue_sat(c: vec3<f32>) -> vec2<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let d = mx - mn;
+    if mx <= 1e-6 || d <= 1e-6 {
+        return vec2(0.0, 0.0);
+    }
+    var h6: f32;
+    if mx == c.r {
+        h6 = (c.g - c.b) / d;
+    } else if mx == c.g {
+        h6 = (c.b - c.r) / d + 2.0;
     } else {
+        h6 = (c.r - c.g) / d + 4.0;
+    }
+    return vec2(fract(h6 / 6.0), d / mx);
+}
+
+// What the ranges are judged on: (display brightness, hue, saturation) of a
+// working pixel after the *global* exposure, white balance and tone curve.
+// Mirrors `masks::RangeRef::of`.
+fn range_ref(c: vec3<f32>) -> vec3<f32> {
+    let g = c * exp2(u.exposure_ev) * vec3(1.0 + 0.4 * u.temp, 1.0 - 0.3 * u.tint, 1.0 - 0.4 * u.temp);
+    var y = clamp(dot(g, LUMA_709), 0.0, 1.0);
+    y = y + u.curve.x * (filmic(vec3(y)).x - y);
+    return vec3(pow(y, 1.0 / MASK_GAMMA), hue_sat(g));
+}
+
+// What mask `i` selects at a pixel: shape x range, inverted if the mask is,
+// not scaled by its amount. Mirrors `masks::selection`.
+fn mask_select(i: u32, uv: vec2<f32>, px: vec3<f32>) -> f32 {
+    let m = u.masks[i];
+    if m.v1.w == 0.0 {
         return 0.0;
+    }
+    var w = mask_shape(i, uv);
+    if m.v6.w > 0.5 {
+        w *= smoothstep(m.v6.x - m.v6.z, m.v6.x, px.x) * (1.0 - smoothstep(m.v6.y, m.v6.y + m.v6.z, px.x));
+    }
+    if m.v7.w > 0.5 {
+        let dist = abs(fract(px.y - m.v7.x + 0.5) - 0.5);
+        w *= (1.0 - smoothstep(m.v7.y, m.v7.y + m.v7.z, dist)) * clamp(px.z / HSL_FULL_SAT, 0.0, 1.0);
     }
     if m.v2.y > 0.5 {
         w = 1.0 - w;
@@ -246,9 +292,9 @@ fn mask_shape(i: u32, uv: vec2<f32>) -> f32 {
     return w;
 }
 
-// Global sliders plus every mask's offsets at its weight. Mirrors
-// `masks::locals`.
-fn locals(uv: vec2<f32>) -> Locals {
+// Global sliders plus every mask's offsets at its weight. `c` is the working
+// pixel before the detail stage. Mirrors `masks::locals`.
+fn locals(uv: vec2<f32>, c: vec3<f32>) -> Locals {
     var l: Locals;
     l.exposure_ev = u.exposure_ev;
     l.contrast = u.contrast;
@@ -265,9 +311,10 @@ fn locals(uv: vec2<f32>) -> Locals {
     if n == 0u {
         return l;
     }
+    let px = range_ref(c);
     for (var i = 0u; i < n; i++) {
         let m = u.masks[i];
-        let w = mask_shape(i, uv) * m.v2.x;
+        let w = mask_select(i, uv, px) * m.v2.x;
         l.exposure_ev += w * m.v3.x;
         l.contrast += w * m.v3.y;
         l.temp += w * m.v3.z;
@@ -347,7 +394,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.
     //    Masks first: they decide the slider values this pixel gets.
-    let l = locals(src);
+    let before_detail = c;
+    let l = locals(src, c);
     if l.nr_luma > 0.0 || u.nr_chroma > 0.0 || l.sharpen_amount > 0.0 {
         c = detail(src, c, l.sharpen_amount, l.nr_luma);
     }
@@ -403,8 +451,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     c = clamp(c, vec3(0.0), vec3(1.0));
     // Mask overlay — mirrored in src/masks.rs::overlay.
     if u.mask_info.y > 0.5 {
-        let shape = mask_shape(u32(u.mask_info.y) - 1u, src);
-        c = mix(c, MASK_OVERLAY_COLOUR, MASK_OVERLAY_OPACITY * shape);
+        let sel = mask_select(u32(u.mask_info.y) - 1u, src, range_ref(before_detail));
+        c = mix(c, MASK_OVERLAY_COLOUR, MASK_OVERLAY_OPACITY * sel);
     }
     // Straightened corners with no source behind them.
     if outside {

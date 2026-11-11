@@ -607,6 +607,40 @@ the list helpers, the sidecar form and the pure handle geometry
   really changed the render), `masks_on_a_real_frame_through_the_gpu_export`
   (portrait frame + crop).
 
+## Mask ranges (M2)
+
+`MaskRange` (on every `Mask`) limits the selection by brightness and / or
+hue; `MaskKind::Range` is "no shape" (shape = 1), so a range alone is a
+whole-frame mask. `masks::selection` = shape × range, **then** invert — the
+invert flips the whole selection, which is what makes inverting a pure range
+mask meaningful. `masks::shape` is geometry only.
+
+- Ranges are judged on `RangeRef::of(p, rgb)` / shader `range_ref(c)`: the
+  working pixel **before the detail stage**, after the *global* exposure,
+  temp / tint and tone-curve strength, as display-domain brightness
+  (`MASK_GAMMA`) and HSV hue / saturation. Deliberately not after contrast,
+  the tonal sliders or any mask offset: the selection must not move while
+  the mask's own sliders do. The CPU export therefore passes the pre-detail
+  `working` pixel to `masks::locals` and the detailed one to `apply_local`;
+  the shader keeps `before_detail` for the overlay.
+- `apply_at(p, uv, aspect, rgb)` uses `rgb` for both — only right where no
+  detail stage sits in between (histogram, Auto).
+- Colour weight includes `clamp(sat / HSL_FULL_SAT)`, like the per-colour
+  panel, so greys drop out; `hue_sat` in masks.rs and the shader must keep
+  the same max-channel tie order. Hue jumps where two channels tie, so the
+  colour-range parity tests allow 4 levels instead of 3.
+- Feathers are floored (`MIN_RANGE_FEATHER`) when packed into the uniforms
+  and in the CPU maths: WGSL `smoothstep` with equal edges is undefined.
+  Hues are stored in degrees in the sidecar and sent as fractions of the
+  circle (`v7`); brightness range in `v6`.
+- GUI: `App.mask_pick` arms the range eyedropper (`handle_range_pick`,
+  reading `DevelopedImage::working_patch`); adding a range mask arms it at
+  once. While armed, mask handles, pan cursor and double-click zoom stand
+  down, and it cancels the WB eyedropper (and vice versa). A grey click
+  keeps the colour picker armed instead of setting a meaningless hue.
+- Tests: `masks::tests` (range weights, hue seam, greys, invert, picking),
+  `parity_mask_*range*` on `range_source()` (every hue × brightness ramp).
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

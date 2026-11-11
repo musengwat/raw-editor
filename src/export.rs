@@ -78,11 +78,13 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     let masked = crate::masks::count(&params.masks) > 0;
     let aspect = img.width as f32 / img.height as f32;
     let global = Locals::of(params);
-    let locals = |uv: [f32; 2]| if masked { crate::masks::locals(params, uv, aspect) } else { global };
+    // `rgb` is the pixel before the detail stage: what the ranges are judged on.
+    let locals =
+        |uv: [f32; 2], rgb: [f32; 3]| if masked { crate::masks::locals(params, uv, aspect, rgb) } else { global };
     if geom.is_identity(img.width, img.height) {
-        data.par_chunks_mut(3).zip(detailed.par_chunks(3)).enumerate().for_each(|(i, (dst, src))| {
+        data.par_chunks_mut(3).zip(detailed.par_chunks(3)).zip(working.par_chunks(3)).enumerate().for_each(|(i, ((dst, src), raw))| {
             let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-            let c = apply_local(params, &locals(uv), [src[0], src[1], src[2]]);
+            let c = apply_local(params, &locals(uv, [raw[0], raw[1], raw[2]]), [src[0], src[1], src[2]]);
             for i in 0..3 {
                 dst[i] = to_u16(srgb_encode(c[i]));
             }
@@ -98,7 +100,8 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
             if !(0.0..=1.0).contains(&s[0]) || !(0.0..=1.0).contains(&s[1]) {
                 return; // black, as the shader draws it
             }
-            let c = apply_local(params, &locals(s), bilinear(&detailed, img.width, img.height, s));
+            let raw = if masked { bilinear(&working, img.width, img.height, s) } else { [0.0; 3] };
+            let c = apply_local(params, &locals(s, raw), bilinear(&detailed, img.width, img.height, s));
             for k in 0..3 {
                 dst[k] = to_u16(srgb_encode(c[k]));
             }

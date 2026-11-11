@@ -106,6 +106,27 @@ impl DevelopedImage {
         Ok(Pick { gains, clamped: gains != ideal })
     }
 
+    /// Mean working RGB (optics, white balance, matrix — what the tone chain
+    /// starts from) of the `PICK_RADIUS` window around a pixel. What the
+    /// mask range eyedroppers read.
+    pub fn working_patch(&self, x: usize, y: usize, p: &AdjustParams) -> [f32; 3] {
+        let col = Colour::resolve(&self.colour, p);
+        let optics = self.optics(p);
+        let r = PICK_RADIUS;
+        let (mut sum, mut n) = ([0f64; 3], 0u32);
+        for py in y.saturating_sub(r)..(y + r + 1).min(self.height) {
+            for px in x.saturating_sub(r)..(x + r + 1).min(self.width) {
+                let i = py * self.width + px;
+                let c = to_working(&col, self.camera_rgb(&optics, i), self.clip_at(i));
+                for k in 0..3 {
+                    sum[k] += c[k] as f64;
+                }
+                n += 1;
+            }
+        }
+        sum.map(|v| (v / n.max(1) as f64) as f32)
+    }
+
     pub fn clip_at(&self, i: usize) -> f32 {
         self.clip.get(i).copied().unwrap_or(0.0)
     }
