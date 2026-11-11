@@ -10,7 +10,7 @@
 use rayon::prelude::*;
 
 use crate::develop::DevelopedImage;
-use crate::pipeline::{AdjustParams, Colour, Frame, apply_at, srgb_encode, to_working};
+use crate::pipeline::{AdjustParams, Colour, Frame, apply_local, srgb_encode, to_working};
 
 pub const BINS: usize = 256;
 /// Long side of the copy the histogram is computed from. ~190k pixels on a
@@ -40,7 +40,7 @@ pub fn downsample(img: &DevelopedImage, long_side: usize) -> DevelopedImage {
             }
         }
     }
-    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone() }
+    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone(), local: img.local.clone() }
 }
 
 /// Box-averaged copy whose long side is at most `long_side` — for pictures
@@ -69,7 +69,7 @@ pub fn box_downsample(img: &DevelopedImage, long_side: usize) -> DevelopedImage 
         .collect();
     let data = px.iter().flat_map(|(c, _)| *c).collect();
     let clip = if img.clip.is_empty() { Vec::new() } else { px.iter().map(|(_, k)| *k).collect() };
-    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone() }
+    DevelopedImage { width: w, height: h, data, clip, colour: img.colour, flat: img.flat.clone(), local: img.local.clone() }
 }
 
 pub fn compute(img: &DevelopedImage, p: &AdjustParams) -> Histogram {
@@ -86,7 +86,11 @@ pub fn compute(img: &DevelopedImage, p: &AdjustParams) -> Histogram {
             || (Box::new([[0u32; BINS]; 3]), [0u32; 3]),
             |(mut bins, mut over), i| {
                 let uv = [((i % img.width) as f32 + 0.5) / img.width as f32, ((i / img.width) as f32 + 0.5) / img.height as f32];
-                let c = apply_at(p, &frame, uv, to_working(&col, img.camera_rgb(&optics, i), img.clip_at(i)));
+                // Masks judge the pixel before texture / clarity scale it.
+                let rgb = to_working(&col, img.camera_rgb(&optics, i), img.clip_at(i));
+                let g = img.local_gain(p, [img.data[i * 3], img.data[i * 3 + 1], img.data[i * 3 + 2]], uv);
+                let l = frame.locals(p, uv, frame.geom.output_uv(uv), rgb);
+                let c = apply_local(p, &l, [rgb[0] * g, rgb[1] * g, rgb[2] * g]);
                 for ch in 0..3 {
                     let b = (srgb_encode(c[ch]) * (BINS - 1) as f32 + 0.5) as usize;
                     bins[ch][b.min(BINS - 1)] += 1;

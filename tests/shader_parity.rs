@@ -64,7 +64,7 @@ fn render_image_sized(
     h: usize,
 ) -> Vec<[u8; 4]> {
     let view = View::one_to_one([1.0 / img.width as f32, 1.0 / img.height as f32]);
-    let mut uniforms = Uniforms::new(params, &img.colour, view, false);
+    let mut uniforms = Uniforms::new(params, &img.colour, view, false).with_local(img.local.as_deref());
     uniforms.show_clip = if show_clip { 1.0 } else { 0.0 };
     render_uniforms(device, queue, img, &uniforms, w, h)
 }
@@ -1051,4 +1051,71 @@ fn parity_vibrance() {
         assert_parity(AdjustParams { saturation: -0.5, exposure_ev: 0.4, ..p });
         assert_image_parity(&mask_source(), AdjustParams { saturation: 0.4, tone_curve: 1.0, ..p });
     }
+}
+
+// --- Texture and clarity ----------------------------------------------------
+
+/// Soft blobs, a hard edge and per-pixel noise, in camera RGB with a white
+/// balance — detail at every scale the two sliders look at.
+fn local_source() -> DevelopedImage {
+    let (w, h) = (64usize, 40usize);
+    let mut img = camera_source();
+    let mut data = vec![0f32; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let side = if x < w / 2 { 0.08 } else { 0.25 };
+            let (dx, dy) = (x as f32 - 44.0, y as f32 - 20.0);
+            let blob = 1.0 + 0.5 * (-(dx * dx + dy * dy) / 30.0).exp();
+            let n = if (x + y) % 2 == 0 { 1.06 } else { 0.94 };
+            let o = (y * w + x) * 3;
+            data[o] = side * blob * n * 0.5;
+            data[o + 1] = side * blob * n;
+            data[o + 2] = side * blob * n * 0.7;
+        }
+    }
+    img.width = w;
+    img.height = h;
+    img.data = data;
+    img.clip = Vec::new();
+    img.with_local()
+}
+
+#[test]
+fn parity_texture_and_clarity() {
+    let img = local_source();
+    for (texture, clarity) in [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (0.6, 0.8), (-0.5, 0.7)] {
+        let p = AdjustParams { texture, clarity, tone_curve: 0.6, exposure_ev: 0.5, ..Default::default() };
+        // They do something…
+        let (with, without) = (
+            raw_editor::export::render_cpu(&img, &p),
+            raw_editor::export::render_cpu(&img, &AdjustParams { texture: 0.0, clarity: 0.0, ..p }),
+        );
+        let changed = with.data.iter().zip(&without.data).filter(|(a, b)| a.abs_diff(**b) > 300).count();
+        // (Opposite signs partly cancel on this frame, hence the low bar.)
+        assert!(changed > with.data.len() / 40, "texture {texture} clarity {clarity}: only {changed} samples changed");
+        // …and the same thing on both sides, cropped and turned too, and
+        // together with the detail stage and a mask.
+        assert_geometry_parity(&img, p, 3);
+        assert_geometry_parity(&img, AdjustParams { rotation: 1, crop: [0.125, 0.25, 0.875, 1.0], ..p }, 3);
+        let mut q = AdjustParams { sharpen_amount: 0.8, nr_luma: 0.4, ..p };
+        q.masks[0] = Mask { adjust: MaskAdjust { exposure_ev: 0.6, ..Default::default() }, ..Mask::radial([0.6, 0.5], 0.3) };
+        assert_geometry_parity(&img, q, 3);
+    }
+}
+
+/// Without bases (a synthetic image, or an old code path that forgot to
+/// build them) the sliders must do nothing rather than read a missing
+/// texture.
+#[test]
+fn texture_and_clarity_need_the_bases() {
+    let Some(ctx) = common::gpu() else { return };
+    let img = mask_source();
+    assert!(img.local.is_none());
+    let p = AdjustParams { texture: 1.0, clarity: 1.0, ..Default::default() };
+    assert_eq!(
+        render_image(&ctx.device, &ctx.queue, &img, &p),
+        render_image(&ctx.device, &ctx.queue, &img, &AdjustParams::default())
+    );
+    let (a, b) = (raw_editor::export::render_cpu(&img, &p), raw_editor::export::render_cpu(&img, &AdjustParams::default()));
+    assert_eq!(a.data, b.data);
 }

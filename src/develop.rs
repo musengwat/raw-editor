@@ -61,12 +61,33 @@ pub struct DevelopedImage {
     /// opened the file (it comes from the settings, keyed by lens); used only
     /// when `AdjustParams::flat_field` is on.
     pub flat: Option<std::sync::Arc<FlatField>>,
+    /// The smoothed copies texture and clarity work against, built when a
+    /// photo is opened ([`DevelopedImage::with_local`]). `None` on synthetic
+    /// images: the two sliders then do nothing.
+    pub local: Option<std::sync::Arc<crate::local::LocalBase>>,
 }
 
 impl DevelopedImage {
     /// An image whose data is already linear sRGB (tests, synthetic input).
     pub fn linear_srgb(width: usize, height: usize, data: Vec<f32>) -> Self {
-        Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB, flat: None }
+        Self { width, height, data, clip: Vec::new(), colour: ImageColour::LINEAR_SRGB, flat: None, local: None }
+    }
+
+    /// Build the texture / clarity bases for this image (see
+    /// [`crate::local`]). Without them those two sliders do nothing.
+    pub fn with_local(mut self) -> Self {
+        self.local = Some(std::sync::Arc::new(crate::local::LocalBase::build(&self)));
+        self
+    }
+
+    /// What texture and clarity multiply pixel `cam` (camera RGB as stored,
+    /// before optics) at source uv `uv` by; 1 when both are off or the
+    /// image has no bases.
+    pub fn local_gain(&self, p: &AdjustParams, cam: [f32; 3], uv: [f32; 2]) -> f32 {
+        match &self.local {
+            Some(b) if p.texture != 0.0 || p.clarity != 0.0 => b.gain(cam, uv, p.texture, p.clarity),
+            _ => 1.0,
+        }
     }
 
     /// Eyedropper: white-balance gains that make the area around `(x, y)`
@@ -269,7 +290,7 @@ pub fn develop(raw: &RawImage) -> Result<DevelopedImage> {
     let (out, clip) = demosaic(&mosaic, (ax, ay, aw, ah), Demosaic::Mhc);
 
     let colour = ImageColour { as_shot_wb: [wb[0], wb[1], wb[2]], cam_to_srgb, turns: orientation_turns(raw.orientation) };
-    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None })
+    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None, local: None })
 }
 
 /// Demosaic algorithm.

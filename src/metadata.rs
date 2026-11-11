@@ -98,6 +98,14 @@ impl ExportMetadata {
 /// files) comes back as an error: in the GUI it would otherwise kill the
 /// loader thread silently and leave the window on "Loading…" for good.
 pub fn develop_file(path: &Path) -> Result<crate::develop::DevelopedImage> {
+    // The texture / clarity bases are part of opening a photo: every render
+    // of it (screen, export, batch) must have them.
+    develop_file_plain(path).map(crate::develop::DevelopedImage::with_local)
+}
+
+/// [`develop_file`] without the texture / clarity bases, for callers that
+/// only want the pixels (the HDR merge reads several frames this way).
+pub fn develop_file_plain(path: &Path) -> Result<crate::develop::DevelopedImage> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| develop_file_inner(path))).unwrap_or_else(|panic| {
         let why = panic
             .downcast_ref::<&str>()

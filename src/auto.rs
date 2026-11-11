@@ -42,6 +42,8 @@ struct Sample {
     uv: [f32; 2],
     out_uv: [f32; 2],
     frame: Frame,
+    /// What texture and clarity multiply it by.
+    gain: f32,
     /// Clipped at the sensor already: going white is not Auto's doing.
     clipped: bool,
 }
@@ -62,6 +64,7 @@ fn samples(preview: &DevelopedImage, p: &AdjustParams) -> Vec<Sample> {
             uv: uv(i),
             out_uv: frame.geom.output_uv(uv(i)),
             frame,
+            gain: preview.local_gain(p, [preview.data[i * 3], preview.data[i * 3 + 1], preview.data[i * 3 + 2]], uv(i)),
             clipped: preview.clip_at(i) > 0.0,
         })
         .collect()
@@ -71,7 +74,7 @@ fn median_and_new_clip(s: &[Sample], q: &AdjustParams) -> (f32, f32) {
     let mut lum = Vec::with_capacity(s.len());
     let (mut fresh, mut blown) = (0usize, 0usize);
     for px in s {
-        let o = apply_local(q, &px.frame.locals(q, px.uv, px.out_uv, px.rgb), px.rgb);
+        let o = apply_local(q, &px.frame.locals(q, px.uv, px.out_uv, px.rgb), px.rgb.map(|v| v * px.gain));
         lum.push(encode(0.2126 * o[0] + 0.7152 * o[1] + 0.0722 * o[2]));
         if !px.clipped {
             fresh += 1;

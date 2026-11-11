@@ -185,7 +185,7 @@ pub fn merge_files(
     let mut metas = Vec::with_capacity(set.len());
     for (i, path) in set.iter().enumerate() {
         progress(&format!("developing frame {}/{}", i + 1, set.len()));
-        frames.push(crate::metadata::develop_file(path)?);
+        frames.push(crate::metadata::develop_file_plain(path)?);
         let meta = crate::metadata::read(path).ok();
         evs.push(meta.as_ref().and_then(|m| crate::bracket::Shot::from_metadata(path, m).ev));
         metas.push(meta);
@@ -327,6 +327,7 @@ pub fn merge(frames: &[DevelopedImage], evs: &[Option<f32>]) -> Result<(Develope
         clip,
         colour: frames[reference].colour,
         flat: None,
+        local: None,
     };
     let centre = [w as f32 / 2.0, h as f32 / 2.0];
     let shifts = warps
@@ -835,7 +836,7 @@ pub fn local_tone_map(w: usize, h: usize, rgb: &[f32], style: Style) -> Vec<f32>
 /// Guided filter of `px` guided by itself (He et al.), returning the
 /// per-pixel linear coefficients `(a, b)`, already box-averaged: the
 /// filtered value at a pixel with value `v` is `a·v + b`.
-fn guided(px: &[f32], w: usize, h: usize, r: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn guided(px: &[f32], w: usize, h: usize, r: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
     let mean_i = box_blur(px, w, h, r);
     let sq: Vec<f32> = px.iter().map(|v| v * v).collect();
     let mean_ii = box_blur(&sq, w, h, r);
@@ -914,7 +915,7 @@ fn soft_limit(c: [f32; 3]) -> [f32; 3] {
 }
 
 /// Mean of each `k`×`k` block.
-fn box_downsample(px: &[f32], w: usize, h: usize, k: usize) -> Vec<f32> {
+pub(crate) fn box_downsample(px: &[f32], w: usize, h: usize, k: usize) -> Vec<f32> {
     if k == 1 {
         return px.to_vec();
     }
@@ -936,7 +937,7 @@ fn box_downsample(px: &[f32], w: usize, h: usize, k: usize) -> Vec<f32> {
 }
 
 /// Bilinear sample of a `k`-times-smaller grid at full-resolution `(x, y)`.
-fn upsample(g: &[f32], sw: usize, sh: usize, k: usize, x: usize, y: usize) -> f32 {
+pub(crate) fn upsample(g: &[f32], sw: usize, sh: usize, k: usize, x: usize, y: usize) -> f32 {
     if k == 1 {
         return g[y * sw + x];
     }
@@ -967,19 +968,21 @@ pub fn box_blur(px: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let mut rows = vec![0f32; w * h];
     rows.par_chunks_mut(w).zip(px.par_chunks(w)).for_each(|(d, s)| run(s, w, 1, d));
     // Columns: transpose, blur as rows, transpose back.
+    // (Both transposes in parallel: on a 2 MP plane the serial version cost
+    // more than the blur itself.)
     let mut t = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            t[x * h + y] = rows[y * w + x];
+    t.par_chunks_mut(h).enumerate().for_each(|(x, col)| {
+        for (y, v) in col.iter_mut().enumerate() {
+            *v = rows[y * w + x];
         }
-    }
+    });
     let mut tb = vec![0f32; w * h];
     tb.par_chunks_mut(h).zip(t.par_chunks(h)).for_each(|(d, s)| run(s, h, 1, d));
-    for y in 0..h {
-        for x in 0..w {
-            rows[y * w + x] = tb[x * h + y];
+    rows.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, v) in row.iter_mut().enumerate() {
+            *v = tb[x * h + y];
         }
-    }
+    });
     rows
 }
 
@@ -1038,7 +1041,7 @@ mod tests {
                 clip[i] = if r >= 1.0 { 1.0 } else { 0.0 };
             }
         }
-        DevelopedImage { width: w, height: h, data, clip, colour: ImageColour::LINEAR_SRGB, flat: None }
+        DevelopedImage { width: w, height: h, data, clip, colour: ImageColour::LINEAR_SRGB, flat: None, local: None }
     }
 
     #[test]

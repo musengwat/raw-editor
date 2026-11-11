@@ -110,7 +110,7 @@ pub fn develop_linear_raw(raw: &RawImage, cam_to_srgb: [[f32; 3]; 3], turns: u8)
     let g = wb[1];
     let as_shot = std::array::from_fn(|i| if wb[i].is_finite() && wb[i] > 0.0 && g > 0.0 { wb[i] / g } else { 1.0 });
     let colour = ImageColour { as_shot_wb: as_shot, cam_to_srgb, turns };
-    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None })
+    Ok(DevelopedImage { width: aw, height: ah, data: out, clip, colour, flat: None, local: None })
 }
 
 /// sRGB transfer function, encoded → linear.
@@ -136,7 +136,7 @@ pub fn open_tiff(path: &Path) -> Result<DevelopedImage> {
         data.par_iter_mut().for_each(|v| *v = srgb_to_linear(*v));
     }
     let clip = if float { Vec::new() } else { clip_mask(&data) };
-    Ok(DevelopedImage { width: w, height: h, data, clip, colour: ImageColour::LINEAR_SRGB, flat: None })
+    Ok(DevelopedImage { width: w, height: h, data, clip, colour: ImageColour::LINEAR_SRGB, flat: None, local: None })
 }
 
 /// A warning to show when a TIFF carries a colour profile the editor will not

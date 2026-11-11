@@ -83,13 +83,17 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     let locals = |src: [f32; 2], out: [f32; 2], rgb: [f32; 3]| {
         if placed { frame.locals(params, src, out, rgb) } else { global }
     };
+    // Texture / clarity: a gain from the stored camera pixel and the bases.
+    let local = img.local.as_ref().filter(|_| params.texture != 0.0 || params.clarity != 0.0);
+    let scaled = |c: [f32; 3], g: f32| [c[0] * g, c[1] * g, c[2] * g];
     // Grain is tied to the source pixel grid.
     let (sw, sh) = (img.width as f32, img.height as f32);
     let finish = |c: [f32; 3], src: [f32; 2]| crate::effects::apply_grain(params, c, [src[0] * sw, src[1] * sh]);
     if geom.is_identity(img.width, img.height) {
         data.par_chunks_mut(3).zip(detailed.par_chunks(3)).zip(working.par_chunks(3)).enumerate().for_each(|(i, ((dst, src), raw))| {
             let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-            let c = finish(apply_local(params, &locals(uv, uv, [raw[0], raw[1], raw[2]]), [src[0], src[1], src[2]]), uv);
+            let g = local.map_or(1.0, |b| b.gain([img.data[i * 3], img.data[i * 3 + 1], img.data[i * 3 + 2]], uv, params.texture, params.clarity));
+            let c = finish(apply_local(params, &locals(uv, uv, [raw[0], raw[1], raw[2]]), scaled([src[0], src[1], src[2]], g)), uv);
             for i in 0..3 {
                 dst[i] = to_u16(srgb_encode(c[i]));
             }
@@ -106,7 +110,8 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
                 return; // black, as the shader draws it
             }
             let raw = if masked { bilinear(&working, img.width, img.height, s) } else { [0.0; 3] };
-            let c = finish(apply_local(params, &locals(s, uv, raw), bilinear(&detailed, img.width, img.height, s)), s);
+            let g = local.map_or(1.0, |b| b.gain(bilinear(&img.data, img.width, img.height, s), s, params.texture, params.clarity));
+            let c = finish(apply_local(params, &locals(s, uv, raw), scaled(bilinear(&detailed, img.width, img.height, s), g)), s);
             for k in 0..3 {
                 dst[k] = to_u16(srgb_encode(c[k]));
             }
@@ -151,7 +156,7 @@ pub fn render_gpu(
     // One output pixel per source pixel, so the detail filters step by exactly
     // one source texel and the export matches the 1:1 preview.
     let view = View::one_to_one([1.0 / w as f32, 1.0 / h as f32]);
-    renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false));
+    renderer.write_uniforms(queue, &Uniforms::new(params, &img.colour, view, false).with_local(img.local.as_deref()));
     // The target is the cropped / rotated output; the texel above stays the
     // source's, so detail still steps one source pixel.
     let (w, h) = (geom.width, geom.height);

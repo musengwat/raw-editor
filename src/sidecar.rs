@@ -176,6 +176,8 @@ mod tests {
             straighten: -1.5,
             crop: [0.05, 0.1, 0.95, 0.85],
             vibrance: -0.25,
+            texture: 0.35,
+            clarity: 0.5,
             vignette_amount: -0.45,
             vignette_midpoint: 0.35,
             vignette_feather: 0.8,

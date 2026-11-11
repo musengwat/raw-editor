@@ -1406,6 +1406,14 @@ impl App {
             resettable(ui, &mut p.contrast, d.contrast, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Contrast")));
             resettable(ui, &mut p.temp, d.temp, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Temp")));
             resettable(ui, &mut p.tint, d.tint, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Tint")));
+            resettable(ui, &mut p.texture, d.texture, |ui, v| {
+                ui.add(egui::Slider::new(v, -1.0..=1.0).text("Texture"))
+                    .on_hover_text("Fine surface detail — bark, fabric, skin. Left smooths it. Judge it at 100%")
+            });
+            resettable(ui, &mut p.clarity, d.clarity, |ui, v| {
+                ui.add(egui::Slider::new(v, -1.0..=1.0).text("Clarity"))
+                    .on_hover_text("Local contrast: gives shapes more depth without changing the overall brightness. Left gives a soft glow")
+            });
             resettable(ui, &mut p.vibrance, d.vibrance, |ui, v| {
                 ui.add(egui::Slider::new(v, -1.0..=1.0).text("Vibrance"))
                     .on_hover_text("Saturation for the muted colours; ones that are vivid already (and skin) hardly move")
@@ -2450,6 +2458,7 @@ impl App {
         } else {
             Uniforms::new(&shown, &colour, view, target_is_srgb)
         };
+        uniforms = uniforms.with_local(self.image.as_ref().and_then(|img| img.local.as_deref()));
         uniforms.show_clip = if self.show_clip { 1.0 } else { 0.0 };
         if masking && self.mask_overlay {
             uniforms.mask_info = masks::uniforms(&shown.masks, self.selected_mask()).0;

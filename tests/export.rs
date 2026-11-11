@@ -389,6 +389,53 @@ fn masks_on_a_real_frame_through_the_gpu_export() {
     }
 }
 
+/// Texture and clarity on a real frame, opened the way the editor opens it
+/// (so the bases are the quarter-size ones a 16 MP photo gets): GPU and CPU
+/// exports agree, and the sliders change the picture's local contrast but
+/// not its typical tone. Skips without testdata.
+#[test]
+fn texture_and_clarity_on_a_real_frame_through_the_gpu_export() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/portrait/P1050191.rw2");
+    if !path.exists() {
+        eprintln!("SKIP: testdata not present");
+        return;
+    }
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    let img = raw_editor::metadata::develop_file(&path).unwrap();
+    let base = img.local.as_ref().expect("opening a photo builds the bases");
+    assert!(base.width < img.width / 3, "quarter size: {} for {}", base.width, img.width);
+
+    let plain = AdjustParams { tone_curve: 1.0, ..Default::default() };
+    let p = AdjustParams { texture: 0.7, clarity: 0.8, crop: [0.1, 0.1, 0.9, 0.9], ..plain };
+    let gpu = export::render_gpu(&ctx.device, &ctx.queue, &img, &p).unwrap();
+    let cpu = export::render_cpu(&img, &p);
+    let worst = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    let mean = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b) as f64).sum::<f64>() / gpu.data.len() as f64;
+    eprintln!("GPU vs CPU with texture + clarity: mean {mean:.1}, worst {worst} (of 65535)");
+    assert!(mean < 64.0 && worst < 1024, "GPU and CPU disagree: mean {mean:.1}, worst {worst}");
+
+    let without = export::render_gpu(&ctx.device, &ctx.queue, &img, &AdjustParams { crop: p.crop, ..plain }).unwrap();
+    let stats = |r: &export::Rendered| {
+        // The median, not the mean: pushing pixels away from their
+        // surroundings by a *ratio* keeps the typical tone where it was but
+        // raises the arithmetic mean (the brighter side gains more than the
+        // darker side loses) — 9% on this dark, noisy frame.
+        let mut g: Vec<f64> = r.data.chunks(3).step_by(7).map(|c| c[1] as f64).collect();
+        g.sort_by(|a, b| a.total_cmp(b));
+        let mean = g[g.len() / 2];
+        // Mean step between horizontal neighbours: a plain measure of detail.
+        let detail = r.data.chunks(3).zip(r.data.chunks(3).skip(1)).step_by(5).map(|(a, b)| (a[1] as f64 - b[1] as f64).abs()).sum::<f64>();
+        (mean, detail)
+    };
+    let ((m0, d0), (m1, d1)) = (stats(&without), stats(&gpu));
+    eprintln!("median {m0:.0} -> {m1:.0}, detail x{:.2}", d1 / d0);
+    assert!(d1 > d0 * 1.3, "detail only x{:.2}", d1 / d0);
+    assert!((m1 / m0 - 1.0).abs() < 0.04, "the typical tone moved: {m0:.0} -> {m1:.0}");
+}
+
 /// A portrait G85 frame (EXIF orientation 8): rawler reports it as Normal,
 /// so the turn must come from the EXIF, and the export must come out tall.
 /// Skips without testdata.

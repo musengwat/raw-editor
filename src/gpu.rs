@@ -102,6 +102,18 @@ impl ImageRenderer {
                     },
                     count: None,
                 },
+                // The texture / clarity bases: smoothed luminance at two
+                // scales, a quarter of the image's size.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -212,6 +224,11 @@ impl ImageRenderer {
             // field is switched on, but the binding must always exist.
             None => upload_rgba16f(device, queue, "no flat field", 1, 1, &[[1.0; 3]]),
         };
+        let local_view = match &img.local {
+            Some(b) => upload_rgba16f(device, queue, "local bases", b.width, b.height, &b.base),
+            // Never sampled (the uniforms say there are none), but bound.
+            None => upload_rgba16f(device, queue, "no local bases", 1, 1, &[[1.0; 3]]),
+        };
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("adjust"),
             layout: &self.bind_group_layout,
@@ -231,6 +248,10 @@ impl ImageRenderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&flat_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&local_view),
                 },
             ],
         }));

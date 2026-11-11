@@ -102,6 +102,10 @@ pub struct AdjustParams {
     pub tint: f32,
     /// -1..1, luma-preserving saturation.
     pub saturation: f32,
+    /// -1..1, fine surface detail: see [`crate::local`].
+    pub texture: f32,
+    /// -1..1, local contrast: see [`crate::local`].
+    pub clarity: f32,
     /// -1..1, saturation for the colours that have least of it: muted
     /// colours move the most, already vivid ones (and so skin, mostly)
     /// hardly at all.
@@ -205,6 +209,8 @@ impl Default for AdjustParams {
             temp: 0.0,
             tint: 0.0,
             saturation: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
             vibrance: 0.0,
             tone_curve: 0.0,
             curves: Curves::default(),
@@ -312,6 +318,8 @@ impl AdjustParams {
                 self.tint = d.tint;
                 self.saturation = d.saturation;
                 self.vibrance = d.vibrance;
+                self.texture = d.texture;
+                self.clarity = d.clarity;
                 self.tone_curve = d.tone_curve;
             }
             Section::Tonal => {
@@ -570,7 +578,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 2016 bytes.
+/// Total size 2048 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -609,6 +617,12 @@ pub struct Uniforms {
     pub vig1: [f32; 4],
     /// `[grain amount, grain size, vibrance, _]`.
     pub effects: [f32; 4],
+    /// Texture / clarity: the base's luminance weights on camera RGB in
+    /// `.rgb`, 1.0 in `.w` when the image has bases — set by whoever binds
+    /// the image ([`Uniforms::with_local`]); zero otherwise.
+    pub local0: [f32; 4],
+    /// `[texture, clarity, _, _]`.
+    pub local1: [f32; 4],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -825,6 +839,8 @@ impl Uniforms {
             vig0: crate::effects::Vignette::uniforms(Frame::vignette(p, img, view)).0,
             vig1: crate::effects::Vignette::uniforms(Frame::vignette(p, img, view)).1,
             effects: [p.grain_amount.max(0.0), p.grain_size.max(crate::effects::GRAIN_MIN_SIZE), p.vibrance, 0.0],
+            local0: [0.0; 4],
+            local1: [p.texture, p.clarity, 0.0, 0.0],
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -846,6 +862,16 @@ impl Uniforms {
             nr_chroma: p.nr_chroma,
             show_clip: 0.0,
         }
+    }
+
+    /// Tell the shader about the image's texture / clarity bases. They
+    /// belong to the image, not to `AdjustParams` or `ImageColour`, so this
+    /// is a separate step: without it the two sliders do nothing.
+    pub fn with_local(mut self, local: Option<&crate::local::LocalBase>) -> Self {
+        if let Some(b) = local {
+            self.local0 = [b.weights[0], b.weights[1], b.weights[2], 1.0];
+        }
+        self
     }
 
     /// Uniforms that pass the image through untouched — used by the
@@ -1142,6 +1168,8 @@ mod tests {
             rotation: 1,
             straighten: 2.0,
             crop: [0.1, 0.1, 0.9, 0.8],
+            texture: 0.3,
+            clarity: -0.2,
             vibrance: 0.2,
             vignette_amount: -0.3,
             vignette_midpoint: 0.4,
@@ -1370,8 +1398,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_2016_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 2016);
+    fn uniforms_layout_is_2048_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 2048);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -1395,6 +1423,8 @@ mod tests {
             &u.vig0 as *const _ as usize,
             &u.vig1 as *const _ as usize,
             &u.effects as *const _ as usize,
+            &u.local0 as *const _ as usize,
+            &u.local1 as *const _ as usize,
             &u.scale as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);

@@ -692,6 +692,50 @@ shader — after the filmic `tone_curve`, before lift/gamma/gain.
   0; skipped when 0 so old renders are bit-identical.
 - Uniforms are 2016 bytes. New `Section::Effects`.
 
+## Texture and clarity (T3)
+
+`src/local.rs`. `LocalBase` holds two guided-filtered copies of the photo's
+luminance (fine for texture, coarse for clarity) at a quarter of its size;
+`gain(y, base, texture, clarity)` = (y / fine)^texture · (y / coarse)^clarity
+(ratios clamped to 4x) multiplies the working pixel as step 0b — after the
+detail stage, before exposure. Shader twin: `local_gain`, binding 4
+(`local_tex`), uniforms `local0` (weights + "bases bound") and `local1`.
+
+- **The base is in camera space and so is the pixel.** Luminance =
+  `as_shot_wb · [0.25, 0.5, 0.25]` on the *stored* camera RGB (before
+  optics, WB, matrix), for the base and for the pixel alike, so the ratio
+  depends on no slider. Do not "simplify" this to working luminance: every
+  WB or exposure move would then change what counts as detail.
+- **`DevelopedImage.local`** is built by `metadata::develop_file` (the one
+  entry point) via `with_local`; `develop_file_plain` skips it (HDR merge
+  frames). Synthetic images have `None` and the sliders do nothing — on
+  both sides (`texture_and_clarity_need_the_bases`). The histogram / look
+  thumbnail copies share the parent's `Arc`.
+- **`Uniforms::new` cannot know about the base** (it takes `ImageColour`):
+  every caller that binds an image must chain `.with_local(img.local
+  .as_deref())` — the GUI's `image_panel`, `render_gpu`, the parity
+  harness. Forget it and the sliders silently do nothing on the GPU.
+- Guided filter, not a blur: with a Gaussian base a 1.5-stop edge overshot
+  by ~50% at full clarity; with `COARSE_EPS` 0.1 it is under 10%
+  (`clarity_lifts_local_contrast_without_ringing_a_hard_edge`). The filter
+  runs in log2 so the edge threshold is in stops.
+- Cost: the coarse filter runs on a 1/16-size copy and only its
+  coefficients are upsampled ("fast guided filter"); `hdr::box_blur`'s
+  transposes were made parallel for this. Measured on this box: +80 ms on a
+  33 MP A7 IV file (755 → 835 ms develop), +40 ms on 16 MP. The first
+  version (both filters at quarter size, serial transposes) cost +270 ms.
+- Base values are f16-rounded on the CPU because they are uploaded as
+  rgba16float; `LocalBase::sample` mirrors the sampler like
+  `FlatField::sample`.
+- Masks' ranges are judged on the pixel *before* this gain (and before
+  detail), as in the shader. Texture / clarity are global only for now;
+  making them maskable means adding them to `Locals`.
+- The gain is a ratio, so it preserves the *median* tone, not the mean:
+  on a dark noisy frame the arithmetic mean rose 9% at texture 0.7 /
+  clarity 0.8 while the median stayed put. The real-frame test checks the
+  median for that reason.
+- Uniforms are 2048 bytes.
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

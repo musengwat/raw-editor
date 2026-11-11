@@ -34,6 +34,8 @@ struct Uniforms {
     vig0: vec4<f32>,       // vignette: ev, start, end, power (all zero = off)
     vig1: vec4<f32>,       // vignette: kx, ky, norm
     effects: vec4<f32>,    // grain amount, grain size, vibrance
+    local0: vec4<f32>,     // .rgb = base luminance weights on camera RGB, .w = bases bound
+    local1: vec4<f32>,     // texture, clarity
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -62,6 +64,8 @@ struct Uniforms {
 @group(0) @binding(2) var samp: sampler;
 // Lens flat field: camera-RGB gains on a coarse grid (1x1 white when none).
 @group(0) @binding(3) var flat_tex: texture_2d<f32>;
+// Texture / clarity bases: .r = fine, .g = coarse smoothed luminance.
+@group(0) @binding(4) var local_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -396,6 +400,22 @@ fn locals(uv: vec2<f32>, c: vec3<f32>) -> Locals {
     return l;
 }
 
+// --- Texture and clarity — mirrors src/local.rs ---------------------------
+
+const TEXTURE_GAIN: f32 = 1.0;
+const CLARITY_GAIN: f32 = 0.8;
+const LOCAL_MAX_RATIO: f32 = 4.0;
+
+// What to multiply the working pixel by: how far the pixel's luminance is
+// from the two smoothed bases, raised to the sliders. `cam` is the camera
+// RGB sample as stored. Mirrors `local::gain`.
+fn local_gain(cam: vec3<f32>, uv: vec2<f32>) -> f32 {
+    let base = textureSampleLevel(local_tex, samp, uv, 0.0).rg;
+    let y = max(dot(cam, u.local0.rgb), 1e-6);
+    let ratio = clamp(vec2(y) / max(base, vec2(1e-6)), vec2(1.0 / LOCAL_MAX_RATIO), vec2(LOCAL_MAX_RATIO));
+    return pow(ratio.x, u.local1.x * TEXTURE_GAIN) * pow(ratio.y, u.local1.y * CLARITY_GAIN);
+}
+
 // --- Vignette and grain — mirrors src/effects.rs --------------------------
 
 const GRAIN_MAX: f32 = 0.14;
@@ -493,7 +513,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Everything after works in source uv, so optics and detail are unchanged.
     let src = vec2(dot(u.geom0.xyz, vec3(in.uv, 1.0)), dot(u.geom1.xyz, vec3(in.uv, 1.0)));
     // Sampled before the outside test: textureSample needs uniform control flow.
-    var c = to_working(textureSample(tex, samp, src), src);
+    let stored = textureSample(tex, samp, src);
+    var c = to_working(stored, src);
     let outside = any(src < vec2(0.0)) || any(src > vec2(1.0));
     // Source pixels per screen pixel (1 at 100% and in exports). Derivatives
     // need uniform control flow too, so this is taken here, unconditionally.
@@ -509,6 +530,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if l.nr_luma > 0.0 || u.nr_chroma > 0.0 || l.sharpen_amount > 0.0 {
         c = detail(src, c, l.sharpen_amount, l.nr_luma);
+    }
+
+    // 0b. Texture and clarity: a local exposure change, before the tone chain.
+    if u.local0.w > 0.5 && (u.local1.x != 0.0 || u.local1.y != 0.0) {
+        c *= local_gain(stored.rgb, src);
     }
 
     // 1. Exposure + white balance as combined per-channel gains.

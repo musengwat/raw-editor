@@ -136,7 +136,8 @@ Everyday use:
   each for red, green and blue, with the histogram behind it
 - [x] T2 — **vignette** (follows the crop; amount, midpoint, feather,
   roundness), **film grain** (amount, size) and **vibrance**
-- [ ] T3 — texture and clarity
+- [x] T3 — **texture** (fine surface detail) and **clarity** (local
+  contrast), both ways, without halos at hard edges
 - [ ] T4 — shadows / midtones / highlights colour grading
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
@@ -172,6 +173,15 @@ casts by tone — lift the blue curve's left end and the shadows turn blue. A
 dot marks the channels that have been changed; ↺ resets the one showing. The
 curve passes through every point and never overshoots between two of them.
 It comes after the look's own *Tone curve* slider and the tonal ranges.
+
+**Texture and clarity** (under Basic) are local contrast at two scales.
+*Texture* strengthens fine surface detail — sand, bark, fabric — or, to the
+left, smooths it (skin) without blurring edges; judge it at 100%. *Clarity*
+works on larger shapes: it gives clouds, rocks and faces more depth, and to
+the left a soft glow. Neither shifts the photo's overall exposure, and strong
+edges such as a horizon are left alone rather than ringed with a halo. They
+compare each pixel with a smoothed copy of the photo that is prepared when
+it opens (about a tenth of a second on a 33 MP file).
 
 **Effects**: *Vignette* darkens (left) or brightens (right) the corners of
 the frame *as cropped*; *Midpoint* is how far in it reaches, *Feather* how

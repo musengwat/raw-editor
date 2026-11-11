@@ -13,6 +13,7 @@ pub mod hdr;
 pub mod histogram;
 pub mod history;
 pub mod immich;
+pub mod local;
 pub mod looks;
 pub mod masks;
 pub mod metadata;
