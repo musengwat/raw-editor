@@ -29,6 +29,8 @@ struct Uniforms {
     geom1: vec4<f32>,      // row 1
     mask_info: vec4<f32>,  // .x = slots to evaluate, .y = overlay slot + 1 (0 = none)
     masks: array<MaskU, 8>,
+    curve_info: vec4<f32>, // points in the rgb, r, g, b point curves (0 = off)
+    curves: array<vec4<f32>, 32>, // [x, y, tangent, _], eight per curve
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -110,6 +112,63 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     // NDC y is up, texture v is down.
     out.uv = vec2(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
     return out;
+}
+
+fn srgb_decode(v: vec3<f32>) -> vec3<f32> {
+    let lo = v / 12.92;
+    let hi = pow((v + 0.055) / 1.055, vec3(2.4));
+    return select(hi, lo, v <= vec3(0.04045));
+}
+
+// --- Point curves — mirrors src/curve.rs ----------------------------------
+
+// Curve `c` (0 rgb, 1 r, 2 g, 3 b) with `n` points at `x`: a cubic Hermite
+// through the points with the tangents worked out on the CPU, flat outside
+// the end points. Mirrors `Spline::eval`.
+fn curve_eval(c: u32, n: u32, x: f32) -> f32 {
+    let base = c * 8u;
+    let first = u.curves[base];
+    if x <= first.x {
+        return first.y;
+    }
+    let last = u.curves[base + n - 1u];
+    if x >= last.x {
+        return last.y;
+    }
+    var i = 0u;
+    for (var j = 1u; j < n - 1u; j++) {
+        if x >= u.curves[base + j].x {
+            i = j;
+        }
+    }
+    let p0 = u.curves[base + i];
+    let p1 = u.curves[base + i + 1u];
+    let h = p1.x - p0.x;
+    let t = (x - p0.x) / h;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let y = (2.0 * t3 - 3.0 * t2 + 1.0) * p0.y + (t3 - 2.0 * t2 + t) * h * p0.z
+        + (-2.0 * t3 + 3.0 * t2) * p1.y + (t3 - t2) * h * p1.z;
+    return clamp(y, 0.0, 1.0);
+}
+
+// The point curves on a linear pixel. Mirrors `Curves::apply`.
+fn curves(c: vec3<f32>) -> vec3<f32> {
+    var v = srgb_encode(clamp(c, vec3(0.0), vec3(1.0)));
+    let n = vec4<u32>(u.curve_info);
+    if n.x > 0u {
+        v = vec3(curve_eval(0u, n.x, v.r), curve_eval(0u, n.x, v.g), curve_eval(0u, n.x, v.b));
+    }
+    if n.y > 0u {
+        v.r = curve_eval(1u, n.y, v.r);
+    }
+    if n.z > 0u {
+        v.g = curve_eval(2u, n.z, v.g);
+    }
+    if n.w > 0u {
+        v.b = curve_eval(3u, n.w, v.b);
+    }
+    return srgb_decode(v) * max(c, vec3(1.0));
 }
 
 fn srgb_encode(v: vec3<f32>) -> vec3<f32> {
@@ -422,6 +481,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if u.curve.x != 0.0 {
         let xc = max(c, vec3(0.0));
         c = xc + u.curve.x * (filmic(xc) - xc);
+    }
+
+    // 3c. Point curves.
+    if any(u.curve_info > vec4(0.0)) {
+        c = curves(c);
     }
 
     // 4. Lift / gamma / gain:  out = gain * (in + lift*(1-in))^(1/gamma)

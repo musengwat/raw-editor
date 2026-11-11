@@ -945,3 +945,29 @@ fn parity_mask_range_with_detail() {
     };
     assert_geometry_parity(&mask_source(), AdjustParams { sharpen_amount: 0.5, ..with_masks(&[m]) }, 3);
 }
+
+// --- Point curves -----------------------------------------------------------
+
+#[test]
+fn parity_point_curves() {
+    use raw_editor::curve::{Curve, Curves};
+    let s_curve = Curve::from_points(&[[0.0, 0.0], [0.25, 0.15], [0.75, 0.88], [1.0, 1.0]]);
+    let faded = Curve::from_points(&[[0.0, 0.12], [0.5, 0.55], [1.0, 0.9]]);
+    let steps = Curve::from_points(&[[0.05, 0.0], [0.2, 0.02], [0.3, 0.6], [0.5, 0.62], [0.6, 0.3], [0.8, 0.95], [0.9, 0.97], [0.95, 1.0]]);
+    for curves in [
+        Curves { rgb: s_curve, ..Default::default() },
+        Curves { r: faded, b: s_curve, ..Default::default() },
+        Curves { rgb: faded, g: steps, ..Default::default() },
+        Curves { rgb: steps, r: s_curve, g: faded, b: steps },
+    ] {
+        let p = AdjustParams { curves, ..Default::default() };
+        // The ramp covers black to above white in every channel.
+        assert_image_parity(&range_source(), p);
+        assert_image_parity(&mask_source(), AdjustParams { exposure_ev: 1.5, tone_curve: 0.7, contrast: 0.2, ..p });
+        assert_parity(AdjustParams { saturation: 0.3, lift: [0.02, 0.0, -0.01], ..p });
+        // And they change the picture.
+        let img = range_source();
+        let (with, without) = (raw_editor::export::render_cpu(&img, &p), raw_editor::export::render_cpu(&img, &AdjustParams::default()));
+        assert!(with.data.iter().zip(&without.data).filter(|(a, b)| a.abs_diff(**b) > 600).count() > with.data.len() / 20);
+    }
+}

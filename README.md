@@ -132,7 +132,8 @@ Everyday use:
 - [x] M2 — **brightness and colour ranges**: any mask can be limited to a
   range of tones and / or one colour, picked from the photo; a range on its
   own is a mask over the whole frame ("only the blues", "only the shadows")
-- [ ] T1 — point tone curve (RGB + per channel)
+- [x] T1 — **point curve**: a draggable tone curve for all channels and one
+  each for red, green and blue, with the histogram behind it
 - [ ] T2 — vignette, grain, vibrance
 - [ ] T3 — texture and clarity
 - [ ] T4 — shadows / midtones / highlights colour grading
@@ -159,6 +160,17 @@ position carry over to the next photo, so stepping through a burst at 100%
 compares the same spot. Crop mode always shows the whole frame; the zoom
 returns when it ends. The middle button, or **Space** + drag, pans even when
 a tool on the photo takes drags for itself.
+
+**Point curve**: the square under *Tonal range* is the photo's tone curve —
+dark tones on the left, bright on the right, the histogram behind it. Click
+or drag anywhere to add a point (up to eight), drag a point to move it,
+double-click one to remove it. Pull the lower part down and the upper part up
+for contrast (an S), lift the left end for faded blacks. *Red*, *Green* and
+*Blue* have curves of their own, applied after the *RGB* one, for colour
+casts by tone — lift the blue curve's left end and the shadows turn blue. A
+dot marks the channels that have been changed; ↺ resets the one showing. The
+curve passes through every point and never overshoots between two of them.
+It comes after the look's own *Tone curve* slider and the tonal ranges.
 
 **Masks** limit a set of adjustments to part of the photo. Under *Masks*,
 *+ Add mask* gives a **linear gradient** (full effect on one side of a line,

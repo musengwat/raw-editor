@@ -175,6 +175,11 @@ mod tests {
             rotation: 3,
             straighten: -1.5,
             crop: [0.05, 0.1, 0.95, 0.85],
+            curves: crate::curve::Curves {
+                rgb: crate::curve::Curve::from_points(&[[0.0, 0.03], [0.3, 0.25], [0.7, 0.8], [1.0, 0.97]]),
+                b: crate::curve::Curve::from_points(&[[0.0, 0.1], [1.0, 0.9]]),
+                ..Default::default()
+            },
             masks: {
                 use crate::masks::{Mask, MaskAdjust};
                 let mut m = [Mask::default(); crate::masks::MAX_MASKS];

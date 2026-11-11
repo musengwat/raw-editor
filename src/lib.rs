@@ -1,6 +1,7 @@
 pub mod auto;
 pub mod bracket;
 pub mod config;
+pub mod curve;
 pub mod detail;
 pub mod develop;
 pub mod export;

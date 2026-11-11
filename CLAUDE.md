@@ -641,6 +641,34 @@ mask meaningful. `masks::shape` is geometry only.
 - Tests: `masks::tests` (range weights, hue seam, greys, invert, picking),
   `parity_mask_*range*` on `range_source()` (every hue × brightness ramp).
 
+## Point curves (T1)
+
+`src/curve.rs`: `Curve` (2–8 points, `Copy`, serialised as a plain list of
+`[x, y]`), `Spline` (points + Fritsch–Carlson tangents), `Curves` (rgb, r,
+g, b). `AdjustParams.curves`; step 3c of `apply_local` / `curves()` in the
+shader — after the filmic `tone_curve`, before lift/gamma/gain.
+
+- **No lookup texture.** The shader evaluates the cubic Hermite itself from
+  `Uniforms.curves` (`array<vec4, 32>`: `[x, y, tangent, _]`, eight per
+  curve) and `curve_info` (points per curve; 0 = identity, skipped). The
+  tangents are computed once on the CPU, so both sides run the same
+  arithmetic on the same numbers and a 16-bit export has no LUT
+  quantisation. Uniforms are now 1968 bytes.
+- The curve works on **sRGB-encoded** values so its x axis is the
+  histogram's. Above white the result is `decode(curve(1)) · c`: continuous
+  at white, and an unclipped highlight stays above it.
+- `Curve::from_points` is the only way in from outside (sidecar, tests): it
+  sorts, clamps, enforces `MIN_GAP` and the point limit, and falls back to
+  the identity — a hand-edited sidecar cannot produce a curve the spline
+  divides by zero on. Unused slots must stay zeroed: `is_identity` is a
+  plain `==` against `Curve::IDENTITY`.
+- Curves belong to the photo, like masks: looks do not set them.
+- Widget: `widgets::curve_editor` (press on empty space inserts and keeps
+  dragging; hit-test at `press_origin`). Its headless tests drive real
+  pointer events through `ctx.run_ui`.
+- Tests: `curve::tests`, `parity_point_curves` (four curve sets × three
+  sources, including the non-monotone eight-point one).
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

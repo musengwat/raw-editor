@@ -314,6 +314,104 @@ pub fn fit_aspect(crop: [f32; 4], aspect: f32) -> [f32; 4] {
 }
 
 /// Overlaid RGB histogram plus a per-channel clipped-percentage line.
+/// How close (in points) a press must be to a curve point to grab it.
+const CURVE_SLOP: f32 = 10.0;
+/// Largest side of the curve editor, in points.
+const CURVE_MAX_SIDE: f32 = 260.0;
+
+/// The point-curve editor: a square with the curve on it. Click or drag on
+/// empty space adds a point (and a drag carries on moving it), dragging a
+/// point moves it, double-clicking one removes it. `drag` is the point being
+/// dragged, kept by the caller between frames. `backdrop` is a histogram
+/// (bar heights 0..1 across the x axis) drawn behind the curve.
+pub fn curve_editor(
+    ui: &mut egui::Ui,
+    curve: &mut crate::curve::Curve,
+    drag: &mut Option<usize>,
+    backdrop: Option<&[f32]>,
+    colour: Color32,
+) -> egui::Response {
+    let side = ui.available_width().min(CURVE_MAX_SIDE);
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
+    let before = *curve;
+    let norm = |p: Pos2| [(p.x - rect.left()) / rect.width(), (rect.bottom() - p.y) / rect.height()];
+    let at = |p: [f32; 2]| Pos2::new(rect.left() + p[0] * rect.width(), rect.bottom() - p[1] * rect.height());
+    let scale = [rect.width(), rect.height()];
+
+    // A drag is hit-tested where the button went down: egui reports it only
+    // after a few points of movement.
+    let pressed = ui.ctx().input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
+    if response.drag_started()
+        && let Some(pos) = pressed
+    {
+        let n = norm(pos);
+        *drag = curve.hit(n, scale, CURVE_SLOP).or_else(|| curve.insert(n[0], n[1]));
+    }
+    if response.dragged()
+        && let (Some(i), Some(pos)) = (*drag, response.interact_pointer_pos())
+    {
+        let n = norm(pos);
+        curve.move_point(i, n[0], n[1]);
+    }
+    if response.drag_stopped() {
+        *drag = None;
+    }
+    if let Some(pos) = response.interact_pointer_pos() {
+        let n = norm(pos);
+        if response.double_clicked() {
+            if let Some(i) = curve.hit(n, scale, CURVE_SLOP) {
+                curve.remove(i);
+            }
+        } else if response.clicked() && curve.hit(n, scale, CURVE_SLOP).is_none() {
+            curve.insert(n[0], n[1]);
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_gray(18));
+    if let Some(bars) = backdrop.filter(|b| !b.is_empty()) {
+        let bin_w = rect.width() / bars.len() as f32;
+        let mut mesh = egui::Mesh::default();
+        for (k, &v) in bars.iter().enumerate() {
+            if v > 0.0 {
+                let x0 = rect.left() + k as f32 * bin_w;
+                let top = rect.bottom() - v * (rect.height() - 2.0);
+                mesh.add_colored_rect(
+                    egui::Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x0 + bin_w, rect.bottom())),
+                    Color32::from_gray(52),
+                );
+            }
+        }
+        painter.add(mesh);
+    }
+    let grid = Stroke::new(1.0, Color32::from_gray(48));
+    for k in 1..4 {
+        let t = k as f32 / 4.0;
+        painter.line_segment([at([t, 0.0]), at([t, 1.0])], grid);
+        painter.line_segment([at([0.0, t]), at([1.0, t])], grid);
+    }
+    painter.line_segment([at([0.0, 0.0]), at([1.0, 1.0])], Stroke::new(1.0, Color32::from_gray(70)));
+    let spline = curve.spline();
+    let line: Vec<Pos2> = (0..=128).map(|i| i as f32 / 128.0).map(|x| at([x, spline.eval(x)])).collect();
+    painter.add(egui::Shape::line(line, Stroke::new(1.8, colour)));
+    let hovered = response.hover_pos().and_then(|p| curve.hit(norm(p), scale, CURVE_SLOP));
+    // The end points sit on the border: let their dots spill over it.
+    let painter = ui.painter_at(rect.expand(7.0));
+    for (i, p) in curve.points().iter().enumerate() {
+        let hot = *drag == Some(i) || (drag.is_none() && hovered == Some(i));
+        painter.circle(at(*p), if hot { 6.0 } else { 4.5 }, if hot { Color32::WHITE } else { colour }, Stroke::new(1.5, Color32::BLACK));
+    }
+    if hovered.is_some() || drag.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    } else if response.hovered() && !curve.is_full() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    if *curve != before {
+        response.mark_changed();
+    }
+    response
+}
+
 pub fn histogram(ui: &mut egui::Ui, h: &crate::histogram::Histogram) {
     use crate::histogram::BINS;
     let width = ui.available_width();
@@ -395,6 +493,88 @@ mod tests {
 
     fn approx(a: [f32; 4], b: [f32; 4]) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    /// One frame of the curve editor with the given pointer events.
+    fn run_curve(
+        ctx: &egui::Context,
+        curve: &mut crate::curve::Curve,
+        drag: &mut Option<usize>,
+        events: Vec<egui::Event>,
+    ) -> egui::Response {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+            time: Some(ctx.input(|i| i.time) + 0.05),
+            events,
+            ..Default::default()
+        };
+        let mut out = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            out = Some(curve_editor(ui, curve, drag, None, Color32::WHITE));
+        });
+        output.textures_delta.clear();
+        out.unwrap()
+    }
+
+    fn button(at: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    #[test]
+    fn dragging_on_the_curve_editor_adds_a_point_and_moves_it() {
+        use crate::curve::Curve;
+        let ctx = egui::Context::default();
+        let (mut curve, mut drag) = (Curve::IDENTITY, None);
+        let rect = run_curve(&ctx, &mut curve, &mut drag, vec![]).rect;
+        let at = |x: f32, y: f32| Pos2::new(rect.left() + x * rect.width(), rect.bottom() - y * rect.height());
+
+        // Press in the middle of the box, drag up and left, let go.
+        let (from, to) = (at(0.5, 0.5), at(0.4, 0.7));
+        let steps: Vec<egui::Event> = (0..=8).map(|i| egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))).collect();
+        run_curve(&ctx, &mut curve, &mut drag, vec![egui::Event::PointerMoved(from)]);
+        run_curve(&ctx, &mut curve, &mut drag, vec![button(from, true)]);
+        for e in steps {
+            run_curve(&ctx, &mut curve, &mut drag, vec![e]);
+        }
+        assert_eq!(drag, Some(1), "the new point is the one being dragged");
+        let changed = run_curve(&ctx, &mut curve, &mut drag, vec![button(to, false)]);
+        let _ = changed;
+        assert_eq!(drag, None);
+        assert_eq!(curve.points().len(), 3);
+        let p = curve.points()[1];
+        assert!((p[0] - 0.4).abs() < 0.01 && (p[1] - 0.7).abs() < 0.01, "{p:?}");
+
+        // Grab that point again and move it; no new point appears.
+        let (from, to) = (at(0.4, 0.7), at(0.6, 0.3));
+        run_curve(&ctx, &mut curve, &mut drag, vec![egui::Event::PointerMoved(from)]);
+        run_curve(&ctx, &mut curve, &mut drag, vec![button(from, true)]);
+        for i in 0..=8 {
+            run_curve(&ctx, &mut curve, &mut drag, vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+        }
+        run_curve(&ctx, &mut curve, &mut drag, vec![button(to, false)]);
+        assert_eq!(curve.points().len(), 3);
+        let p = curve.points()[1];
+        assert!((p[0] - 0.6).abs() < 0.01 && (p[1] - 0.3).abs() < 0.01, "{p:?}");
+
+        // Double-click it: gone.
+        for e in [egui::Event::PointerMoved(to), button(to, true), button(to, false), button(to, true), button(to, false)] {
+            run_curve(&ctx, &mut curve, &mut drag, vec![e]);
+        }
+        assert!(curve.is_identity(), "{:?}", curve.points());
+    }
+
+    #[test]
+    fn a_click_on_the_curve_editor_adds_a_point() {
+        use crate::curve::Curve;
+        let ctx = egui::Context::default();
+        let (mut curve, mut drag) = (Curve::IDENTITY, None);
+        let rect = run_curve(&ctx, &mut curve, &mut drag, vec![]).rect;
+        let at = Pos2::new(rect.left() + 0.25 * rect.width(), rect.bottom() - 0.1 * rect.height());
+        for e in [egui::Event::PointerMoved(at), button(at, true), button(at, false)] {
+            run_curve(&ctx, &mut curve, &mut drag, vec![e]);
+        }
+        assert_eq!(curve.points().len(), 3);
+        assert!((curve.points()[1][0] - 0.25).abs() < 0.01 && (curve.points()[1][1] - 0.1).abs() < 0.01);
     }
 
     #[test]

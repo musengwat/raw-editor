@@ -25,7 +25,7 @@ use raw_editor::masks::{self, Mask, MaskGrab, MaskKind, RangeRef};
 use raw_editor::looks::{Look, LookGroup};
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
-use raw_editor::widgets::{ColorWheel, CropGrab, drag_crop, fit_aspect, resettable, section_header};
+use raw_editor::widgets::{ColorWheel, CropGrab, curve_editor, drag_crop, fit_aspect, resettable, section_header};
 
 /// Hold this key to bypass every adjustment and see the original.
 const COMPARE_KEY: egui::Key = egui::Key::B;
@@ -267,6 +267,10 @@ struct App {
     zoom: Zoom,
     /// Pan offset in NDC, only meaningful while zoomed past the viewport.
     pan: [f32; 2],
+    /// Which point curve the editor shows: 0 RGB, 1 red, 2 green, 3 blue.
+    curve_tab: usize,
+    /// The curve point being dragged.
+    curve_drag: Option<usize>,
     /// The mask whose controls show in the panel and on the image.
     mask_sel: Option<usize>,
     /// Tint the selected mask's area red (a viewing aid, never exported).
@@ -360,6 +364,8 @@ impl App {
             jpeg_quality: 92,
             zoom: Zoom::Fit,
             pan: [0.0, 0.0],
+            curve_tab: 0,
+            curve_drag: None,
             mask_sel: None,
             mask_overlay: false,
             mask_pick: None,
@@ -1160,6 +1166,15 @@ impl App {
         let (cropping, crop_before, crop_aspect) = (&mut self.cropping, &mut self.crop_before, &mut self.crop_aspect);
         let (mask_sel, mask_overlay, mask_pick) = (&mut self.mask_sel, &mut self.mask_overlay, &mut self.mask_pick);
         let mut mask_action: Option<MaskAction> = None;
+        let (curve_tab, curve_drag) = (&mut self.curve_tab, &mut self.curve_drag);
+        // The histogram behind the curve: all three channels, or the one.
+        let curve_bars: Option<Vec<f32>> = self.histogram.as_ref().map(|(_, h)| {
+            let heights = h.heights();
+            match *curve_tab {
+                0 => (0..heights[0].len()).map(|k| heights[0][k].max(heights[1][k]).max(heights[2][k])).collect(),
+                c => heights[c - 1].to_vec(),
+            }
+        });
         let source = self.image.as_ref().map(|img| (img.width as f32, img.height as f32, img.colour.turns));
         let thumbs: Vec<(Look, egui::TextureHandle)> = self.thumbs.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
         let p = &mut self.params;
@@ -1416,6 +1431,37 @@ impl App {
             resettable(ui, &mut p.shadows, d.shadows, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Shadows")));
             resettable(ui, &mut p.whites, d.whites, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Whites")));
             resettable(ui, &mut p.blacks, d.blacks, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Blacks")));
+
+            ui.add_space(10.0);
+            header(ui, "Point curve", Section::Curve, p);
+            const CHANNELS: [(&str, egui::Color32); 4] = [
+                ("RGB", egui::Color32::from_gray(230)),
+                ("Red", egui::Color32::from_rgb(255, 90, 90)),
+                ("Green", egui::Color32::from_rgb(90, 220, 90)),
+                ("Blue", egui::Color32::from_rgb(110, 150, 255)),
+            ];
+            ui.horizontal(|ui| {
+                for (i, (name, _)) in CHANNELS.iter().enumerate() {
+                    // A dot marks the channels whose curve has been moved.
+                    let label = if p.curves.channel(i).is_identity() { name.to_string() } else { format!("{name} •") };
+                    if ui.selectable_label(*curve_tab == i, label).clicked() {
+                        *curve_tab = i;
+                        *curve_drag = None;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let curve = p.curves.channel_mut(*curve_tab);
+                    if ui.add_visible(!curve.is_identity(), egui::Button::new("↺").small().frame(false)).on_hover_text("Reset this curve").clicked() {
+                        *curve = raw_editor::curve::Curve::IDENTITY;
+                    }
+                });
+            });
+            curve_editor(ui, p.curves.channel_mut(*curve_tab), curve_drag, curve_bars.as_deref(), CHANNELS[*curve_tab].1);
+            ui.label(
+                egui::RichText::new("Click or drag to add a point, drag a point to move it, double-click to remove it. Dark tones on the left, bright on the right.")
+                    .weak()
+                    .small(),
+            );
 
             ui.add_space(10.0);
             header(ui, "Masks", Section::Masks, p);

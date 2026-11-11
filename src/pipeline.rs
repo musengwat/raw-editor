@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::curve::Curves;
 use crate::masks::{MAX_MASKS, Mask};
 
 pub const CONTRAST_PIVOT: f32 = 0.18;
@@ -105,6 +106,9 @@ pub struct AdjustParams {
     /// linear (the original rendering), 1 = camera-like mid-tones and a
     /// highlight shoulder. The everyday looks set it.
     pub tone_curve: f32,
+    /// Point curves (see [`crate::curve`]): one for all channels, one each
+    /// for red, green and blue. Applied after `tone_curve`.
+    pub curves: Curves,
     /// -1..1 EV applied through a broad upper-range mask.
     pub highlights: f32,
     /// -1..1 EV applied through a broad lower-range mask.
@@ -183,6 +187,7 @@ impl Default for AdjustParams {
             tint: 0.0,
             saturation: 0.0,
             tone_curve: 0.0,
+            curves: Curves::default(),
             highlights: 0.0,
             shadows: 0.0,
             whites: 0.0,
@@ -313,6 +318,7 @@ impl AdjustParams {
                 self.crop = d.crop;
             }
             Section::Masks => self.masks = d.masks,
+            Section::Curve => self.curves = d.curves,
         }
     }
 
@@ -336,10 +342,11 @@ pub enum Section {
     Optics,
     Geometry,
     Masks,
+    Curve,
 }
 
 impl Section {
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Colour,
         Section::Basic,
         Section::Hsl,
@@ -349,6 +356,7 @@ impl Section {
         Section::Optics,
         Section::Geometry,
         Section::Masks,
+        Section::Curve,
     ];
 }
 
@@ -525,7 +533,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 1440 bytes.
+/// Total size 1968 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -554,6 +562,10 @@ pub struct Uniforms {
     pub mask_info: [f32; 4],
     /// The mask slots, eight vec4s each — see [`crate::masks::uniforms`].
     pub masks: [crate::masks::MaskUniform; MAX_MASKS],
+    /// Points in the rgb, r, g and b point curves (0 = that curve is off).
+    pub curve_info: [f32; 4],
+    /// The curves' points and tangents — see [`Curves::uniforms`].
+    pub curves: crate::curve::CurveUniform,
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -765,6 +777,8 @@ impl Uniforms {
             geom1: { let g = view_geometry(p, img, view); [g.a[1][0], g.a[1][1], g.a[1][2], 0.0] },
             mask_info: crate::masks::uniforms(&p.masks, None).0,
             masks: crate::masks::uniforms(&p.masks, None).1,
+            curve_info: p.curves.uniforms().0,
+            curves: p.curves.uniforms().1,
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -873,6 +887,9 @@ pub fn apply_local(p: &AdjustParams, l: &Locals, rgb: [f32; 3]) -> [f32; 3] {
             *v = x + p.tone_curve * (filmic(x) - x);
         }
     }
+
+    // 3c. Point curves, in the display-encoded domain.
+    c = p.curves.apply(c);
 
     // 4. Lift / gamma / gain, per channel:  out = gain * (in + lift*(1-in))^(1/gamma)
     for i in 0..3 {
@@ -1036,6 +1053,7 @@ mod tests {
             rotation: 1,
             straighten: 2.0,
             crop: [0.1, 0.1, 0.9, 0.8],
+            curves: Curves { rgb: crate::curve::Curve::from_points(&[[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]), ..Default::default() },
             masks: {
                 let mut m = [Mask::default(); MAX_MASKS];
                 m[0] = Mask::radial([0.4, 0.6], 0.3);
@@ -1256,8 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_1440_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 1440);
+    fn uniforms_layout_is_1968_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 1968);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -1276,6 +1294,8 @@ mod tests {
             &u.geom1 as *const _ as usize,
             &u.mask_info as *const _ as usize,
             &u.masks as *const _ as usize,
+            &u.curve_info as *const _ as usize,
+            &u.curves as *const _ as usize,
             &u.scale as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
