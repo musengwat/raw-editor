@@ -12,6 +12,7 @@ pub mod histogram;
 pub mod history;
 pub mod immich;
 pub mod looks;
+pub mod masks;
 pub mod metadata;
 pub mod pipeline;
 pub mod rgb_input;

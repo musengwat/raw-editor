@@ -22,7 +22,7 @@ use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
 use crate::metadata::ExportMetadata;
-use crate::pipeline::{AdjustParams, Geometry, Uniforms, View, apply, srgb_encode};
+use crate::pipeline::{AdjustParams, Geometry, Locals, Uniforms, View, apply_local, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -73,9 +73,16 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     let geom = Geometry::resolve(params, &img.colour, img.width, img.height);
     let (w, h) = (geom.width, geom.height);
     let mut data = vec![0u16; w * h * 3];
+    // Masks are placed in source uv, so every pixel needs to know where in
+    // the source it came from. Without masks that lookup is skipped.
+    let masked = crate::masks::count(&params.masks) > 0;
+    let aspect = img.width as f32 / img.height as f32;
+    let global = Locals::of(params);
+    let locals = |uv: [f32; 2]| if masked { crate::masks::locals(params, uv, aspect) } else { global };
     if geom.is_identity(img.width, img.height) {
-        data.par_chunks_mut(3).zip(detailed.par_chunks(3)).for_each(|(dst, src)| {
-            let c = apply(params, [src[0], src[1], src[2]]);
+        data.par_chunks_mut(3).zip(detailed.par_chunks(3)).enumerate().for_each(|(i, (dst, src))| {
+            let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
+            let c = apply_local(params, &locals(uv), [src[0], src[1], src[2]]);
             for i in 0..3 {
                 dst[i] = to_u16(srgb_encode(c[i]));
             }
@@ -91,7 +98,7 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
             if !(0.0..=1.0).contains(&s[0]) || !(0.0..=1.0).contains(&s[1]) {
                 return; // black, as the shader draws it
             }
-            let c = apply(params, bilinear(&detailed, img.width, img.height, s));
+            let c = apply_local(params, &locals(s), bilinear(&detailed, img.width, img.height, s));
             for k in 0..3 {
                 dst[k] = to_u16(srgb_encode(c[k]));
             }

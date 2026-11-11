@@ -10,7 +10,7 @@
 use rayon::prelude::*;
 
 use crate::develop::DevelopedImage;
-use crate::pipeline::{AdjustParams, Colour, apply, srgb_encode, to_working};
+use crate::pipeline::{AdjustParams, Colour, apply_at, srgb_encode, to_working};
 
 pub const BINS: usize = 256;
 /// Long side of the copy the histogram is computed from. ~190k pixels on a
@@ -79,12 +79,14 @@ pub fn compute(img: &DevelopedImage, p: &AdjustParams) -> Histogram {
     // histogram.
     let optics = img.optics(p);
     let n = img.width * img.height;
+    let aspect = img.width as f32 / img.height as f32;
     let (bins, over) = (0..n)
         .into_par_iter()
         .fold(
             || (Box::new([[0u32; BINS]; 3]), [0u32; 3]),
             |(mut bins, mut over), i| {
-                let c = apply(p, to_working(&col, img.camera_rgb(&optics, i), img.clip_at(i)));
+                let uv = [((i % img.width) as f32 + 0.5) / img.width as f32, ((i / img.width) as f32 + 0.5) / img.height as f32];
+                let c = apply_at(p, uv, aspect, to_working(&col, img.camera_rgb(&optics, i), img.clip_at(i)));
                 for ch in 0..3 {
                     let b = (srgb_encode(c[ch]) * (BINS - 1) as f32 + 0.5) as usize;
                     bins[ch][b.min(BINS - 1)] += 1;

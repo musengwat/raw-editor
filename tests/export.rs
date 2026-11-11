@@ -331,6 +331,64 @@ fn flat_field_on_a_real_frame_through_the_gpu_export() {
     assert!(mean < 64.0 && worst < 1024, "GPU and CPU disagree: mean {mean:.1}, worst {worst}");
 }
 
+/// Masks on a real, portrait frame (so the camera's quarter turn is in play)
+/// with a crop on top: the GPU export and the CPU export agree, and the mask
+/// stays on the same part of the photo whatever the framing. Skips without
+/// testdata.
+#[test]
+fn masks_on_a_real_frame_through_the_gpu_export() {
+    use raw_editor::masks::{Mask, MaskAdjust};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/portrait/P1050191.rw2");
+    if !path.exists() {
+        eprintln!("SKIP: testdata not present");
+        return;
+    }
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    let img = raw_editor::metadata::develop_file(&path).unwrap();
+    let mut p = AdjustParams { tone_curve: 1.0, ..Default::default() };
+    // A hard-edged spot two stops down, and a gradient warming one side.
+    let spot = [0.3, 0.6];
+    p.masks[0] = Mask {
+        feather: 0.05,
+        adjust: MaskAdjust { exposure_ev: -2.0, ..Default::default() },
+        ..Mask::radial(spot, 0.1)
+    };
+    p.masks[1] = Mask {
+        adjust: MaskAdjust { temp: 0.5, saturation: 0.4, shadows: 0.5, ..Default::default() },
+        ..Mask::linear([0.1, 0.5], [0.9, 0.5])
+    };
+    let plain = AdjustParams { masks: Default::default(), ..p };
+
+    for crop in [[0.0, 0.0, 1.0, 1.0], [0.1, 0.2, 0.9, 0.95]] {
+        let (p, plain) = (AdjustParams { crop, ..p }, AdjustParams { crop, ..plain });
+        let gpu = export::render_gpu(&ctx.device, &ctx.queue, &img, &p).unwrap();
+        let cpu = export::render_cpu(&img, &p);
+        assert!(gpu.height > gpu.width, "portrait");
+        let worst = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        let mean = gpu.data.iter().zip(&cpu.data).map(|(a, b)| a.abs_diff(*b) as f64).sum::<f64>() / gpu.data.len() as f64;
+        eprintln!("GPU vs CPU with masks, crop {crop:?}: mean {mean:.1}, worst {worst} (of 65535)");
+        assert!(mean < 64.0 && worst < 1024, "GPU and CPU disagree: mean {mean:.1}, worst {worst}");
+
+        // The spot darkens the pixel that shows source uv `spot` — wherever
+        // the turn and the crop put it in the output — and nothing far away.
+        let without = export::render_gpu(&ctx.device, &ctx.queue, &img, &plain).unwrap();
+        let geom = raw_editor::pipeline::Geometry::resolve(&p, &img.colour, img.width, img.height);
+        let at = |r: &export::Rendered, src: [f32; 2]| {
+            let uv = geom.output_uv(src);
+            let (x, y) = ((uv[0] * r.width as f32) as usize, (uv[1] * r.height as f32) as usize);
+            r.data[(y * r.width + x) * 3 + 1] as f32
+        };
+        let (dark, was) = (at(&gpu, spot), at(&without, spot));
+        assert!(dark < was * 0.7, "crop {crop:?}: the spot should be darker ({dark} vs {was})");
+        // A point outside the spot, at the gradient's far end: untouched.
+        let far = [0.9, 0.3];
+        assert!((at(&gpu, far) - at(&without, far)).abs() < 300.0, "crop {crop:?}: {} vs {}", at(&gpu, far), at(&without, far));
+    }
+}
+
 /// A portrait G85 frame (EXIF orientation 8): rawler reports it as Normal,
 /// so the turn must come from the EXIF, and the export must come out tall.
 /// Skips without testdata.

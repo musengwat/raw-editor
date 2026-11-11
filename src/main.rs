@@ -21,6 +21,7 @@ use raw_editor::config::Config;
 use raw_editor::hdr::{self, MergeReport, Style};
 use raw_editor::history::History;
 use raw_editor::immich;
+use raw_editor::masks::{self, Mask, MaskGrab, MaskKind};
 use raw_editor::looks::{Look, LookGroup};
 use raw_editor::metadata::CameraIds;
 use raw_editor::sidecar::{self, Origin};
@@ -39,6 +40,12 @@ const ZOOM_FIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modif
 const ZOOM_ONE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num1);
 const ZOOM_IN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Equals);
 const ZOOM_OUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Minus);
+/// Shows / hides the selected mask's red overlay.
+const MASK_OVERLAY_KEY: egui::Key = egui::Key::O;
+/// Shows / hides the masks' on-image handles (selects or deselects a mask).
+const MASK_KEY: egui::Key = egui::Key::M;
+/// How close (in points) the pointer must be to a mask handle to grab it.
+const MASK_HANDLE_SLOP: f32 = 12.0;
 /// Zoom per point of wheel travel (one notch is 50–80 points: 10–17%).
 const WHEEL_ZOOM: f32 = 0.002;
 /// Arms the white-balance eyedropper; the next click on the image picks.
@@ -126,6 +133,47 @@ enum ZoomCmd {
     Step(i32),
 }
 
+/// What the Masks section asked for; carried out after the panel is drawn,
+/// where the image's geometry is at hand.
+enum MaskAction {
+    Add(MaskKind),
+    Duplicate(usize),
+    Remove(usize),
+}
+
+/// Source uv <-> screen for the mask handles: through the crop / rotation
+/// (`geom`) and the zoom and pan (`view`) of the image drawn in `rect`.
+struct MaskMap {
+    rect: egui::Rect,
+    view: View,
+    geom: Geometry,
+    /// Source width / height.
+    aspect: f32,
+}
+
+impl MaskMap {
+    fn to_screen(&self, src: [f32; 2]) -> egui::Pos2 {
+        let (r, ndc) = (self.rect, self.view.ndc(self.geom.output_uv(src)));
+        egui::pos2(r.left() + (ndc[0] + 1.0) / 2.0 * r.width(), r.top() + (1.0 - ndc[1]) / 2.0 * r.height())
+    }
+
+    fn to_source(&self, pos: egui::Pos2) -> [f32; 2] {
+        let r = self.rect;
+        let ndc = [(pos.x - r.left()) / r.width() * 2.0 - 1.0, 1.0 - (pos.y - r.top()) / r.height() * 2.0];
+        self.geom.source_uv(self.view.quad_uv_unbounded(ndc))
+    }
+
+    /// The handle of `mask` under `pos`, the nearest if several are.
+    fn grab_at(&self, mask: &Mask, pos: egui::Pos2) -> Option<MaskGrab> {
+        masks::handles(mask, self.aspect)
+            .into_iter()
+            .map(|(grab, at)| (grab, self.to_screen(at).distance(pos)))
+            .filter(|(_, d)| *d <= MASK_HANDLE_SLOP)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(grab, _)| grab)
+    }
+}
+
 enum OpticsAction {
     /// Make (or replace) the lens's flat field from the open photo.
     Make(String),
@@ -190,6 +238,13 @@ struct App {
     zoom: Zoom,
     /// Pan offset in NDC, only meaningful while zoomed past the viewport.
     pan: [f32; 2],
+    /// The mask whose controls show in the panel and on the image.
+    mask_sel: Option<usize>,
+    /// Tint the selected mask's area red (a viewing aid, never exported).
+    mask_overlay: bool,
+    /// Handle drag in progress: what was grabbed, the mask and the pointer
+    /// (source uv) when it began.
+    mask_drag: Option<(MaskGrab, Mask, [f32; 2])>,
     /// Zoom change waiting for `image_panel`.
     zoom_cmd: Option<ZoomCmd>,
     /// Zoom as last drawn, in percent, for the status bar.
@@ -273,6 +328,9 @@ impl App {
             jpeg_quality: 92,
             zoom: Zoom::Fit,
             pan: [0.0, 0.0],
+            mask_sel: None,
+            mask_overlay: false,
+            mask_drag: None,
             zoom_cmd: None,
             zoom_percent: 100.0,
             show_before: false,
@@ -400,6 +458,8 @@ impl App {
                     self.prev_params = params;
                     self.history = History::new(params);
                     self.show_before = false;
+                    self.mask_sel = None;
+                    self.mask_drag = None;
                     self.cropping = false;
                     self.crop_drag = None;
                     self.dirty_since = None;
@@ -1064,6 +1124,8 @@ impl App {
         let mut optics_action: Option<OpticsAction> = None;
         let hsl_tab = &mut self.hsl_tab;
         let (cropping, crop_before, crop_aspect) = (&mut self.cropping, &mut self.crop_before, &mut self.crop_aspect);
+        let (mask_sel, mask_overlay) = (&mut self.mask_sel, &mut self.mask_overlay);
+        let mut mask_action: Option<MaskAction> = None;
         let source = self.image.as_ref().map(|img| (img.width as f32, img.height as f32, img.colour.turns));
         let thumbs: Vec<(Look, egui::TextureHandle)> = self.thumbs.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
         let p = &mut self.params;
@@ -1322,6 +1384,100 @@ impl App {
             resettable(ui, &mut p.blacks, d.blacks, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Blacks")));
 
             ui.add_space(10.0);
+            header(ui, "Masks", Section::Masks, p);
+            let used = masks::used(&p.masks);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(has_image && used < masks::MAX_MASKS, |ui| {
+                    ui.menu_button("+ Add mask", |ui| {
+                        for kind in [MaskKind::Linear, MaskKind::Radial] {
+                            if ui.button(kind.label()).clicked() {
+                                mask_action = Some(MaskAction::Add(kind));
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text(if has_image {
+                        "All mask slots are in use — delete one first"
+                    } else {
+                        "Open a photo first"
+                    });
+                });
+                ui.add_enabled(mask_sel.is_some(), egui::Checkbox::new(mask_overlay, format!("Overlay ({})", MASK_OVERLAY_KEY.name())))
+                    .on_hover_text("Tint the selected mask's area red. Never exported");
+            });
+            if used == 0 {
+                ui.label(
+                    egui::RichText::new("A mask limits a set of adjustments to part of the photo: a gradient across it, or an oval.")
+                        .weak()
+                        .small(),
+                );
+            }
+            for i in 0..used {
+                let selected = *mask_sel == Some(i);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut p.masks[i].enabled, "").on_hover_text("Turn this mask on or off");
+                    let name = format!("{} · {}", i + 1, p.masks[i].kind.label());
+                    if ui.selectable_label(selected, name).on_hover_text("Show this mask's controls and handles").clicked() {
+                        *mask_sel = if selected { None } else { Some(i) };
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✖").on_hover_text("Delete this mask").clicked() {
+                            mask_action = Some(MaskAction::Remove(i));
+                        }
+                        if ui.small_button("Copy").on_hover_text("Duplicate this mask").clicked() {
+                            mask_action = Some(MaskAction::Duplicate(i));
+                        }
+                    });
+                });
+                if !selected {
+                    continue;
+                }
+                let m = &mut p.masks[i];
+                let md = Mask::default();
+                let before = m.adjust;
+                ui.indent(("mask", i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut m.invert, "Invert").on_hover_text("Affect everything outside the shape instead");
+                    });
+                    resettable(ui, &mut m.amount, md.amount, |ui, v| {
+                        ui.add(egui::Slider::new(v, 0.0..=1.0).text("Amount")).on_hover_text("Strength of everything this mask does")
+                    });
+                    if m.kind == MaskKind::Radial {
+                        resettable(ui, &mut m.feather, md.feather, |ui, v| {
+                            ui.add(egui::Slider::new(v, 0.0..=1.0).text("Feather")).on_hover_text("How soft the edge is")
+                        });
+                    }
+                    ui.add_space(4.0);
+                    let a = &mut m.adjust;
+                    let slider = |ui: &mut egui::Ui, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
+                        resettable(ui, v, 0.0, |ui, v| ui.add(egui::Slider::new(v, range).text(text)));
+                    };
+                    slider(ui, &mut a.exposure_ev, -4.0..=4.0, "Exposure");
+                    slider(ui, &mut a.contrast, -1.0..=1.0, "Contrast");
+                    slider(ui, &mut a.highlights, -1.0..=1.0, "Highlights");
+                    slider(ui, &mut a.shadows, -1.0..=1.0, "Shadows");
+                    slider(ui, &mut a.whites, -1.0..=1.0, "Whites");
+                    slider(ui, &mut a.blacks, -1.0..=1.0, "Blacks");
+                    slider(ui, &mut a.temp, -1.0..=1.0, "Temp");
+                    slider(ui, &mut a.tint, -1.0..=1.0, "Tint");
+                    slider(ui, &mut a.saturation, -1.0..=1.0, "Saturation");
+                    slider(ui, &mut a.sharpen, -3.0..=3.0, "Sharpen");
+                    slider(ui, &mut a.nr_luma, -1.0..=1.0, "NR luminance");
+                    ui.label(
+                        egui::RichText::new("Added to the sliders above, inside the mask. Drag the handles on the photo to place it.")
+                            .weak()
+                            .small(),
+                    );
+                });
+                // The overlay is for placing the mask; once its sliders
+                // move, what matters is the result.
+                if m.adjust != before {
+                    *mask_overlay = false;
+                }
+            }
+
+            ui.add_space(10.0);
             header(ui, "Lift / Gamma / Gain", Section::Wheels, p);
             ui.horizontal(|ui| {
                 ColorWheel::new("Lift", &mut p.lift, 0.0, 0.5).show(ui);
@@ -1510,6 +1666,9 @@ impl App {
         if let Some(action) = look_action {
             self.apply_look_action(action);
         }
+        if let Some(action) = mask_action {
+            self.apply_mask_action(action);
+        }
         if let Some(action) = optics_action {
             self.apply_optics_action(action);
         }
@@ -1566,7 +1725,117 @@ impl App {
     /// A tool on the image takes plain drags (so panning needs the pan key
     /// or the middle button).
     fn tool_owns_drag(&self) -> bool {
-        self.cropping
+        self.cropping || self.mask_drag.is_some()
+    }
+
+    /// The selected mask, if the selection still points at one (undo, reset
+    /// or a paste may have taken it away).
+    fn selected_mask(&self) -> Option<usize> {
+        self.mask_sel.filter(|&i| i < masks::MAX_MASKS && self.params.masks[i].kind != MaskKind::Off)
+    }
+
+    fn apply_mask_action(&mut self, action: MaskAction) {
+        match action {
+            MaskAction::Add(kind) => {
+                let Some(img) = self.image.clone() else { return };
+                // Placed in the middle of the frame as it is cropped and
+                // turned now, then stored in source uv.
+                let geom = Geometry::resolve(&self.params, &img.colour, img.width, img.height);
+                let mask = match kind {
+                    MaskKind::Linear => Mask::linear(geom.source_uv([0.5, 0.2]), geom.source_uv([0.5, 0.55])),
+                    _ => Mask::radial(geom.source_uv([0.5, 0.5]), 0.3 * geom.width.min(geom.height) as f32 / img.height as f32),
+                };
+                match masks::add(&mut self.params.masks, mask) {
+                    Some(i) => {
+                        self.mask_sel = Some(i);
+                        self.mask_overlay = true;
+                        self.status = format!("{} added — drag its handles on the photo, then move its sliders", kind.label());
+                    }
+                    None => self.status = "All mask slots are in use".into(),
+                }
+            }
+            MaskAction::Duplicate(i) => {
+                let copy = self.params.masks[i];
+                match masks::add(&mut self.params.masks, copy) {
+                    Some(j) => self.mask_sel = Some(j),
+                    None => self.status = "All mask slots are in use".into(),
+                }
+            }
+            MaskAction::Remove(i) => {
+                masks::remove(&mut self.params.masks, i);
+                self.mask_sel = match self.mask_sel {
+                    Some(s) if s == i => None,
+                    Some(s) if s > i => Some(s - 1),
+                    other => other,
+                };
+            }
+        }
+    }
+
+    /// Dragging the selected mask's handles on the image. `map` is what is
+    /// on screen. Returns the handle the pointer is on (or dragging), so the
+    /// caller leaves panning and double-click zoom alone and
+    /// [`mask_draw`](Self::mask_draw) can highlight it.
+    fn mask_interact(&mut self, ui: &egui::Ui, response: &egui::Response, map: &MaskMap) -> Option<MaskGrab> {
+        let Some(sel) = self.selected_mask() else {
+            self.mask_drag = None;
+            return None;
+        };
+        let (to_source, aspect) = (|pos| map.to_source(pos), map.aspect);
+        let grab_at = |mask: &Mask, pos: egui::Pos2| map.grab_at(mask, pos);
+
+        let mask = self.params.masks[sel];
+        // Hit-test where the button went down (see `crop_overlay`).
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && !ui.ctx().input(|i| i.key_down(PAN_KEY))
+            && let Some(pos) = ui.ctx().input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
+            && let Some(grab) = grab_at(&mask, pos)
+        {
+            self.mask_drag = Some((grab, mask, to_source(pos)));
+        }
+        if let (Some((grab, start, from)), Some(pos)) = (self.mask_drag, response.interact_pointer_pos())
+            && response.dragged()
+        {
+            self.params.masks[sel] = masks::drag(start, grab, from, to_source(pos), aspect);
+        }
+        if response.drag_stopped() || !ui.ctx().input(|i| i.pointer.primary_down()) {
+            self.mask_drag = None;
+        }
+
+        let mask = self.params.masks[sel];
+        self.mask_drag.map(|(g, _, _)| g).or_else(|| response.hover_pos().and_then(|pos| grab_at(&mask, pos)))
+    }
+
+    /// The selected mask's outline and handles, drawn over the image.
+    fn mask_draw(&self, ui: &egui::Ui, map: &MaskMap, hovered: Option<MaskGrab>) {
+        let Some(sel) = self.selected_mask() else { return };
+        let (mask, aspect) = (self.params.masks[sel], map.aspect);
+        let to_screen = |src| map.to_screen(src);
+        let painter = ui.painter_at(map.rect);
+        let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(110));
+        let light = egui::Stroke::new(1.2, egui::Color32::from_white_alpha(230));
+        for line in masks::outline(&mask, aspect) {
+            let points: Vec<egui::Pos2> = line.into_iter().map(to_screen).collect();
+            painter.add(egui::Shape::line(points.clone(), dark));
+            painter.add(egui::Shape::line(points, light));
+        }
+        for (grab, at) in masks::handles(&mask, aspect) {
+            let at = to_screen(at);
+            let hot = hovered == Some(grab);
+            let (radius, fill) = match grab {
+                MaskGrab::Move => (7.0, egui::Color32::from_rgb(235, 70, 70)),
+                MaskGrab::Rotate => (4.5, egui::Color32::from_rgb(120, 190, 255)),
+                _ => (5.0, egui::Color32::WHITE),
+            };
+            painter.circle(at, radius + if hot { 2.0 } else { 0.0 }, fill, egui::Stroke::new(1.5, egui::Color32::from_black_alpha(200)));
+        }
+        if let Some(grab) = hovered {
+            ui.ctx().set_cursor_icon(match grab {
+                MaskGrab::Move => egui::CursorIcon::Move,
+                MaskGrab::Rotate => egui::CursorIcon::Alias,
+                _ => egui::CursorIcon::Crosshair,
+            });
+        }
     }
 
     fn step_photo(&mut self, ctx: &egui::Context, step: isize) {
@@ -1847,7 +2116,24 @@ impl App {
         // mode is always "fit"; the zoom comes back when it ends.
         let asked = self.zoom_cmd.take();
         let mut zoom = if self.cropping { Zoom::Fit } else { self.zoom };
-        let mut pan = View::placed(out, viewport, zoom, self.pan, texel).offset;
+        // What is on screen now, before this frame's zooming and panning.
+        let on_screen = View::placed(out, viewport, zoom, self.pan, texel);
+        let mut pan = on_screen.offset;
+        let comparing = self.show_before || shortcut(ui.ctx(), COMPARE_KEY, true);
+        // Mask handles get first claim on the pointer.
+        let masking = !self.cropping && !self.picking_wb && !comparing;
+        let aspect = iw as f32 / ih as f32;
+        let mask_grab = if masking {
+            self.mask_interact(ui, &response, &MaskMap { rect, view: on_screen, geom, aspect })
+        } else {
+            self.mask_drag = None;
+            None
+        };
+        let on_handle = mask_grab.is_some();
+        // The handle drag above may have changed the mask.
+        if masking {
+            shown.masks = self.params.masks;
+        }
         if !self.cropping {
             // Change the zoom, keeping the image point under `about` in place.
             let zoom_to = |zoom: &mut Zoom, pan: &mut [f32; 2], to: Zoom, about: [f32; 2]| {
@@ -1876,7 +2162,7 @@ impl App {
                     zoom_to(&mut zoom, &mut pan, to, cursor);
                 }
                 // The eyedropper clicks, so a double-click is not a zoom then.
-                if response.double_clicked() && !self.picking_wb {
+                if response.double_clicked() && !self.picking_wb && !on_handle {
                     let to = toggled(zoom);
                     zoom_to(&mut zoom, &mut pan, to, cursor);
                 }
@@ -1900,7 +2186,7 @@ impl App {
         if !self.cropping {
             self.pan = view.offset;
             let pannable = view.scale[0] > 1.0 || view.scale[1] > 1.0;
-            if pannable && response.hovered() && !self.picking_wb {
+            if pannable && response.hovered() && !self.picking_wb && !on_handle {
                 let held = response.is_pointer_button_down_on();
                 ui.ctx().set_cursor_icon(if held { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
             }
@@ -1910,7 +2196,6 @@ impl App {
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
         // The geometry stays, so before and after line up.
-        let comparing = self.show_before || shortcut(ui.ctx(), COMPARE_KEY, true);
         let mut uniforms = if comparing {
             // How the photo opened (its starting look), in the current framing.
             let before = AdjustParams { rotation: shown.rotation, straighten: shown.straighten, crop: shown.crop, ..self.baseline };
@@ -1919,10 +2204,16 @@ impl App {
             Uniforms::new(&shown, &colour, view, target_is_srgb)
         };
         uniforms.show_clip = if self.show_clip { 1.0 } else { 0.0 };
+        if masking && self.mask_overlay {
+            uniforms.mask_info = masks::uniforms(&shown.masks, self.selected_mask()).0;
+        }
 
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { uniforms }));
 
+        if masking {
+            self.mask_draw(ui, &MaskMap { rect, view, geom, aspect }, mask_grab);
+        }
         if self.picking_wb {
             self.handle_wb_pick(ui, rect, &response, view, geom, [iw, ih]);
         } else if self.cropping {
@@ -2012,6 +2303,20 @@ impl eframe::App for App {
         }
         if shortcut(ui.ctx(), ZOOM_KEY, false) {
             self.zoom_cmd = Some(ZoomCmd::Toggle);
+        }
+        if shortcut(ui.ctx(), MASK_OVERLAY_KEY, false) && self.selected_mask().is_some() {
+            self.mask_overlay = !self.mask_overlay;
+        }
+        if shortcut(ui.ctx(), MASK_KEY, false) {
+            // Handles on / off: deselect, or select the first mask.
+            self.mask_sel = match self.selected_mask() {
+                Some(_) => None,
+                None if masks::used(&self.params.masks) > 0 => Some(0),
+                None => {
+                    self.status = "No masks yet — add one under Masks in the panel".into();
+                    None
+                }
+            };
         }
         if shortcut(ui.ctx(), BEFORE_AFTER_KEY, false) {
             self.show_before = !self.show_before;

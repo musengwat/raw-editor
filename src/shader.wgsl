@@ -1,6 +1,18 @@
 // Adjustment pipeline. Mirrored in src/pipeline.rs (`apply`) — keep in sync,
 // covered by the parity test in tests/shader_parity.rs.
 
+// One mask slot — packed by `masks::uniforms` in src/masks.rs.
+struct MaskU {
+    v0: vec4<f32>,  // a.xy, b.xy (linear: the two ends; radial: centre, semi-axes)
+    v1: vec4<f32>,  // cos, sin, feather, kind (0 off, 1 linear, 2 radial)
+    v2: vec4<f32>,  // amount, invert, sharpen, nr_luma
+    v3: vec4<f32>,  // exposure, contrast, temp, tint
+    v4: vec4<f32>,  // saturation, highlights, shadows, whites
+    v5: vec4<f32>,  // blacks
+    v6: vec4<f32>,  // reserved: luminance range
+    v7: vec4<f32>,  // reserved: colour range
+};
+
 struct Uniforms {
     // vec4s first: WGSL uniform buffers need 16-byte alignment for them.
     wb: vec4<f32>,         // .rgb = white-balance gains
@@ -15,6 +27,8 @@ struct Uniforms {
     hsl: array<vec4<f32>, 8>, // per-colour [hue, sat, lum, _]; hsl[0].w = 1 when active
     geom0: vec4<f32>,      // output uv -> source uv, row 0 (.xyz); see pipeline::Geometry
     geom1: vec4<f32>,      // row 1
+    mask_info: vec4<f32>,  // .x = slots to evaluate, .y = overlay slot + 1 (0 = none)
+    masks: array<MaskU, 8>,
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -140,7 +154,7 @@ fn to_working(s: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
 //
 // textureSampleLevel (not textureSample) because this runs under control flow
 // that depends on uniforms; an explicit LOD sidesteps the uniformity rules.
-fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
+fn detail(uv: vec2<f32>, center: vec3<f32>, sharpen_amount: f32, nr_luma: f32) -> vec3<f32> {
     let cl = dot(center, LUMA_709);
     let s_nr = 2.0 * NR_SIGMA * NR_SIGMA;
     let s_sh = 2.0 * pow(max(u.sharpen_radius, 0.3), 2.0);
@@ -175,7 +189,7 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
         }
     }
 
-    let nr_l = cl + (bil_l / max(bil_w, 1e-6) - cl) * u.nr_luma;
+    let nr_l = cl + (bil_l / max(bil_w, 1e-6) - cl) * nr_luma;
     let chroma = center - cl;
     let out_chroma = chroma + (chroma_sum / max(chroma_w, 1e-6) - chroma) * u.nr_chroma;
 
@@ -183,7 +197,94 @@ fn detail(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
     var d = cl - blur_l;
     d = sign(d) * max(abs(d) - u.sharpen_threshold, 0.0);
 
-    return max(out_chroma + nr_l + u.sharpen_amount * d, vec3(0.0));
+    return max(out_chroma + nr_l + sharpen_amount * d, vec3(0.0));
+}
+
+// --- Masks — mirrors src/masks.rs -----------------------------------------
+
+// The slider values in force at one pixel — `pipeline::Locals`.
+struct Locals {
+    exposure_ev: f32,
+    contrast: f32,
+    temp: f32,
+    tint: f32,
+    saturation: f32,
+    highlights: f32,
+    shadows: f32,
+    whites: f32,
+    blacks: f32,
+    sharpen_amount: f32,
+    nr_luma: f32,
+};
+
+const MASK_OVERLAY_OPACITY: f32 = 0.55;
+const MASK_OVERLAY_COLOUR: vec3<f32> = vec3(1.0, 0.08, 0.08);
+
+// The shape of mask `i` at a source uv, inverted if the mask is, not scaled
+// by its amount. Mirrors `masks::shape`. Distances are in "aspect space" (u
+// times width / height), so circles are round.
+fn mask_shape(i: u32, uv: vec2<f32>) -> f32 {
+    let m = u.masks[i];
+    let asp = vec2(u.optics.z, 1.0);
+    let p = uv * asp;
+    var w = 0.0;
+    if m.v1.w == 1.0 {
+        let a = m.v0.xy * asp;
+        let ab = m.v0.zw * asp - a;
+        let t = dot(p - a, ab) / max(dot(ab, ab), 1e-12);
+        w = 1.0 - smoothstep(0.0, 1.0, t);
+    } else if m.v1.w == 2.0 {
+        let d = p - m.v0.xy * asp;
+        let r = vec2(m.v1.x * d.x + m.v1.y * d.y, -m.v1.y * d.x + m.v1.x * d.y) / m.v0.zw;
+        w = 1.0 - smoothstep(1.0 - m.v1.z, 1.0, length(r));
+    } else {
+        return 0.0;
+    }
+    if m.v2.y > 0.5 {
+        w = 1.0 - w;
+    }
+    return w;
+}
+
+// Global sliders plus every mask's offsets at its weight. Mirrors
+// `masks::locals`.
+fn locals(uv: vec2<f32>) -> Locals {
+    var l: Locals;
+    l.exposure_ev = u.exposure_ev;
+    l.contrast = u.contrast;
+    l.temp = u.temp;
+    l.tint = u.tint;
+    l.saturation = u.saturation;
+    l.highlights = u.highlights;
+    l.shadows = u.shadows;
+    l.whites = u.whites;
+    l.blacks = u.blacks;
+    l.sharpen_amount = u.sharpen_amount;
+    l.nr_luma = u.nr_luma;
+    let n = u32(u.mask_info.x);
+    if n == 0u {
+        return l;
+    }
+    for (var i = 0u; i < n; i++) {
+        let m = u.masks[i];
+        let w = mask_shape(i, uv) * m.v2.x;
+        l.exposure_ev += w * m.v3.x;
+        l.contrast += w * m.v3.y;
+        l.temp += w * m.v3.z;
+        l.tint += w * m.v3.w;
+        l.saturation += w * m.v4.x;
+        l.highlights += w * m.v4.y;
+        l.shadows += w * m.v4.z;
+        l.whites += w * m.v4.w;
+        l.blacks += w * m.v5.x;
+        l.sharpen_amount += w * m.v2.z;
+        l.nr_luma += w * m.v2.w;
+    }
+    l.contrast = max(l.contrast, -1.0);
+    l.saturation = max(l.saturation, -1.0);
+    l.sharpen_amount = max(l.sharpen_amount, 0.0);
+    l.nr_luma = clamp(l.nr_luma, 0.0, 1.0);
+    return l;
 }
 
 // --- Per-colour adjustments — mirrors src/pipeline.rs::hsl_adjust ---------
@@ -245,16 +346,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.
-    if u.nr_luma > 0.0 || u.nr_chroma > 0.0 || u.sharpen_amount > 0.0 {
-        c = detail(src, c);
+    //    Masks first: they decide the slider values this pixel gets.
+    let l = locals(src);
+    if l.nr_luma > 0.0 || u.nr_chroma > 0.0 || l.sharpen_amount > 0.0 {
+        c = detail(src, c, l.sharpen_amount, l.nr_luma);
     }
 
     // 1. Exposure + white balance as combined per-channel gains.
-    let gain = exp2(u.exposure_ev);
-    c *= gain * vec3(1.0 + 0.4 * u.temp, 1.0 - 0.3 * u.tint, 1.0 - 0.4 * u.temp);
+    let gain = exp2(l.exposure_ev);
+    c *= gain * vec3(1.0 + 0.4 * l.temp, 1.0 - 0.3 * l.tint, 1.0 - 0.4 * l.temp);
 
     // 2. Pivot-based contrast in linear space.
-    c = CONTRAST_PIVOT * pow(max(c, vec3(0.0)) / CONTRAST_PIVOT, vec3(1.0 + u.contrast));
+    c = CONTRAST_PIVOT * pow(max(c, vec3(0.0)) / CONTRAST_PIVOT, vec3(1.0 + l.contrast));
 
     // 3. Tonal ranges. Masks live in an approximate display domain so they
     //    line up with what the eye calls "highlights"/"shadows", and they are
@@ -264,8 +367,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let m_shad = 1.0 - smoothstep(SHAD_LO, SHAD_HI, d);
     let m_white = smoothstep(WHITE_LO, WHITE_HI, d);
     let m_black = 1.0 - smoothstep(BLACK_LO, BLACK_HI, d);
-    let tone_gain = exp2(u.highlights * m_high + u.shadows * m_shad + u.whites * WHITES_EV * m_white);
-    c = c * tone_gain + u.blacks * BLACKS_LIFT * m_black;
+    let tone_gain = exp2(l.highlights * m_high + l.shadows * m_shad + l.whites * WHITES_EV * m_white);
+    c = c * tone_gain + l.blacks * BLACKS_LIFT * m_black;
 
     // 3b. Tone curve (filmic shoulder), blended in by strength.
     if u.curve.x != 0.0 {
@@ -280,7 +383,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // 5. Luma-preserving saturation.
     let luma = dot(c, LUMA_709);
-    c = luma + (c - luma) * (1.0 + u.saturation);
+    c = luma + (c - luma) * (1.0 + l.saturation);
 
     // 6. Per-colour hue / saturation / luminance.
     if u.hsl[0].w > 0.5 {
@@ -298,6 +401,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     c = clamp(c, vec3(0.0), vec3(1.0));
+    // Mask overlay — mirrored in src/masks.rs::overlay.
+    if u.mask_info.y > 0.5 {
+        let shape = mask_shape(u32(u.mask_info.y) - 1u, src);
+        c = mix(c, MASK_OVERLAY_COLOUR, MASK_OVERLAY_OPACITY * shape);
+    }
     // Straightened corners with no source behind them.
     if outside {
         c = vec3(0.0);

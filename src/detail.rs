@@ -17,13 +17,20 @@
 //!   blur to get the high-frequency detail, drop everything below a threshold
 //!   so grain is not amplified, and add back a multiple of the rest.
 
-use crate::pipeline::{AdjustParams, DETAIL_RADIUS, NR_RANGE, NR_SIGMA, luma};
+use crate::masks;
+use crate::pipeline::{AdjustParams, DETAIL_RADIUS, Locals, NR_RANGE, NR_SIGMA, luma};
 use rayon::prelude::*;
 
 /// True when no detail filtering is requested, so callers can skip the work
 /// entirely — the common case.
 pub fn is_neutral(p: &AdjustParams) -> bool {
-    p.sharpen_amount <= 0.0 && p.nr_luma <= 0.0 && p.nr_chroma <= 0.0
+    p.sharpen_amount <= 0.0 && p.nr_luma <= 0.0 && p.nr_chroma <= 0.0 && !masks::touch_detail(&p.masks)
+}
+
+/// The stage has something to do at a pixel with these slider values. The
+/// shader's guard around `detail()` is the same test.
+fn wanted(p: &AdjustParams, l: &Locals) -> bool {
+    l.nr_luma > 0.0 || p.nr_chroma > 0.0 || l.sharpen_amount > 0.0
 }
 
 /// One pixel of the detail stage, given a sampler into the source image.
@@ -31,6 +38,17 @@ pub fn is_neutral(p: &AdjustParams) -> bool {
 /// `sample(dx, dy)` must return the pixel at the given offset with
 /// clamp-to-edge behaviour, matching the GPU sampler.
 pub fn pixel(p: &AdjustParams, center: [f32; 3], sample: impl Fn(i32, i32) -> [f32; 3]) -> [f32; 3] {
+    pixel_local(p, &Locals::of(p), center, sample)
+}
+
+/// [`pixel`] with the sharpening amount and luminance noise reduction taken
+/// from `l` — the values in force at this pixel once masks are counted.
+pub fn pixel_local(
+    p: &AdjustParams,
+    l: &Locals,
+    center: [f32; 3],
+    sample: impl Fn(i32, i32) -> [f32; 3],
+) -> [f32; 3] {
     let cl = luma(center);
     let s_nr = 2.0 * NR_SIGMA * NR_SIGMA;
     let s_sh = 2.0 * p.sharpen_radius.max(0.3).powi(2);
@@ -66,7 +84,7 @@ pub fn pixel(p: &AdjustParams, center: [f32; 3], sample: impl Fn(i32, i32) -> [f
 
     // Noise reduction: blend luminance toward the bilateral average and chroma
     // toward the plain average.
-    let nr_l = cl + (bil_l / bil_w.max(1e-6) - cl) * p.nr_luma;
+    let nr_l = cl + (bil_l / bil_w.max(1e-6) - cl) * l.nr_luma;
     let mut out = [0.0f32; 3];
     for i in 0..3 {
         let chroma = center[i] - cl;
@@ -79,7 +97,7 @@ pub fn pixel(p: &AdjustParams, center: [f32; 3], sample: impl Fn(i32, i32) -> [f
     let blur_l = sharp_l / sharp_w.max(1e-6);
     let d = cl - blur_l;
     let d = d.signum() * (d.abs() - p.sharpen_threshold).max(0.0);
-    let final_l = nr_l + p.sharpen_amount * d;
+    let final_l = nr_l + l.sharpen_amount * d;
 
     for v in &mut out {
         *v = (*v + final_l).max(0.0);
@@ -92,9 +110,25 @@ pub fn apply(width: usize, height: usize, data: &[f32], p: &AdjustParams) -> Vec
     if is_neutral(p) {
         return data.to_vec();
     }
+    // With masks the amounts differ from pixel to pixel, and — as in the
+    // shader — a pixel they leave at zero skips the stage altogether.
+    let masked = masks::count(&p.masks) > 0;
+    let global = Locals::of(p);
+    let aspect = width as f32 / height as f32;
     let mut out = vec![0f32; width * height * 3];
     out.par_chunks_mut(width * 3).enumerate().for_each(|(y, row)| {
         for x in 0..width {
+            let l = if masked {
+                let uv = [(x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32];
+                masks::locals(p, uv, aspect)
+            } else {
+                global
+            };
+            if masked && !wanted(p, &l) {
+                let o = (y * width + x) * 3;
+                row[x * 3..x * 3 + 3].copy_from_slice(&data[o..o + 3]);
+                continue;
+            }
             let at = |dx: i32, dy: i32| -> [f32; 3] {
                 let sx = (x as i32 + dx).clamp(0, width as i32 - 1) as usize;
                 let sy = (y as i32 + dy).clamp(0, height as i32 - 1) as usize;
@@ -102,7 +136,7 @@ pub fn apply(width: usize, height: usize, data: &[f32], p: &AdjustParams) -> Vec
                 [data[o], data[o + 1], data[o + 2]]
             };
             let c = at(0, 0);
-            let v = pixel(p, c, at);
+            let v = pixel_local(p, &l, c, at);
             row[x * 3..x * 3 + 3].copy_from_slice(&v);
         }
     });

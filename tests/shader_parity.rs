@@ -11,8 +11,9 @@ use eframe::wgpu;
 use raw_editor::develop::DevelopedImage;
 use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
+use raw_editor::masks::{self, Mask, MaskAdjust};
 use raw_editor::pipeline::{ColourMode, 
-    AdjustParams, ImageColour, Uniforms, View, apply, clip_view, srgb_encode,
+    AdjustParams, ImageColour, Uniforms, View, apply, apply_at, clip_view, srgb_encode,
 };
 
 const W: usize = 2;
@@ -62,12 +63,25 @@ fn render_image_sized(
     w: usize,
     h: usize,
 ) -> Vec<[u8; 4]> {
-    let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
-    renderer.set_image(device, queue, img);
     let view = View::one_to_one([1.0 / img.width as f32, 1.0 / img.height as f32]);
     let mut uniforms = Uniforms::new(params, &img.colour, view, false);
     uniforms.show_clip = if show_clip { 1.0 } else { 0.0 };
-    renderer.write_uniforms(queue, &uniforms);
+    render_uniforms(device, queue, img, &uniforms, w, h)
+}
+
+/// Render with a uniform block the caller has finished by hand (the view
+/// settings that are not part of `AdjustParams`).
+fn render_uniforms(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DevelopedImage,
+    uniforms: &Uniforms,
+    w: usize,
+    h: usize,
+) -> Vec<[u8; 4]> {
+    let mut renderer = ImageRenderer::from_device(device, wgpu::TextureFormat::Rgba8Unorm);
+    renderer.set_image(device, queue, img);
+    renderer.write_uniforms(queue, uniforms);
 
     let size = wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -311,8 +325,10 @@ fn assert_image_parity(img: &DevelopedImage, params: AdjustParams) {
     let working = img.working(&params);
     let detailed = detail::apply(img.width, img.height, &working, &params);
     let mut worst = 0i32;
+    let (w, h) = (img.width, img.height);
     for (i, px) in detailed.chunks(3).enumerate() {
-        let c = apply(&params, [px[0], px[1], px[2]]);
+        let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
+        let c = apply_at(&params, uv, w as f32 / h as f32, [px[0], px[1], px[2]]);
         for ch in 0..3 {
             let want = (srgb_encode(c[ch]) * 255.0 + 0.5) as u8;
             let got = gpu[i][ch];
@@ -654,3 +670,169 @@ fn parity_clipping_overlay() {
     assert_eq!(&gpu[2][..3], &[255, 255, 255]);
 }
 
+
+// --- Masks ------------------------------------------------------------------
+
+/// A 48x32 frame (not square, so an aspect mistake shows) of smooth colour
+/// with fine noise, for the masks to work on.
+fn mask_source() -> DevelopedImage {
+    let (w, h) = (48usize, 32usize);
+    let mut data = vec![0f32; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let n = if (x + y) % 2 == 0 { 0.02 } else { -0.02 };
+            let o = (y * w + x) * 3;
+            data[o] = 0.15 + 0.5 * x as f32 / w as f32 + n;
+            data[o + 1] = 0.30 + n;
+            data[o + 2] = 0.10 + 0.6 * y as f32 / h as f32 - n;
+        }
+    }
+    DevelopedImage::linear_srgb(w, h, data)
+}
+
+/// Every offset a mask can carry, all non-zero.
+fn every_offset() -> MaskAdjust {
+    MaskAdjust {
+        exposure_ev: 0.8,
+        contrast: 0.3,
+        highlights: -0.5,
+        shadows: 0.4,
+        whites: 0.3,
+        blacks: -0.2,
+        temp: 0.4,
+        tint: -0.3,
+        saturation: 0.5,
+        sharpen: 0.0,
+        nr_luma: 0.0,
+    }
+}
+
+fn with_masks(masks: &[Mask]) -> AdjustParams {
+    let mut p = AdjustParams { exposure_ev: -0.2, contrast: 0.1, tone_curve: 0.6, ..Default::default() };
+    p.masks[..masks.len()].copy_from_slice(masks);
+    p
+}
+
+/// The masks must really reach the pixels: a render with them differs from
+/// one without. Guards the parity tests against agreeing on "no effect".
+fn assert_masks_change_the_render(img: &DevelopedImage, params: &AdjustParams) {
+    let with = raw_editor::export::render_cpu(img, params);
+    let without = raw_editor::export::render_cpu(img, &AdjustParams { masks: Default::default(), ..*params });
+    let changed = with.data.iter().zip(&without.data).filter(|(a, b)| a.abs_diff(**b) > 600).count();
+    assert!(changed > with.data.len() / 20, "only {changed} samples changed");
+}
+
+#[test]
+fn parity_linear_mask() {
+    for (a, b) in [([0.5, 0.2], [0.5, 0.8]), ([0.2, 0.3], [0.7, 0.6]), ([0.8, 0.5], [0.3, 0.5])] {
+        let p = with_masks(&[Mask { adjust: every_offset(), ..Mask::linear(a, b) }]);
+        assert_masks_change_the_render(&mask_source(), &p);
+        assert_geometry_parity(&mask_source(), p, 3);
+    }
+}
+
+#[test]
+fn parity_radial_mask() {
+    let round = Mask { adjust: every_offset(), ..Mask::radial([0.45, 0.55], 0.35) };
+    let turned = Mask { b: [0.5, 0.2], angle: 0.7, feather: 0.3, ..round };
+    for m in [round, turned, Mask { invert: true, ..turned }, Mask { amount: 0.4, ..round }] {
+        let p = with_masks(&[m]);
+        assert_masks_change_the_render(&mask_source(), &p);
+        assert_geometry_parity(&mask_source(), p, 3);
+    }
+}
+
+#[test]
+fn parity_stacked_masks_and_a_disabled_one() {
+    let lin = Mask { adjust: every_offset(), ..Mask::linear([0.5, 0.1], [0.5, 0.7]) };
+    let rad = Mask {
+        adjust: MaskAdjust { exposure_ev: -1.0, saturation: -2.0, contrast: -1.5, ..Default::default() },
+        ..Mask::radial([0.6, 0.5], 0.3)
+    };
+    let off = Mask { enabled: false, adjust: MaskAdjust { exposure_ev: 3.0, ..Default::default() }, ..Mask::radial([0.5, 0.5], 0.9) };
+    let p = with_masks(&[lin, off, rad]);
+    assert_geometry_parity(&mask_source(), p, 3);
+    // The disabled one in the middle changes nothing.
+    let Some(ctx) = common::gpu() else { return };
+    let img = mask_source();
+    let gpu = |p: &AdjustParams| render_image(&ctx.device, &ctx.queue, &img, p);
+    assert_eq!(gpu(&p), gpu(&with_masks(&[lin, Mask::default(), rad])));
+}
+
+/// Masks stay on the same part of the photo through rotation and a crop:
+/// they are placed in source uv, and the shader maps output to source first.
+#[test]
+fn parity_masks_with_rotation_and_crop() {
+    let m = Mask { adjust: every_offset(), b: [0.4, 0.2], angle: 0.4, ..Mask::radial([0.4, 0.6], 0.3) };
+    for rotation in 0..4u8 {
+        let p = AdjustParams { rotation, crop: [0.125, 0.25, 0.875, 1.0], ..with_masks(&[m]) };
+        assert_geometry_parity(&mask_source(), p, 3);
+    }
+    let p = AdjustParams { straighten: 4.0, ..with_masks(&[m]) };
+    assert_geometry_parity(&mask_source(), p, 6);
+}
+
+/// Local sharpening and noise reduction: the detail stage runs only where a
+/// mask asks for it, with the amount the mask gives.
+#[test]
+fn parity_mask_detail() {
+    let m = Mask {
+        adjust: MaskAdjust { sharpen: 1.2, nr_luma: 0.7, exposure_ev: 0.3, ..Default::default() },
+        ..Mask::radial([0.5, 0.5], 0.3)
+    };
+    // No global detail at all: outside the mask the stage is skipped.
+    let p = with_masks(&[m]);
+    assert_image_parity(&mask_source(), p);
+    // A mask that takes global sharpening away again.
+    let less = Mask { adjust: MaskAdjust { sharpen: -2.0, ..Default::default() }, ..m };
+    assert_image_parity(&mask_source(), AdjustParams { sharpen_amount: 1.0, nr_chroma: 0.5, ..with_masks(&[less]) });
+    // And it does something: the noise is smaller inside than with no mask.
+    let img = mask_source();
+    let nr = with_masks(&[Mask { adjust: MaskAdjust { nr_luma: 1.0, ..Default::default() }, ..Mask::radial([0.5, 0.5], 0.3) }]);
+    let (with, without) = (
+        raw_editor::export::render_cpu(&img, &nr),
+        raw_editor::export::render_cpu(&img, &AdjustParams { masks: Default::default(), ..nr }),
+    );
+    let step = |r: &raw_editor::export::Rendered, x: usize, y: usize| {
+        (r.data[(y * 48 + x) * 3 + 1] as i32 - r.data[(y * 48 + x + 1) * 3 + 1] as i32).abs()
+    };
+    assert!(step(&with, 24, 16) * 2 < step(&without, 24, 16), "centre: {} vs {}", step(&with, 24, 16), step(&without, 24, 16));
+    assert_eq!(step(&with, 1, 1), step(&without, 1, 1), "the corner is outside the mask");
+}
+
+/// The overlay tints by the selected mask's shape — after the adjustments,
+/// regardless of that mask's amount or eye.
+#[test]
+fn parity_mask_overlay() {
+    let Some(ctx) = common::gpu() else {
+        eprintln!("SKIP: no wgpu adapter available");
+        return;
+    };
+    let img = mask_source();
+    let shown = Mask { enabled: false, feather: 0.6, ..Mask::radial([0.5, 0.5], 0.4) };
+    let p = with_masks(&[Mask { adjust: every_offset(), ..Mask::linear([0.5, 0.2], [0.5, 0.8]) }, shown]);
+    let view = View::one_to_one([1.0 / img.width as f32, 1.0 / img.height as f32]);
+    let mut uniforms = Uniforms::new(&p, &img.colour, view, false);
+    uniforms.mask_info = masks::uniforms(&p.masks, Some(1)).0;
+    let gpu = render_uniforms(&ctx.device, &ctx.queue, &img, &uniforms, img.width, img.height);
+    let plain = raw_editor::export::render_cpu(&img, &p);
+    let (w, h) = (img.width, img.height);
+    let aspect = w as f32 / h as f32;
+    let mut tinted = 0;
+    for i in 0..w * h {
+        let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
+        let shape = masks::shape(&shown, uv, aspect);
+        tinted += (shape > 0.5) as usize;
+        // The CPU render is sRGB-encoded; the overlay mixes in linear.
+        let lin = |v: u16| {
+            let v = v as f32 / 65535.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        let c = masks::overlay(std::array::from_fn(|ch| lin(plain.data[i * 3 + ch])), shape);
+        for ch in 0..3 {
+            let want = (srgb_encode(c[ch]) * 255.0 + 0.5) as u8;
+            assert!(want.abs_diff(gpu[i][ch]) <= 3, "pixel {i} ch {ch}: gpu {} cpu {want}", gpu[i][ch]);
+        }
+    }
+    assert!(tinted > w * h / 10, "the overlay covers a real area");
+}

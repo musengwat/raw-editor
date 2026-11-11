@@ -554,6 +554,59 @@ knows the viewport, so keys and the View menu just set `App.zoom_cmd`
   double-click needs the two clicks <0.3 s apart — sleeping 0.15 s after
   every event misses egui's double-click window and looks like a bug.
 
+## Masks (M1)
+
+`src/masks.rs` is the whole feature apart from the GUI: `Mask` (kind, shape,
+`MaskAdjust` offsets), `shape` / `weight` / `locals`, the uniform packing,
+the list helpers, the sidecar form and the pure handle geometry
+(`handles`, `outline`, `drag`, `MaskGrab`).
+
+- **One pipeline, not two.** `pipeline::Locals` holds the eleven slider
+  values a mask can change. `masks::locals(p, uv, aspect)` = global values +
+  Σ weight·offset; `pipeline::apply_local(p, &locals, rgb)` is the chain and
+  `apply(p, rgb)` is that with `Locals::of(p)`. The shader does the same in
+  `locals(src)` at the top of `fs_main`. Anything that renders pixels with a
+  position must use `apply_at` / `apply_local` (CPU export, histogram, Auto
+  do); plain `apply` ignores masks.
+- **`AdjustParams` stays `Copy`**: `masks: [Mask; MAX_MASKS]` (8), used
+  slots packed at the front (`masks::add` / `remove` keep it so — the GUI
+  list and `count` rely on it). The sidecar lists only used masks
+  (`masks::slots`); extra entries are dropped, not refused.
+- **Source uv.** Geometry is stored in the texture's uv, before the camera
+  turn / rotation / straighten / crop, so reframing never moves a mask.
+  Distances are in "aspect space" (u × width/height; unit = source height) so
+  circles are round; the shader gets the aspect from `u.optics.z`. Screen ↔
+  source goes `MaskMap` (main.rs) → `View::ndc` / `quad_uv_unbounded` →
+  `Geometry::output_uv` / `source_uv`.
+- **Detail.** Local sharpen / luma NR make the amounts per pixel:
+  `detail()` in the shader takes them as arguments, the guard around it
+  tests the *local* values, and `detail::apply` mirrors that guard per pixel
+  (`wanted`) — a masked photo's untouched pixels skip the stage on both
+  sides, bit for bit. Mask weights are taken at the centre pixel only.
+- **Uniforms** grew to 1440 bytes: `mask_info` (count, overlay slot + 1) and
+  `masks: array<MaskU, 8>` of eight vec4s (two reserved for M2's ranges),
+  placed with the other vec4s. A disabled mask is sent with amount 0, not
+  kind 0, so the overlay can still show it.
+- **Overlay** is a view setting like the clipping overlay: the GUI sets
+  `uniforms.mask_info` itself; `Uniforms::new` always passes `None`, so
+  exports can never contain it. CPU twin `masks::overlay`.
+- **Clamps** (contrast ≥ −1, saturation ≥ −1, sharpen ≥ 0, NR 0..1) apply
+  only when a mask is active, so mask-free renders are byte-identical to
+  before (checked by exporting five real files with the old and new binary).
+- **GUI.** `mask_interact` runs *before* panning (a drag that starts on a
+  handle is the mask's, anything else pans) against the view that is on
+  screen; `mask_draw` runs *after* the image callback is added — drawn
+  before it, the handles end up underneath the photo. `App::selected_mask`
+  re-checks the selection every use, because undo / reset / paste can remove
+  the mask it points at. New masks are placed in the *output* frame's centre
+  and converted to source uv.
+- egui's default font has no `＋` (fullwidth plus) or `⧉`; they render as
+  boxes. `✖` and `↺` are fine.
+- Tests: `masks::tests` (maths, list, sidecar, handles), `parity_*mask*` in
+  `tests/shader_parity.rs` (48×32 non-square frame; each asserts the masks
+  really changed the render), `masks_on_a_real_frame_through_the_gpu_export`
+  (portrait frame + crop).
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

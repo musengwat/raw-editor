@@ -175,6 +175,18 @@ mod tests {
             rotation: 3,
             straighten: -1.5,
             crop: [0.05, 0.1, 0.95, 0.85],
+            masks: {
+                use crate::masks::{Mask, MaskAdjust};
+                let mut m = [Mask::default(); crate::masks::MAX_MASKS];
+                m[0] = Mask {
+                    invert: true,
+                    amount: 0.8,
+                    adjust: MaskAdjust { exposure_ev: -0.7, temp: 0.2, sharpen: 0.5, ..Default::default() },
+                    ..Mask::linear([0.5, 0.1], [0.45, 0.6])
+                };
+                m[1] = Mask { enabled: false, angle: 0.3, feather: 0.2, ..Mask::radial([0.3, 0.7], 0.15) };
+                m
+            },
         };
         save(&raw, &params).unwrap();
         assert_eq!(load(&raw).unwrap().unwrap(), params);

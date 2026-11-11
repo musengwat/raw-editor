@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::masks::{MAX_MASKS, Mask};
+
 pub const CONTRAST_PIVOT: f32 = 0.18;
 
 // --- Tone curve -----------------------------------------------------------
@@ -151,6 +153,11 @@ pub struct AdjustParams {
     /// Crop `[x0, y0, x1, y1]`, normalised to the rotated (and straightened)
     /// frame. `[0, 0, 1, 1]` = no crop.
     pub crop: [f32; 4],
+
+    /// Local adjustments (see [`crate::masks`]). A fixed number of slots,
+    /// the ones in use packed at the front; the sidecar lists only those.
+    #[serde(with = "crate::masks::slots")]
+    pub masks: [Mask; MAX_MASKS],
 }
 
 /// Half-width of the detail neighbourhood, in source pixels. Mirrored in
@@ -196,6 +203,43 @@ impl Default for AdjustParams {
             rotation: 0,
             straighten: 0.0,
             crop: [0.0, 0.0, 1.0, 1.0],
+            masks: [Mask::default(); MAX_MASKS],
+        }
+    }
+}
+
+/// The slider values the tone chain and the detail stage read per pixel.
+/// Without masks they are simply the global ones ([`Locals::of`]); with
+/// masks, [`crate::masks::locals`] adds each mask's offsets at its weight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Locals {
+    pub exposure_ev: f32,
+    pub contrast: f32,
+    pub temp: f32,
+    pub tint: f32,
+    pub saturation: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+    pub sharpen_amount: f32,
+    pub nr_luma: f32,
+}
+
+impl Locals {
+    pub fn of(p: &AdjustParams) -> Self {
+        Self {
+            exposure_ev: p.exposure_ev,
+            contrast: p.contrast,
+            temp: p.temp,
+            tint: p.tint,
+            saturation: p.saturation,
+            highlights: p.highlights,
+            shadows: p.shadows,
+            whites: p.whites,
+            blacks: p.blacks,
+            sharpen_amount: p.sharpen_amount,
+            nr_luma: p.nr_luma,
         }
     }
 }
@@ -268,6 +312,7 @@ impl AdjustParams {
                 self.straighten = d.straighten;
                 self.crop = d.crop;
             }
+            Section::Masks => self.masks = d.masks,
         }
     }
 
@@ -290,10 +335,11 @@ pub enum Section {
     Detail,
     Optics,
     Geometry,
+    Masks,
 }
 
 impl Section {
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::Colour,
         Section::Basic,
         Section::Hsl,
@@ -302,6 +348,7 @@ impl Section {
         Section::Detail,
         Section::Optics,
         Section::Geometry,
+        Section::Masks,
     ];
 }
 
@@ -387,6 +434,17 @@ impl Geometry {
         [a[0][0] * uv[0] + a[0][1] * uv[1] + a[0][2], a[1][0] * uv[0] + a[1][1] * uv[1] + a[1][2]]
     }
 
+    /// Where a source uv lands in the output: the inverse of [`source_uv`].
+    /// Masks live in source uv; this puts their handles on the screen.
+    ///
+    /// [`source_uv`]: Geometry::source_uv
+    pub fn output_uv(&self, src: [f32; 2]) -> [f32; 2] {
+        let a = &self.a;
+        let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+        let (x, y) = (src[0] - a[0][2], src[1] - a[1][2]);
+        [(a[1][1] * x - a[0][1] * y) / det, (a[0][0] * y - a[1][0] * x) / det]
+    }
+
     /// The source pixel behind an output uv, or `None` where straightening
     /// left no source (the black corners).
     pub fn source_pixel(&self, uv: [f32; 2], w: usize, h: usize) -> Option<[usize; 2]> {
@@ -467,7 +525,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 400 bytes.
+/// Total size 1440 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -492,6 +550,10 @@ pub struct Uniforms {
     /// Output uv → source uv, the two rows of [`Geometry::a`] (`.w` unused).
     pub geom0: [f32; 4],
     pub geom1: [f32; 4],
+    /// `[slots to evaluate, overlay slot + 1 (0 = no overlay), _, _]`.
+    pub mask_info: [f32; 4],
+    /// The mask slots, eight vec4s each — see [`crate::masks::uniforms`].
+    pub masks: [crate::masks::MaskUniform; MAX_MASKS],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -556,6 +618,22 @@ impl View {
             return None;
         }
         Some([cx * 0.5 + 0.5, 0.5 - cy * 0.5])
+    }
+
+    /// [`quad_uv`] without the bounds test: a drag that leaves the image
+    /// still has a position.
+    ///
+    /// [`quad_uv`]: View::quad_uv
+    pub fn quad_uv_unbounded(&self, ndc: [f32; 2]) -> [f32; 2] {
+        let cx = (ndc[0] - self.offset[0]) / self.scale[0];
+        let cy = (ndc[1] - self.offset[1]) / self.scale[1];
+        [cx * 0.5 + 0.5, 0.5 - cy * 0.5]
+    }
+
+    /// Where a quad uv is in the viewport, in NDC. Inverse of
+    /// [`quad_uv_unbounded`](View::quad_uv_unbounded).
+    pub fn ndc(&self, uv: [f32; 2]) -> [f32; 2] {
+        [(uv[0] * 2.0 - 1.0) * self.scale[0] + self.offset[0], (1.0 - uv[1] * 2.0) * self.scale[1] + self.offset[1]]
     }
 
     /// Aspect-fitted, unpanned.
@@ -685,6 +763,8 @@ impl Uniforms {
             },
             geom0: { let g = view_geometry(p, img, view); [g.a[0][0], g.a[0][1], g.a[0][2], 0.0] },
             geom1: { let g = view_geometry(p, img, view); [g.a[1][0], g.a[1][1], g.a[1][2], 0.0] },
+            mask_info: crate::masks::uniforms(&p.masks, None).0,
+            masks: crate::masks::uniforms(&p.masks, None).1,
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -745,16 +825,29 @@ pub fn tone_masks(luma: f32) -> [f32; 4] {
 /// blacks → lift/gamma/gain → saturation. Keep this in lockstep with
 /// `fs_main` in `src/shader.wgsl`.
 pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
+    apply_local(p, &Locals::of(p), rgb)
+}
+
+/// [`apply`] for a photo with masks: the pixel at source uv `uv` of an image
+/// `aspect` (width / height) wide gets the global sliders plus whatever its
+/// masks add there.
+pub fn apply_at(p: &AdjustParams, uv: [f32; 2], aspect: f32, rgb: [f32; 3]) -> [f32; 3] {
+    apply_local(p, &crate::masks::locals(p, uv, aspect), rgb)
+}
+
+/// The chain with the per-pixel slider values given: `l` for everything a
+/// mask can change, `p` for the rest.
+pub fn apply_local(p: &AdjustParams, l: &Locals, rgb: [f32; 3]) -> [f32; 3] {
     // 1. Exposure and white balance as combined per-channel gains.
-    let gain = (p.exposure_ev).exp2();
-    let r_gain = 1.0 + 0.4 * p.temp;
-    let b_gain = 1.0 - 0.4 * p.temp;
-    let g_gain = 1.0 - 0.3 * p.tint;
+    let gain = (l.exposure_ev).exp2();
+    let r_gain = 1.0 + 0.4 * l.temp;
+    let b_gain = 1.0 - 0.4 * l.temp;
+    let g_gain = 1.0 - 0.3 * l.tint;
 
     let mut c = [rgb[0] * gain * r_gain, rgb[1] * gain * g_gain, rgb[2] * gain * b_gain];
 
     // 2. Pivot-based contrast in linear space.
-    let e = 1.0 + p.contrast;
+    let e = 1.0 + l.contrast;
     for v in &mut c {
         *v = CONTRAST_PIVOT * (v.max(0.0) / CONTRAST_PIVOT).powf(e);
     }
@@ -763,8 +856,8 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
     //    shadow and white masks, plus an additive black-point lift. Masks are
     //    driven by luminance so hue stays put.
     let [mh, ms, mw, mb] = tone_masks(luma(c));
-    let tone_gain = (p.highlights * mh + p.shadows * ms + p.whites * WHITES_EV * mw).exp2();
-    let black_lift = p.blacks * BLACKS_LIFT * mb;
+    let tone_gain = (l.highlights * mh + l.shadows * ms + l.whites * WHITES_EV * mw).exp2();
+    let black_lift = l.blacks * BLACKS_LIFT * mb;
     for v in &mut c {
         *v = *v * tone_gain + black_lift;
     }
@@ -787,10 +880,10 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
     }
 
     // 5. Luma-preserving saturation.
-    let l = luma(c);
-    let s = 1.0 + p.saturation;
+    let y = luma(c);
+    let s = 1.0 + l.saturation;
     for v in &mut c {
-        *v = l + (*v - l) * s;
+        *v = y + (*v - y) * s;
     }
 
     // 6. Per-colour hue / saturation / luminance.
@@ -941,6 +1034,11 @@ mod tests {
             rotation: 1,
             straighten: 2.0,
             crop: [0.1, 0.1, 0.9, 0.8],
+            masks: {
+                let mut m = [Mask::default(); MAX_MASKS];
+                m[0] = Mask::radial([0.4, 0.6], 0.3);
+                m
+            },
         }
     }
 
@@ -1156,8 +1254,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_400_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 400);
+    fn uniforms_layout_is_1440_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 1440);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -1174,6 +1272,9 @@ mod tests {
             &u.hsl as *const _ as usize,
             &u.geom0 as *const _ as usize,
             &u.geom1 as *const _ as usize,
+            &u.mask_info as *const _ as usize,
+            &u.masks as *const _ as usize,
+            &u.scale as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
         }
@@ -1434,6 +1535,25 @@ mod tests {
         assert!((z - 1.0).abs() < 1e-6);
         assert_eq!(Zoom::Scale(0.3).step(-1, OUT, VIEWPORT), Zoom::Fit);
         assert_eq!(Zoom::Scale(8.0).step(1, OUT, VIEWPORT), Zoom::Scale(8.0));
+    }
+
+    #[test]
+    fn source_positions_map_to_the_screen_and_back() {
+        // A turned, straightened, cropped frame, zoomed and panned.
+        let p = AdjustParams { rotation: 1, straighten: 7.0, crop: [0.1, 0.2, 0.8, 0.9], ..Default::default() };
+        let geom = Geometry::resolve(&p, &ImageColour::LINEAR_SRGB, 400, 300);
+        let view = View::placed([geom.width as f32, geom.height as f32], VIEWPORT, Zoom::Scale(3.0), [0.2, -0.3], [0.0; 2]);
+        for src in [[0.5, 0.5], [0.1, 0.9], [0.83, 0.27], [1.4, -0.2]] {
+            let out = geom.output_uv(src);
+            let back = geom.source_uv(out);
+            assert!((back[0] - src[0]).abs() < 1e-4 && (back[1] - src[1]).abs() < 1e-4, "{src:?} -> {back:?}");
+            let uv = view.quad_uv_unbounded(view.ndc(out));
+            assert!((uv[0] - out[0]).abs() < 1e-4 && (uv[1] - out[1]).abs() < 1e-4, "{out:?} -> {uv:?}");
+        }
+        // And `ndc` agrees with the bounded lookup the eyedropper uses.
+        let ndc = view.ndc([0.25, 0.75]);
+        let uv = view.quad_uv(ndc).unwrap();
+        assert!((uv[0] - 0.25).abs() < 1e-5 && (uv[1] - 0.75).abs() < 1e-5);
     }
 
     #[test]

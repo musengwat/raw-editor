@@ -125,7 +125,10 @@ Everyday use:
   (fit … 800%), drag pans, double-click or **Z** flips fit ↔ 100%, Ctrl+0 /
   Ctrl+1 / Ctrl+= / Ctrl+−, *Fill window*, zoom shown in the status bar and
   kept from photo to photo; **\\** latches the before view
-- [ ] M1 — linear and radial gradient masks with local adjustments
+- [x] M1 — **masks**: up to 8 linear or radial gradients per photo, each
+  with its own exposure, contrast, highlights, shadows, whites, blacks,
+  temp, tint, saturation, sharpening and noise reduction; handles on the
+  photo, red overlay, invert, amount, feather
 - [ ] M2 — luminance and colour range on masks
 - [ ] T1 — point tone curve (RGB + per channel)
 - [ ] T2 — vignette, grain, vibrance
@@ -154,6 +157,29 @@ position carry over to the next photo, so stepping through a burst at 100%
 compares the same spot. Crop mode always shows the whole frame; the zoom
 returns when it ends. The middle button, or **Space** + drag, pans even when
 a tool on the photo takes drags for itself.
+
+**Masks** limit a set of adjustments to part of the photo. Under *Masks*,
+*+ Add mask* gives a **linear gradient** (full effect on one side of a line,
+fading to nothing at a second line — a darker sky, say) or a **radial
+gradient** (an oval, soft at the edge — a brighter face). The new mask
+appears in the middle of the frame with its area tinted red; drag its handles
+on the photo to place it:
+
+- linear: the two white dots are the full-effect and no-effect ends, the red
+  pin moves the whole gradient;
+- radial: the red pin moves it, the four white dots change its width and
+  height, the blue dot turns it. *Feather* sets how soft the edge is.
+
+Then move the mask's sliders — they are *added* to the main sliders inside
+the mask, so Exposure +1 there is one stop brighter than the rest of the
+photo. The red tint goes away as soon as a slider moves; **O** brings it back
+or hides it. *Invert* affects everything outside the shape instead, *Amount*
+scales the whole mask, the tick box switches it off without losing it, *Copy*
+duplicates it and ✖ deletes it. **M** hides or shows the handles. A photo can
+have up to eight masks; where they overlap, their effects add up. Masks stay
+on the same part of the picture when you crop, rotate or straighten, are
+copied by Copy / Paste edits, and are saved in the sidecar like everything
+else. Looks never change them.
 
 **Before / after**: hold **B** to see the photo as it opened; **\\** (or *View →
 Show before*) keeps that view on until pressed again.
