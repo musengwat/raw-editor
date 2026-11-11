@@ -14,8 +14,8 @@ use raw_editor::develop::DevelopedImage;
 use raw_editor::export::{self, ExportFormat};
 use raw_editor::gpu::{ImageCallback, ImageRenderer};
 use raw_editor::pipeline::{
-    AdjustParams, ColourMode, Geometry, HSL_BANDS, IDENTITY3, ImageColour, Section, Uniforms, WB_GAIN_MAX,
-    WB_GAIN_MIN, straighten_crop,
+    AdjustParams, ColourMode, Geometry, HSL_BANDS, IDENTITY3, ImageColour, Section, Uniforms, View, WB_GAIN_MAX,
+    WB_GAIN_MIN, Zoom, straighten_crop,
 };
 use raw_editor::config::Config;
 use raw_editor::hdr::{self, MergeReport, Style};
@@ -30,6 +30,17 @@ use raw_editor::widgets::{ColorWheel, CropGrab, drag_crop, fit_aspect, resettabl
 const COMPARE_KEY: egui::Key = egui::Key::B;
 /// Toggles between fit-to-window and 1:1.
 const ZOOM_KEY: egui::Key = egui::Key::Z;
+/// Flips the before / after view on and off (Lightroom's key); holding the
+/// compare key shows it only while held.
+const BEFORE_AFTER_KEY: egui::Key = egui::Key::Backslash;
+/// Held while dragging, pans even when a tool (the crop box, say) owns drags.
+const PAN_KEY: egui::Key = egui::Key::Space;
+const ZOOM_FIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num0);
+const ZOOM_ONE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num1);
+const ZOOM_IN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Equals);
+const ZOOM_OUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Minus);
+/// Zoom per point of wheel travel (one notch is 50–80 points: 10–17%).
+const WHEEL_ZOOM: f32 = 0.002;
 /// Arms the white-balance eyedropper; the next click on the image picks.
 const PICK_WB_KEY: egui::Key = egui::Key::W;
 /// Toggles the clipping overlay.
@@ -101,6 +112,20 @@ enum ExportMsg {
 type ExportResult = ExportMsg;
 
 /// A flat-field change for a lens, requested from the side panel.
+/// A zoom change asked for by a key or the View menu. It is carried out in
+/// `image_panel`, the one place that knows the viewport and image sizes.
+#[derive(Clone, Copy, PartialEq)]
+enum ZoomCmd {
+    Fit,
+    Fill,
+    /// 100%.
+    One,
+    /// Fit ↔ 100%, about the pointer when it is over the image.
+    Toggle,
+    /// One stop in (+1) or out (−1).
+    Step(i32),
+}
+
 enum OpticsAction {
     /// Make (or replace) the lens's flat field from the open photo.
     Make(String),
@@ -160,9 +185,18 @@ struct App {
 
     /// 1:1 view — required to judge sharpening and noise reduction, which act
     /// on source pixels a fit-to-window view has already thrown away.
-    zoom_100: bool,
-    /// Pan offset in NDC, only meaningful while zoomed.
+    /// Persists across photos, so stepping through a burst at 100% compares
+    /// the same spot.
+    zoom: Zoom,
+    /// Pan offset in NDC, only meaningful while zoomed past the viewport.
     pan: [f32; 2],
+    /// Zoom change waiting for `image_panel`.
+    zoom_cmd: Option<ZoomCmd>,
+    /// Zoom as last drawn, in percent, for the status bar.
+    zoom_percent: f32,
+    /// Before / after view latched on with its key (holding the compare key
+    /// shows it without latching).
+    show_before: bool,
     /// The white-balance eyedropper is armed: the next click on the image
     /// sets white balance from that spot.
     picking_wb: bool,
@@ -237,8 +271,11 @@ impl App {
             exporting: false,
             export_format: ExportFormat::Jpeg,
             jpeg_quality: 92,
-            zoom_100: false,
+            zoom: Zoom::Fit,
             pan: [0.0, 0.0],
+            zoom_cmd: None,
+            zoom_percent: 100.0,
+            show_before: false,
             picking_wb: false,
             show_clip: false,
             preview: None,
@@ -260,6 +297,9 @@ impl App {
             bracket: None,
             hdr_style: Style::default(),
         };
+        // Ctrl + / − / 0 zoom the photo here; egui would scale the whole
+        // interface with them.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         if let Some(p) = path {
             app.start_load(p, &cc.egui_ctx);
         }
@@ -359,6 +399,7 @@ impl App {
                     self.camera = camera;
                     self.prev_params = params;
                     self.history = History::new(params);
+                    self.show_before = false;
                     self.cropping = false;
                     self.crop_drag = None;
                     self.dirty_since = None;
@@ -875,10 +916,34 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
-                let fit = ui.selectable_label(!self.zoom_100, "Fit to window").clicked();
-                let one = ui.selectable_label(self.zoom_100, "1:1 (100%)").clicked();
-                if fit || one {
-                    self.zoom_100 = one;
+                let key = |s: &egui::KeyboardShortcut| ui.ctx().format_shortcut(s);
+                let entries = [
+                    (ZoomCmd::Fit, self.zoom == Zoom::Fit, "Fit to window", key(&ZOOM_FIT)),
+                    (ZoomCmd::Fill, self.zoom == Zoom::Fill, "Fill window", String::new()),
+                    (ZoomCmd::One, self.zoom == Zoom::Scale(1.0), "100%", key(&ZOOM_ONE)),
+                    (ZoomCmd::Step(1), false, "Zoom in", key(&ZOOM_IN)),
+                    (ZoomCmd::Step(-1), false, "Zoom out", key(&ZOOM_OUT)),
+                ];
+                for (cmd, on, label, keys) in entries {
+                    if ui.add(egui::Button::new(label).selected(on).shortcut_text(keys)).clicked() {
+                        self.zoom_cmd = Some(cmd);
+                        ui.close();
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Scroll to zoom, drag to pan, double-click or {} for fit ↔ 100%",
+                        ZOOM_KEY.name()
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Show before").selected(self.show_before).shortcut_text(BEFORE_AFTER_KEY.symbol_or_name()))
+                    .clicked()
+                {
+                    self.show_before = !self.show_before;
                     ui.close();
                 }
             });
@@ -1395,7 +1460,11 @@ impl App {
                 .on_hover_text("Back to how the photo opened. Each slider also has its own ↺ (or double-click it); Edit → Reset to neutral clears everything")
                 .clicked();
             ui.label(
-                egui::RichText::new(format!("Hold {} to compare with how it opened", COMPARE_KEY.name()))
+                egui::RichText::new(format!(
+                    "Hold {} to compare with how it opened ({} keeps it on)",
+                    COMPARE_KEY.name(),
+                    BEFORE_AFTER_KEY.symbol_or_name()
+                ))
                     .weak()
                     .small(),
             );
@@ -1494,6 +1563,12 @@ impl App {
 
     /// Open the photo `step` places from the current one in its folder (the
     /// one already queued, if keys are pressed faster than photos load).
+    /// A tool on the image takes plain drags (so panning needs the pan key
+    /// or the middle button).
+    fn tool_owns_drag(&self) -> bool {
+        self.cropping
+    }
+
     fn step_photo(&mut self, ctx: &egui::Context, step: isize) {
         let Some(from) = self.queued_load.clone().or_else(|| self.current.clone()) else { return };
         let Some(dir) = from.parent() else { return };
@@ -1588,7 +1663,7 @@ impl App {
         ui: &egui::Ui,
         rect: egui::Rect,
         response: &egui::Response,
-        view: raw_editor::pipeline::View,
+        view: View,
         frame: [usize; 2],
     ) {
         if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1673,7 +1748,7 @@ impl App {
         ui: &egui::Ui,
         rect: egui::Rect,
         response: &egui::Response,
-        view: raw_editor::pipeline::View,
+        view: View,
         geom: Geometry,
         size: [usize; 2],
     ) {
@@ -1756,7 +1831,6 @@ impl App {
         let mut shown = self.params;
         if self.cropping {
             shown.crop = [0.0, 0.0, 1.0, 1.0];
-            self.zoom_100 = false;
         }
         let geom = Geometry::resolve(&shown, &colour, iw, ih);
         let (ow, oh) = (geom.width, geom.height);
@@ -1764,40 +1838,79 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let (vw, vh) = (rect.width() * ppp, rect.height() * ppp);
 
-        let view = if self.zoom_100 {
-            // One source pixel per screen pixel: the quad runs off the edges
-            // and the visible part is a crop the user pans around. Without
-            // this the detail filters are invisible, because a 4592px image
-            // shown in a ~1000px viewport throws away exactly the frequencies
-            // sharpening and noise reduction act on.
-            let scale = [ow as f32 / vw, oh as f32 / vh];
-            if response.dragged() {
-                let d = response.drag_delta();
-                self.pan[0] += 2.0 * d.x * ppp / vw;
-                self.pan[1] -= 2.0 * d.y * ppp / vh;
-            }
-            // Never drag the image completely off the viewport.
-            for i in 0..2 {
-                let slack = (scale[i] - 1.0).max(0.0);
-                self.pan[i] = self.pan[i].clamp(-slack, slack);
-            }
-            raw_editor::pipeline::View { scale, offset: self.pan, texel }
-        } else {
-            self.pan = [0.0, 0.0];
-            let img_aspect = ow as f32 / oh as f32;
-            let rect_aspect = rect.width() / rect.height();
-            let scale = if img_aspect > rect_aspect {
-                [1.0, rect_aspect / img_aspect]
-            } else {
-                [img_aspect / rect_aspect, 1.0]
+        let (out, viewport) = ([ow as f32, oh as f32], [vw, vh]);
+        // The pointer in NDC, when it is over the image area.
+        let cursor = response.hover_pos().map(|p| {
+            [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0]
+        });
+        // The crop box needs the whole frame and owns every drag, so crop
+        // mode is always "fit"; the zoom comes back when it ends.
+        let asked = self.zoom_cmd.take();
+        let mut zoom = if self.cropping { Zoom::Fit } else { self.zoom };
+        let mut pan = View::placed(out, viewport, zoom, self.pan, texel).offset;
+        if !self.cropping {
+            // Change the zoom, keeping the image point under `about` in place.
+            let zoom_to = |zoom: &mut Zoom, pan: &mut [f32; 2], to: Zoom, about: [f32; 2]| {
+                let by = to.factor(out, viewport) / zoom.factor(out, viewport);
+                *pan = if to == Zoom::Fit { [0.0, 0.0] } else { View::zoom_about(*pan, about, by) };
+                *zoom = to;
             };
-            raw_editor::pipeline::View::fit(scale, texel)
-        };
+            let centre = [0.0, 0.0];
+            let toggled = |z: Zoom| if z == Zoom::Fit { Zoom::Scale(1.0) } else { Zoom::Fit };
+            let asked = asked.map(|cmd| match cmd {
+                ZoomCmd::Fit => (Zoom::Fit, centre),
+                ZoomCmd::Fill => (Zoom::Fill, centre),
+                ZoomCmd::One => (Zoom::Scale(1.0), centre),
+                ZoomCmd::Toggle => (toggled(zoom), cursor.unwrap_or(centre)),
+                ZoomCmd::Step(dir) => (zoom.step(dir, out, viewport), centre),
+            });
+            if let Some((to, about)) = asked {
+                zoom_to(&mut zoom, &mut pan, to, about);
+            }
+            if let Some(cursor) = cursor {
+                // Wheel and pinch (egui turns Ctrl + wheel into a pinch too).
+                let (wheel, pinch) = ui.ctx().input(|i| (i.smooth_scroll_delta().y, i.zoom_delta()));
+                let by = (wheel * WHEEL_ZOOM).exp() * pinch;
+                if by != 1.0 {
+                    let to = zoom.zoomed(by, out, viewport);
+                    zoom_to(&mut zoom, &mut pan, to, cursor);
+                }
+                // The eyedropper clicks, so a double-click is not a zoom then.
+                if response.double_clicked() && !self.picking_wb {
+                    let to = toggled(zoom);
+                    zoom_to(&mut zoom, &mut pan, to, cursor);
+                }
+            }
+            // Drag pans. The middle button and Space + drag are for when a
+            // tool on the image takes plain drags for itself.
+            let panning = response.dragged_by(egui::PointerButton::Middle)
+                || (response.dragged_by(egui::PointerButton::Primary)
+                    && (!self.tool_owns_drag() || ui.ctx().input(|i| i.key_down(PAN_KEY))));
+            if panning {
+                let d = response.drag_delta();
+                pan[0] += 2.0 * d.x * ppp / vw;
+                pan[1] -= 2.0 * d.y * ppp / vh;
+            }
+            self.zoom = zoom;
+        }
+        // Without a view past "fit" the detail filters are invisible: a
+        // 4592px image in a ~1000px viewport throws away exactly the
+        // frequencies sharpening and noise reduction act on.
+        let view = View::placed(out, viewport, zoom, pan, texel);
+        if !self.cropping {
+            self.pan = view.offset;
+            let pannable = view.scale[0] > 1.0 || view.scale[1] > 1.0;
+            if pannable && response.hovered() && !self.picking_wb {
+                let held = response.is_pointer_button_down_on();
+                ui.ctx().set_cursor_icon(if held { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            }
+        }
+        self.zoom_percent = zoom.factor(out, viewport) * 100.0;
 
         // Hold-to-compare: feed the shader neutral params instead of bypassing
         // it, so the two views differ only by the adjustments themselves.
         // The geometry stays, so before and after line up.
-        let comparing = shortcut(ui.ctx(), COMPARE_KEY, true);
+        let comparing = self.show_before || shortcut(ui.ctx(), COMPARE_KEY, true);
         let mut uniforms = if comparing {
             // How the photo opened (its starting look), in the current framing.
             let before = AdjustParams { rotation: shown.rotation, straighten: shown.straighten, crop: shown.crop, ..self.baseline };
@@ -1891,7 +2004,6 @@ impl eframe::App for App {
             self.auto_exposure();
         }
 
-        // Z flips between fit and 1:1.
         if shortcut(ui.ctx(), PICK_WB_KEY, false) && self.image.is_some() {
             self.picking_wb = !self.picking_wb;
         }
@@ -1899,7 +2011,20 @@ impl eframe::App for App {
             self.show_clip = !self.show_clip;
         }
         if shortcut(ui.ctx(), ZOOM_KEY, false) {
-            self.zoom_100 = !self.zoom_100;
+            self.zoom_cmd = Some(ZoomCmd::Toggle);
+        }
+        if shortcut(ui.ctx(), BEFORE_AFTER_KEY, false) {
+            self.show_before = !self.show_before;
+        }
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let cmd = ui.ctx().input_mut(|i| {
+                [(ZOOM_FIT, ZoomCmd::Fit), (ZOOM_ONE, ZoomCmd::One), (ZOOM_IN, ZoomCmd::Step(1)), (ZOOM_OUT, ZoomCmd::Step(-1))]
+                    .into_iter()
+                    .find_map(|(keys, cmd)| i.consume_shortcut(&keys).then_some(cmd))
+            });
+            if cmd.is_some() {
+                self.zoom_cmd = cmd;
+            }
         }
 
         // Load a dropped file (last one wins).
@@ -1919,7 +2044,18 @@ impl eframe::App for App {
             self.menu_bar(ui);
         });
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(&self.status);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.image.is_some() {
+                        let fit = if self.zoom == Zoom::Fit { " (fit)" } else { "" };
+                        ui.label(format!("{:.0}%{fit}", self.zoom_percent));
+                        ui.separator();
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(&self.status).truncate());
+                    });
+                });
+            });
         });
         egui::Panel::right("controls").min_size(320.0).show(ui, |ui| {
             self.side_panel(ui);

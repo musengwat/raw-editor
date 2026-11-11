@@ -567,6 +567,86 @@ impl View {
     pub fn one_to_one(texel: [f32; 2]) -> Self {
         Self::fit([1.0, 1.0], texel)
     }
+
+    /// The view for an `out` (pixels) image in a `viewport` (physical
+    /// pixels) at `zoom`, panned by `pan` (NDC). The pan is clamped so the
+    /// image never leaves the viewport, and an axis on which the image is
+    /// smaller than the viewport stays centred — read the pan actually used
+    /// back from `offset`.
+    pub fn placed(out: [f32; 2], viewport: [f32; 2], zoom: Zoom, pan: [f32; 2], texel: [f32; 2]) -> Self {
+        let z = zoom.factor(out, viewport);
+        let scale = [out[0] * z / viewport[0], out[1] * z / viewport[1]];
+        let offset = std::array::from_fn(|i| {
+            let slack = (scale[i] - 1.0).max(0.0);
+            pan[i].clamp(-slack, slack)
+        });
+        Self { scale, offset, texel }
+    }
+
+    /// The pan that keeps the image point under `cursor` (NDC) where it is
+    /// while the zoom changes by `factor`. The quad maps a corner `c` to
+    /// `c·scale + offset`; scaling `scale` by `factor` moves the point under
+    /// the cursor unless the offset moves the other way.
+    pub fn zoom_about(offset: [f32; 2], cursor: [f32; 2], factor: f32) -> [f32; 2] {
+        std::array::from_fn(|i| cursor[i] - (cursor[i] - offset[i]) * factor)
+    }
+}
+
+/// How large the image is drawn. `Scale` is screen pixels per image pixel
+/// (1.0 = 100%).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zoom {
+    /// The whole image, as large as fits.
+    Fit,
+    /// The viewport filled edge to edge; the long side runs off.
+    Fill,
+    Scale(f32),
+}
+
+impl Zoom {
+    /// The closest view on offer: 800%.
+    pub const MAX: f32 = 8.0;
+    /// The stops `step` moves through (Ctrl + / Ctrl −).
+    pub const STEPS: [f32; 11] = [0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
+
+    /// Screen pixels per image pixel at which the whole image just fits.
+    pub fn fit_factor(out: [f32; 2], viewport: [f32; 2]) -> f32 {
+        (viewport[0] / out[0]).min(viewport[1] / out[1])
+    }
+
+    /// Screen pixels per image pixel.
+    pub fn factor(self, out: [f32; 2], viewport: [f32; 2]) -> f32 {
+        match self {
+            Zoom::Fit => Self::fit_factor(out, viewport),
+            Zoom::Fill => (viewport[0] / out[0]).max(viewport[1] / out[1]),
+            Zoom::Scale(z) => z,
+        }
+    }
+
+    /// Zoom in (`by` > 1) or out by a factor. Zooming out stops at "fit" —
+    /// and becomes `Fit`, so the image then follows the window size — or at
+    /// 100% for an image so small that fitting it would enlarge it.
+    pub fn zoomed(self, by: f32, out: [f32; 2], viewport: [f32; 2]) -> Zoom {
+        let fit = Self::fit_factor(out, viewport);
+        let floor = fit.min(1.0);
+        let z = (self.factor(out, viewport) * by).min(Self::MAX);
+        if by < 1.0 && fit <= 1.0 && z <= fit * 1.0001 {
+            Zoom::Fit
+        } else {
+            Zoom::Scale(z.max(floor))
+        }
+    }
+
+    /// The next stop up (`dir` > 0) or down from the current zoom.
+    pub fn step(self, dir: i32, out: [f32; 2], viewport: [f32; 2]) -> Zoom {
+        let z = self.factor(out, viewport);
+        let target = if dir > 0 {
+            Self::STEPS.iter().copied().find(|&s| s > z * 1.001).unwrap_or(Self::MAX)
+        } else {
+            Self::STEPS.iter().rev().copied().find(|&s| s < z * 0.999).unwrap_or(0.0)
+        };
+        self.zoomed(target / z, out, viewport)
+    }
 }
 
 /// The geometry for a render, with the source size recovered from the texel.
@@ -1294,6 +1374,66 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"sensor_rgb\""), "{json}");
         assert_eq!(serde_json::from_str::<AdjustParams>(&json).unwrap(), p);
+    }
+
+    const OUT: [f32; 2] = [4000.0, 3000.0];
+    const VIEWPORT: [f32; 2] = [1000.0, 1000.0];
+
+    #[test]
+    fn fit_and_fill_follow_the_viewport() {
+        assert_eq!(Zoom::Fit.factor(OUT, VIEWPORT), 0.25);
+        assert_eq!(Zoom::Fill.factor(OUT, VIEWPORT), 1.0 / 3.0);
+        let v = View::placed(OUT, VIEWPORT, Zoom::Fit, [0.4, -0.4], [0.0; 2]);
+        assert_eq!(v.scale, [1.0, 0.75]);
+        assert_eq!(v.offset, [0.0, 0.0], "nothing to pan at fit");
+    }
+
+    #[test]
+    fn pan_is_clamped_to_keep_the_image_in_view() {
+        let v = View::placed(OUT, VIEWPORT, Zoom::Scale(1.0), [9.0, -0.5], [0.0; 2]);
+        assert_eq!(v.scale, [4.0, 3.0]);
+        assert_eq!(v.offset, [3.0, -0.5]);
+        // Fill: one axis has slack, the other is exactly the viewport.
+        let v = View::placed(OUT, VIEWPORT, Zoom::Fill, [9.0, 9.0], [0.0; 2]);
+        assert!((v.offset[0] - 1.0 / 3.0).abs() < 1e-6 && v.offset[1] == 0.0, "{:?}", v.offset);
+    }
+
+    #[test]
+    fn zooming_about_the_cursor_keeps_that_pixel_under_it() {
+        let size = [4000usize, 3000];
+        let before = View::placed(OUT, VIEWPORT, Zoom::Scale(0.5), [0.3, -0.2], [0.0; 2]);
+        let cursor = [0.4, 0.25];
+        let px = before.image_pixel(cursor, size).unwrap();
+        for by in [1.25f32, 2.0, 0.8] {
+            let zoom = Zoom::Scale(0.5).zoomed(by, OUT, VIEWPORT);
+            let pan = View::zoom_about(before.offset, cursor, zoom.factor(OUT, VIEWPORT) / 0.5);
+            let after = View::placed(OUT, VIEWPORT, zoom, pan, [0.0; 2]);
+            let now = after.image_pixel(cursor, size).unwrap();
+            assert!(px[0].abs_diff(now[0]) <= 1 && px[1].abs_diff(now[1]) <= 1, "{by}: {px:?} -> {now:?}");
+        }
+    }
+
+    #[test]
+    fn zooming_out_ends_at_fit_and_in_at_the_maximum() {
+        assert_eq!(Zoom::Scale(0.3).zoomed(0.5, OUT, VIEWPORT), Zoom::Fit);
+        assert_eq!(Zoom::Fit.zoomed(0.5, OUT, VIEWPORT), Zoom::Fit);
+        assert_eq!(Zoom::Scale(6.0).zoomed(4.0, OUT, VIEWPORT), Zoom::Scale(Zoom::MAX));
+        // An image smaller than the viewport: "fit" enlarges it, so zooming
+        // out goes on down to 100% and stays a plain scale.
+        let small = [400.0, 300.0];
+        assert_eq!(Zoom::Fit.factor(small, VIEWPORT), 2.5);
+        assert_eq!(Zoom::Fit.zoomed(0.1, small, VIEWPORT), Zoom::Scale(1.0));
+    }
+
+    #[test]
+    fn steps_walk_the_stops_from_wherever_the_zoom_is() {
+        // Fit is 25% here, which is itself a stop.
+        assert_eq!(Zoom::Fit.step(1, OUT, VIEWPORT), Zoom::Scale(1.0 / 3.0));
+        assert_eq!(Zoom::Scale(0.9).step(1, OUT, VIEWPORT), Zoom::Scale(1.0));
+        let Zoom::Scale(z) = Zoom::Scale(1.2).step(-1, OUT, VIEWPORT) else { panic!() };
+        assert!((z - 1.0).abs() < 1e-6);
+        assert_eq!(Zoom::Scale(0.3).step(-1, OUT, VIEWPORT), Zoom::Fit);
+        assert_eq!(Zoom::Scale(8.0).step(1, OUT, VIEWPORT), Zoom::Scale(8.0));
     }
 
     #[test]

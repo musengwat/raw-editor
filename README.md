@@ -121,6 +121,16 @@ Everyday use:
   Dramatic); File → *Merge all brackets in folder…*; `hdr` CLI. Sets are
   found automatically, frames aligned (shift + rotation), ghosts removed,
   merged and tone mapped into `<first frame>_hdr.tif`, which opens like a raw
+- [x] Z1 — free zoom and pan: scroll wheel / pinch zooms about the pointer
+  (fit … 800%), drag pans, double-click or **Z** flips fit ↔ 100%, Ctrl+0 /
+  Ctrl+1 / Ctrl+= / Ctrl+−, *Fill window*, zoom shown in the status bar and
+  kept from photo to photo; **\\** latches the before view
+- [ ] M1 — linear and radial gradient masks with local adjustments
+- [ ] M2 — luminance and colour range on masks
+- [ ] T1 — point tone curve (RGB + per channel)
+- [ ] T2 — vignette, grain, vibrance
+- [ ] T3 — texture and clarity
+- [ ] T4 — shadows / midtones / highlights colour grading
 
 Algorithms and coefficients for phases 5 and 6, including the transposed-filter
 trap in the MHC paper's figure, are worked out in
@@ -133,6 +143,20 @@ the next or previous photo in the same folder — raws and TIFFs, alphabetical,
 skipping this editor's own `_edit.tif` exports. Press them as fast as you
 like: one photo decodes at a time and only the latest request is kept. Edits
 save automatically. *File → Open recent* lists the last 10 photos.
+
+**Zoom and pan**: the scroll wheel (or a pinch) zooms about the pointer, from
+fit-to-window up to 800%; drag the photo to pan. Double-click a spot — or
+press **Z** with the pointer over it — to jump between fit and 100% there.
+**Ctrl+0** fits, **Ctrl+1** is 100%, **Ctrl+=** / **Ctrl+−** step through
+25 / 33 / 50 / 67 / 100 / 150 / 200 / 300 / 400 / 600 / 800%, and *View → Fill
+window* fills the area edge to edge. The status bar shows the zoom. Zoom and
+position carry over to the next photo, so stepping through a burst at 100%
+compares the same spot. Crop mode always shows the whole frame; the zoom
+returns when it ends. The middle button, or **Space** + drag, pans even when
+a tool on the photo takes drags for itself.
+
+**Before / after**: hold **B** to see the photo as it opened; **\\** (or *View →
+Show before*) keeps that view on until pressed again.
 
 **Copy / paste edits**: **Ctrl+C** copies the photo's edits (also *Edit →
 Copy edits*), **Ctrl+V** pastes them onto another photo — everything except
@@ -302,9 +326,9 @@ picking one source pixel per screen pixel.
 
 These act on *source* pixels, so they are invisible in a fit-to-window view of a
 16MP image — that view has already thrown away the frequencies they work on.
-Press **Z** (or use the *View* menu) for a 1:1 view and drag to pan; that is the
-only honest way to judge them, and it is why the zoom exists at all. Export is
-always full resolution, so what 1:1 shows is what you get.
+Press **Z** (or double-click, or **Ctrl+1**) for a 100% view and drag to pan;
+that is the only honest way to judge them. Export is always full resolution,
+so what 100% shows is what you get.
 
 **Menu**: *File → Open…* picks a raw through the native file dialog.
 *File → Export as JPEG… / 16-bit TIFF…* and the panel's export button both ask

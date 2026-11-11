@@ -529,6 +529,31 @@ it adds nothing to the shader or `AdjustParams`, so no parity tests apply.
   scratch dir) and side-by-side sheets vs the reference frame's own export,
   plus 100% corner crops for alignment.
 
+## Zoom and pan (Z1)
+
+`pipeline::Zoom` (`Fit` / `Fill` / `Scale(screen px per image px)`) and
+`View::placed(out, viewport, zoom, pan, texel)` are the whole model; the pan
+is NDC and `placed` clamps it, so read it back from `view.offset`.
+`View::zoom_about` keeps the pixel under the pointer in place. All of it is
+pure and tested in `pipeline::tests`; `image_panel` is the only caller that
+knows the viewport, so keys and the View menu just set `App.zoom_cmd`
+(`ZoomCmd`) and `image_panel` carries it out.
+
+- Zooming out snaps to `Zoom::Fit` (so the photo follows the window again);
+  an image smaller than the viewport instead stops at 100%.
+- `ctx.options_mut(|o| o.zoom_with_keyboard = false)` at startup: egui
+  otherwise takes Ctrl + / − / 0 to scale the whole interface.
+- Crop mode forces `Fit` for the frame without touching `App.zoom`.
+  `App::tool_owns_drag` says when a tool takes plain drags (crop today,
+  mask handles next); Space + drag and the middle button always pan.
+- Wheel speed is `WHEEL_ZOOM` per point of `smooth_scroll_delta`; one notch
+  is ~80 points on this box's X server (17% per notch).
+- Before/after: `App.show_before` (the `\` key) latches what holding B
+  shows; it is cleared on every load.
+- GUI check recipe: XTest buttons 4/5 are the wheel. A synthetic
+  double-click needs the two clicks <0.3 s apart — sleeping 0.15 s after
+  every event misses egui's double-click window and looks like a bug.
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release
