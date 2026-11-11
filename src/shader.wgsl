@@ -31,6 +31,9 @@ struct Uniforms {
     masks: array<MaskU, 8>,
     curve_info: vec4<f32>, // points in the rgb, r, g, b point curves (0 = off)
     curves: array<vec4<f32>, 32>, // [x, y, tangent, _], eight per curve
+    vig0: vec4<f32>,       // vignette: ev, start, end, power (all zero = off)
+    vig1: vec4<f32>,       // vignette: kx, ky, norm
+    effects: vec4<f32>,    // grain amount, grain size, vibrance
     scale: vec2<f32>,      // NDC half-extent of the drawn quad
     offset: vec2<f32>,     // NDC translation, for panning when zoomed
     texel: vec2<f32>,      // 1 / source texture size
@@ -393,6 +396,49 @@ fn locals(uv: vec2<f32>, c: vec3<f32>) -> Locals {
     return l;
 }
 
+// --- Vignette and grain — mirrors src/effects.rs --------------------------
+
+const GRAIN_MAX: f32 = 0.14;
+
+// Exposure change at an output uv. Mirrors `Vignette::ev_at`.
+fn vignette_ev(uv: vec2<f32>) -> f32 {
+    let q = abs((uv - vec2(0.5)) * 2.0 * u.vig1.xy);
+    let dist = pow(pow(q.x, u.vig0.w) + pow(q.y, u.vig0.w), 1.0 / u.vig0.w) * u.vig1.z;
+    return u.vig0.x * smoothstep(u.vig0.y, u.vig0.z, dist);
+}
+
+// Mirrors `effects::hash`: integer arithmetic, so the same bits as the CPU.
+fn grain_hash(x: i32, y: i32) -> f32 {
+    var h = (u32(x) * 0x9E3779B1u) ^ (u32(y) * 0x85EBCA77u);
+    h ^= h >> 15u;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12u;
+    h *= 0x297A2D39u;
+    h ^= h >> 15u;
+    return f32(h >> 8u) / 8388608.0 - 1.0;
+}
+
+// Mirrors `effects::grain_noise`. `px` is in source pixels.
+fn grain_noise(px: vec2<f32>) -> f32 {
+    let p = (px - vec2(0.5)) / u.effects.y;
+    let i = floor(p);
+    let f = p - i;
+    let x = i32(i.x);
+    let y = i32(i.y);
+    let top = mix(grain_hash(x, y), grain_hash(x + 1, y), f.x);
+    let bottom = mix(grain_hash(x, y + 1), grain_hash(x + 1, y + 1), f.x);
+    return mix(top, bottom, f.y);
+}
+
+// Mirrors `effects::grain`. `strength` is the amount, less whatever the
+// view's scale averages away.
+fn grain(c: vec3<f32>, n: f32, strength: f32) -> vec3<f32> {
+    let e = srgb_encode(clamp(c, vec3(0.0), vec3(1.0)));
+    let y = dot(e, LUMA_709);
+    let d = n * strength * GRAIN_MAX * (0.4 + 2.4 * y * (1.0 - y));
+    return srgb_decode(clamp(e + vec3(d), vec3(0.0), vec3(1.0))) + max(c - vec3(1.0), vec3(0.0));
+}
+
 // --- Per-colour adjustments — mirrors src/pipeline.rs::hsl_adjust ---------
 
 // Band centres in degrees; must match pipeline::HSL_BANDS.
@@ -449,12 +495,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Sampled before the outside test: textureSample needs uniform control flow.
     var c = to_working(textureSample(tex, samp, src), src);
     let outside = any(src < vec2(0.0)) || any(src > vec2(1.0));
+    // Source pixels per screen pixel (1 at 100% and in exports). Derivatives
+    // need uniform control flow too, so this is taken here, unconditionally.
+    let footprint = max(length(dpdx(src) / u.texel), length(dpdy(src) / u.texel));
 
     // 0. Detail work happens on the linear source, before tone and colour.
     //    Skipped entirely when the controls are neutral, which is the norm.
     //    Masks first: they decide the slider values this pixel gets.
     let before_detail = c;
-    let l = locals(src, c);
+    var l = locals(src, c);
+    if u.vig0.x != 0.0 {
+        l.exposure_ev += vignette_ev(in.uv);
+    }
     if l.nr_luma > 0.0 || u.nr_chroma > 0.0 || l.sharpen_amount > 0.0 {
         c = detail(src, c, l.sharpen_amount, l.nr_luma);
     }
@@ -495,11 +547,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // 5. Luma-preserving saturation.
     let luma = dot(c, LUMA_709);
-    c = luma + (c - luma) * (1.0 + l.saturation);
+    var sat = 1.0 + l.saturation;
+    if u.effects.z != 0.0 {
+        let mx = max(c.r, max(c.g, c.b));
+        let mn = min(c.r, min(c.g, c.b));
+        let have = clamp((mx - mn) / max(mx, 1e-6), 0.0, 1.0);
+        sat = max(sat + u.effects.z * (1.0 - have), 0.0);
+    }
+    c = luma + (c - luma) * sat;
 
     // 6. Per-colour hue / saturation / luminance.
     if u.hsl[0].w > 0.5 {
         c = hsl_adjust(c);
+    }
+
+    // 7. Grain, on the source pixel grid. Zoomed out, each screen pixel is
+    //    the average of many grains, so the strength drops with the view's
+    //    scale — as it would if the export were shown at that size.
+    if u.effects.x > 0.0 {
+        let strength = u.effects.x * min(1.0, u.effects.y / max(footprint, 1e-6));
+        c = grain(c, grain_noise(src / u.texel), strength);
     }
 
     // Clipping overlay — mirrored in src/pipeline.rs::clip_view.

@@ -1406,6 +1406,10 @@ impl App {
             resettable(ui, &mut p.contrast, d.contrast, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Contrast")));
             resettable(ui, &mut p.temp, d.temp, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Temp")));
             resettable(ui, &mut p.tint, d.tint, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Tint")));
+            resettable(ui, &mut p.vibrance, d.vibrance, |ui, v| {
+                ui.add(egui::Slider::new(v, -1.0..=1.0).text("Vibrance"))
+                    .on_hover_text("Saturation for the muted colours; ones that are vivid already (and skin) hardly move")
+            });
             resettable(ui, &mut p.saturation, d.saturation, |ui, v| ui.add(egui::Slider::new(v, -1.0..=1.0).text("Saturation")));
 
             ui.add_space(10.0);
@@ -1632,6 +1636,30 @@ impl App {
                     .weak()
                     .small(),
             );
+
+            ui.add_space(10.0);
+            header(ui, "Effects", Section::Effects, p);
+            resettable(ui, &mut p.vignette_amount, d.vignette_amount, |ui, v| {
+                ui.add(egui::Slider::new(v, -1.0..=1.0).text("Vignette")).on_hover_text("Left darkens the corners, right brightens them. Follows the crop")
+            });
+            ui.add_enabled_ui(p.vignette_amount != 0.0, |ui| {
+                resettable(ui, &mut p.vignette_midpoint, d.vignette_midpoint, |ui, v| {
+                    ui.add(egui::Slider::new(v, 0.0..=1.0).text("Midpoint")).on_hover_text("How far in from the corners it reaches")
+                });
+                resettable(ui, &mut p.vignette_feather, d.vignette_feather, |ui, v| {
+                    ui.add(egui::Slider::new(v, 0.0..=1.0).text("Feather")).on_hover_text("How soft its edge is")
+                });
+                resettable(ui, &mut p.vignette_roundness, d.vignette_roundness, |ui, v| {
+                    ui.add(egui::Slider::new(v, -1.0..=1.0).text("Roundness")).on_hover_text("Left follows the frame's rectangle, right is a circle")
+                });
+            });
+            resettable(ui, &mut p.grain_amount, d.grain_amount, |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0).text("Grain")));
+            ui.add_enabled_ui(p.grain_amount > 0.0, |ui| {
+                resettable(ui, &mut p.grain_size, d.grain_size, |ui, v| {
+                    ui.add(egui::Slider::new(v, 1.0..=8.0).fixed_decimals(1).text("Grain size")).on_hover_text("In pixels of the photo")
+                });
+            });
+            ui.label(egui::RichText::new("Judge grain at 100% — zoomed out it averages away, as it does in a small print").weak().small());
 
             ui.add_space(10.0);
             header(ui, "Optics", Section::Optics, p);

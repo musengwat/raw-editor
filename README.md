@@ -134,7 +134,8 @@ Everyday use:
   own is a mask over the whole frame ("only the blues", "only the shadows")
 - [x] T1 — **point curve**: a draggable tone curve for all channels and one
   each for red, green and blue, with the histogram behind it
-- [ ] T2 — vignette, grain, vibrance
+- [x] T2 — **vignette** (follows the crop; amount, midpoint, feather,
+  roundness), **film grain** (amount, size) and **vibrance**
 - [ ] T3 — texture and clarity
 - [ ] T4 — shadows / midtones / highlights colour grading
 
@@ -171,6 +172,15 @@ casts by tone — lift the blue curve's left end and the shadows turn blue. A
 dot marks the channels that have been changed; ↺ resets the one showing. The
 curve passes through every point and never overshoots between two of them.
 It comes after the look's own *Tone curve* slider and the tonal ranges.
+
+**Effects**: *Vignette* darkens (left) or brightens (right) the corners of
+the frame *as cropped*; *Midpoint* is how far in it reaches, *Feather* how
+soft its edge is, *Roundness* goes from the frame's own rectangle to a
+circle. It works as exposure, so darkened corners keep their colour and
+brightened ones roll off instead of clipping. *Grain* adds film-like
+luminance noise, *Grain size* in pixels of the photo — judge it at 100%;
+zoomed out it averages away, exactly as it will in a small print. *Vibrance*
+(under Basic) is saturation for the muted colours only.
 
 **Masks** limit a set of adjustments to part of the photo. Under *Masks*,
 *+ Add mask* gives a **linear gradient** (full effect on one side of a line,

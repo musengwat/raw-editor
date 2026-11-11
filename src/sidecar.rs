@@ -175,6 +175,13 @@ mod tests {
             rotation: 3,
             straighten: -1.5,
             crop: [0.05, 0.1, 0.95, 0.85],
+            vibrance: -0.25,
+            vignette_amount: -0.45,
+            vignette_midpoint: 0.35,
+            vignette_feather: 0.8,
+            vignette_roundness: -0.5,
+            grain_amount: 0.4,
+            grain_size: 2.5,
             curves: crate::curve::Curves {
                 rgb: crate::curve::Curve::from_points(&[[0.0, 0.03], [0.3, 0.25], [0.7, 0.8], [1.0, 0.97]]),
                 b: crate::curve::Curve::from_points(&[[0.0, 0.1], [1.0, 0.9]]),

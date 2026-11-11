@@ -16,7 +16,7 @@
 //! damped — an overexposed frame needs all of it.
 
 use crate::develop::DevelopedImage;
-use crate::pipeline::{AdjustParams, apply_at};
+use crate::pipeline::{AdjustParams, Frame, apply_local};
 
 /// Median output brightness to aim for (sRGB-encoded; ~mid grey).
 pub const TARGET_MEDIAN: f32 = 0.45;
@@ -38,10 +38,10 @@ fn encode(v: f32) -> f32 {
 
 struct Sample {
     rgb: [f32; 3],
-    /// Where in the source it is, and the source's width / height, for
-    /// the masks.
+    /// Where it is, for the masks and the vignette: source uv, output uv.
     uv: [f32; 2],
-    aspect: f32,
+    out_uv: [f32; 2],
+    frame: Frame,
     /// Clipped at the sensor already: going white is not Auto's doing.
     clipped: bool,
 }
@@ -52,12 +52,16 @@ fn samples(preview: &DevelopedImage, p: &AdjustParams) -> Vec<Sample> {
     let (w, h) = (preview.width, preview.height);
     let n = w * h;
     let step = (n / SAMPLES).max(1);
+    // Geometry and vignette do not depend on the exposure being searched.
+    let frame = Frame::new(p, &preview.colour, w, h);
+    let uv = |i: usize| [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
     (0..n)
         .step_by(step)
         .map(|i| Sample {
             rgb: [work[i * 3], work[i * 3 + 1], work[i * 3 + 2]],
-            uv: [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32],
-            aspect: w as f32 / h as f32,
+            uv: uv(i),
+            out_uv: frame.geom.output_uv(uv(i)),
+            frame,
             clipped: preview.clip_at(i) > 0.0,
         })
         .collect()
@@ -67,7 +71,7 @@ fn median_and_new_clip(s: &[Sample], q: &AdjustParams) -> (f32, f32) {
     let mut lum = Vec::with_capacity(s.len());
     let (mut fresh, mut blown) = (0usize, 0usize);
     for px in s {
-        let o = apply_at(q, px.uv, px.aspect, px.rgb);
+        let o = apply_local(q, &px.frame.locals(q, px.uv, px.out_uv, px.rgb), px.rgb);
         lum.push(encode(0.2126 * o[0] + 0.7152 * o[1] + 0.0722 * o[2]));
         if !px.clipped {
             fresh += 1;

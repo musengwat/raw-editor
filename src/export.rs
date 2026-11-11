@@ -22,7 +22,7 @@ use crate::develop::DevelopedImage;
 use crate::gpu::ImageRenderer;
 use crate::detail;
 use crate::metadata::ExportMetadata;
-use crate::pipeline::{AdjustParams, Geometry, Locals, Uniforms, View, apply_local, srgb_encode};
+use crate::pipeline::{AdjustParams, Frame, Geometry, Locals, Uniforms, View, apply_local, srgb_encode};
 
 /// wgpu requires texture→buffer copy rows to be a multiple of this.
 const COPY_ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -76,15 +76,20 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
     // Masks are placed in source uv, so every pixel needs to know where in
     // the source it came from. Without masks that lookup is skipped.
     let masked = crate::masks::count(&params.masks) > 0;
-    let aspect = img.width as f32 / img.height as f32;
+    let frame = Frame::new(params, &img.colour, img.width, img.height);
+    let placed = masked || frame.vignette.is_some();
     let global = Locals::of(params);
     // `rgb` is the pixel before the detail stage: what the ranges are judged on.
-    let locals =
-        |uv: [f32; 2], rgb: [f32; 3]| if masked { crate::masks::locals(params, uv, aspect, rgb) } else { global };
+    let locals = |src: [f32; 2], out: [f32; 2], rgb: [f32; 3]| {
+        if placed { frame.locals(params, src, out, rgb) } else { global }
+    };
+    // Grain is tied to the source pixel grid.
+    let (sw, sh) = (img.width as f32, img.height as f32);
+    let finish = |c: [f32; 3], src: [f32; 2]| crate::effects::apply_grain(params, c, [src[0] * sw, src[1] * sh]);
     if geom.is_identity(img.width, img.height) {
         data.par_chunks_mut(3).zip(detailed.par_chunks(3)).zip(working.par_chunks(3)).enumerate().for_each(|(i, ((dst, src), raw))| {
             let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-            let c = apply_local(params, &locals(uv, [raw[0], raw[1], raw[2]]), [src[0], src[1], src[2]]);
+            let c = finish(apply_local(params, &locals(uv, uv, [raw[0], raw[1], raw[2]]), [src[0], src[1], src[2]]), uv);
             for i in 0..3 {
                 dst[i] = to_u16(srgb_encode(c[i]));
             }
@@ -101,7 +106,7 @@ pub fn render_cpu(img: &DevelopedImage, params: &AdjustParams) -> Rendered {
                 return; // black, as the shader draws it
             }
             let raw = if masked { bilinear(&working, img.width, img.height, s) } else { [0.0; 3] };
-            let c = apply_local(params, &locals(s, raw), bilinear(&detailed, img.width, img.height, s));
+            let c = finish(apply_local(params, &locals(s, uv, raw), bilinear(&detailed, img.width, img.height, s)), s);
             for k in 0..3 {
                 dst[k] = to_u16(srgb_encode(c[k]));
             }

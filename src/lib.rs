@@ -4,6 +4,7 @@ pub mod config;
 pub mod curve;
 pub mod detail;
 pub mod develop;
+pub mod effects;
 pub mod export;
 pub mod flatfield;
 pub mod formats;

@@ -669,6 +669,8 @@ pub fn thumbnail(src: &crate::develop::DevelopedImage, p: &AdjustParams, look: &
     q.nr_luma = 0.0;
     q.nr_chroma = 0.0;
     q.sharpen_amount = 0.0;
+    // Grain is sized in source pixels; on a thumbnail it would be boulders.
+    q.grain_amount = 0.0;
     let r = crate::export::render_cpu(src, &q);
     let rgba = r.data.chunks(3).flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8, 255]).collect();
     ([r.width, r.height], rgba)

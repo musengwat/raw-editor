@@ -669,6 +669,29 @@ shader — after the filmic `tone_curve`, before lift/gamma/gain.
 - Tests: `curve::tests`, `parity_point_curves` (four curve sets × three
   sources, including the non-monotone eight-point one).
 
+## Vignette, grain, vibrance (T2)
+
+`src/effects.rs` (vignette, grain) and step 5 of `apply_local` (vibrance).
+
+- **Vignette = exposure by position**, in *output* uv. `Vignette::resolve`
+  turns the four sliders into the numbers both sides use (`vig0`, `vig1`);
+  `pipeline::Frame` (source aspect + `Geometry` + vignette) is built once
+  per render and `Frame::locals(p, src_uv, out_uv, rgb)` = masks + vignette.
+  `apply_at(p, &frame, uv, rgb)` is the positioned chain for histogram and
+  Auto. The shader adds `vignette_ev(in.uv)` to `l.exposure_ev`.
+- **Grain** is the last step (after HSL, before the overlays), added in
+  sRGB-encoded space, luminance only. The noise is an integer hash of the
+  *source* pixel grid (`effects::hash` / `grain_hash` — identical bits on
+  both sides), bilinearly blended between grid points `grain_size` apart.
+  The shader scales its strength by `min(1, size / footprint)`, with
+  `footprint` = source pixels per screen pixel from `dpdx/dpdy(src)` taken
+  at the top of `fs_main` (derivatives need uniform control flow); exports
+  and parity tests are 1:1, where it is 1. `grain_fades_in_a_downscaled_view`
+  guards it. Histogram and Auto ignore grain; look thumbnails switch it off.
+- **Vibrance**: `sat_factor += vibrance · (1 − HSV saturation)`, floored at
+  0; skipped when 0 so old renders are bit-identical.
+- Uniforms are 2016 bytes. New `Section::Effects`.
+
 ## Releases
 
 Every push to `master` publishes a `build-YYYYMMDD-<sha7>` GitHub Release

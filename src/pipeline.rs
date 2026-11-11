@@ -102,6 +102,10 @@ pub struct AdjustParams {
     pub tint: f32,
     /// -1..1, luma-preserving saturation.
     pub saturation: f32,
+    /// -1..1, saturation for the colours that have least of it: muted
+    /// colours move the most, already vivid ones (and so skin, mostly)
+    /// hardly at all.
+    pub vibrance: f32,
     /// 0..1, how much of the filmic tone curve ([`filmic`]) applies: 0 =
     /// linear (the original rendering), 1 = camera-like mid-tones and a
     /// highlight shoulder. The everyday looks set it.
@@ -150,6 +154,21 @@ pub struct AdjustParams {
     /// Apply the flat field saved for this photo's lens, if there is one.
     pub flat_field: bool,
 
+    /// Vignette (see [`crate::effects`]): -1 darkens the corners by
+    /// `VIGNETTE_MAX_EV` stops, +1 brightens them. 0 = off.
+    pub vignette_amount: f32,
+    /// 0..1: how far from the centre the vignette is half way in.
+    pub vignette_midpoint: f32,
+    /// 0..1: 0 is a hard edge, 1 fades all the way from centre to corner.
+    pub vignette_feather: f32,
+    /// -1..1: -1 follows the frame's rectangle, 0 is an ellipse that fits
+    /// the frame, +1 a circle.
+    pub vignette_roundness: f32,
+    /// Film grain, 0..1. 0 = off.
+    pub grain_amount: f32,
+    /// Grain size in source pixels (1 = one grain per pixel).
+    pub grain_size: f32,
+
     /// Extra clockwise quarter turns on top of the camera's orientation.
     pub rotation: u8,
     /// Fine rotation in degrees, clockwise, about the frame centre.
@@ -186,6 +205,7 @@ impl Default for AdjustParams {
             temp: 0.0,
             tint: 0.0,
             saturation: 0.0,
+            vibrance: 0.0,
             tone_curve: 0.0,
             curves: Curves::default(),
             highlights: 0.0,
@@ -205,6 +225,12 @@ impl Default for AdjustParams {
             hotspot_centre: [0.5, 0.5],
             hotspot_balance: [1.0; 3],
             flat_field: false,
+            vignette_amount: 0.0,
+            vignette_midpoint: 0.5,
+            vignette_feather: 0.5,
+            vignette_roundness: 0.0,
+            grain_amount: 0.0,
+            grain_size: 1.5,
             rotation: 0,
             straighten: 0.0,
             crop: [0.0, 0.0, 1.0, 1.0],
@@ -285,6 +311,7 @@ impl AdjustParams {
                 self.temp = d.temp;
                 self.tint = d.tint;
                 self.saturation = d.saturation;
+                self.vibrance = d.vibrance;
                 self.tone_curve = d.tone_curve;
             }
             Section::Tonal => {
@@ -319,6 +346,14 @@ impl AdjustParams {
             }
             Section::Masks => self.masks = d.masks,
             Section::Curve => self.curves = d.curves,
+            Section::Effects => {
+                self.vignette_amount = d.vignette_amount;
+                self.vignette_midpoint = d.vignette_midpoint;
+                self.vignette_feather = d.vignette_feather;
+                self.vignette_roundness = d.vignette_roundness;
+                self.grain_amount = d.grain_amount;
+                self.grain_size = d.grain_size;
+            }
         }
     }
 
@@ -343,10 +378,11 @@ pub enum Section {
     Geometry,
     Masks,
     Curve,
+    Effects,
 }
 
 impl Section {
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 11] = [
         Section::Colour,
         Section::Basic,
         Section::Hsl,
@@ -357,6 +393,7 @@ impl Section {
         Section::Geometry,
         Section::Masks,
         Section::Curve,
+        Section::Effects,
     ];
 }
 
@@ -533,7 +570,7 @@ pub fn to_working(col: &Colour, cam: [f32; 3], clip: f32) -> [f32; 3] {
 /// GPU uniform block. Layout must match `Uniforms` in shader.wgsl.
 /// The `vec4` members come first so they land on 16-byte offsets
 /// (WGSL uniform address space requires it); the trailing scalars pack after.
-/// Total size 1968 bytes.
+/// Total size 2016 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -566,6 +603,12 @@ pub struct Uniforms {
     pub curve_info: [f32; 4],
     /// The curves' points and tangents — see [`Curves::uniforms`].
     pub curves: crate::curve::CurveUniform,
+    /// Vignette: `[ev, start, end, power]` and `[kx, ky, norm, _]` — see
+    /// [`crate::effects::Vignette`]. All zero = off.
+    pub vig0: [f32; 4],
+    pub vig1: [f32; 4],
+    /// `[grain amount, grain size, vibrance, _]`.
+    pub effects: [f32; 4],
     /// NDC half-extent of the drawn quad.
     pub scale: [f32; 2],
     /// NDC translation of the quad, used for panning when zoomed in.
@@ -779,6 +822,9 @@ impl Uniforms {
             masks: crate::masks::uniforms(&p.masks, None).1,
             curve_info: p.curves.uniforms().0,
             curves: p.curves.uniforms().1,
+            vig0: crate::effects::Vignette::uniforms(Frame::vignette(p, img, view)).0,
+            vig1: crate::effects::Vignette::uniforms(Frame::vignette(p, img, view)).1,
+            effects: [p.grain_amount.max(0.0), p.grain_size.max(crate::effects::GRAIN_MIN_SIZE), p.vibrance, 0.0],
             scale: view.scale,
             offset: view.offset,
             texel: view.texel,
@@ -842,13 +888,50 @@ pub fn apply(p: &AdjustParams, rgb: [f32; 3]) -> [f32; 3] {
     apply_local(p, &Locals::of(p), rgb)
 }
 
-/// [`apply`] for a photo with masks: the pixel at source uv `uv` of an image
-/// `aspect` (width / height) wide gets the global sliders plus whatever its
-/// masks add there. `rgb` doubles as the pixel the masks' ranges are judged
-/// on, so this is for callers with no detail stage in between (histogram,
-/// Auto); the export path keeps the two apart.
-pub fn apply_at(p: &AdjustParams, uv: [f32; 2], aspect: f32, rgb: [f32; 3]) -> [f32; 3] {
-    apply_local(p, &crate::masks::locals(p, uv, aspect, rgb), rgb)
+/// What a render needs to know about where a pixel is: the source's shape
+/// (for the masks) and the output frame (for the vignette). Built once per
+/// render.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    /// Source width / height.
+    pub aspect: f32,
+    pub geom: Geometry,
+    pub vignette: Option<crate::effects::Vignette>,
+}
+
+impl Frame {
+    /// For a `w`x`h` source (any scaled copy of it gives the same frame, to
+    /// within the crop's pixel snapping).
+    pub fn new(p: &AdjustParams, img: &ImageColour, w: usize, h: usize) -> Self {
+        let geom = Geometry::resolve(p, img, w, h);
+        let vignette = crate::effects::Vignette::resolve(p, geom.width as f32 / geom.height as f32);
+        Self { aspect: w as f32 / h as f32, geom, vignette }
+    }
+
+    fn vignette(p: &AdjustParams, img: &ImageColour, view: View) -> Option<crate::effects::Vignette> {
+        let g = view_geometry(p, img, view);
+        crate::effects::Vignette::resolve(p, g.width as f32 / g.height as f32)
+    }
+
+    /// The slider values in force at a pixel: global, plus the masks at its
+    /// source uv (ranges judged on `rgb`, the working pixel before the
+    /// detail stage), plus the vignette at its output uv.
+    pub fn locals(&self, p: &AdjustParams, src_uv: [f32; 2], out_uv: [f32; 2], rgb: [f32; 3]) -> Locals {
+        let mut l = crate::masks::locals(p, src_uv, self.aspect, rgb);
+        if let Some(v) = &self.vignette {
+            l.exposure_ev += v.ev_at(out_uv);
+        }
+        l
+    }
+}
+
+/// [`apply`] for a pixel with a position: the global sliders plus whatever
+/// the masks and the vignette add at source uv `uv`. `rgb` doubles as the
+/// pixel the masks' ranges are judged on, so this is for callers with no
+/// detail stage in between (histogram, Auto); the export path keeps the two
+/// apart. Grain is not included — it is noise, not tone.
+pub fn apply_at(p: &AdjustParams, frame: &Frame, uv: [f32; 2], rgb: [f32; 3]) -> [f32; 3] {
+    apply_local(p, &frame.locals(p, uv, frame.geom.output_uv(uv), rgb), rgb)
 }
 
 /// The chain with the per-pixel slider values given: `l` for everything a
@@ -900,7 +983,13 @@ pub fn apply_local(p: &AdjustParams, l: &Locals, rgb: [f32; 3]) -> [f32; 3] {
 
     // 5. Luma-preserving saturation.
     let y = luma(c);
-    let s = 1.0 + l.saturation;
+    let mut s = 1.0 + l.saturation;
+    if p.vibrance != 0.0 {
+        // How saturated the pixel already is decides how much it gets.
+        let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let have = ((mx - mn) / mx.max(1e-6)).clamp(0.0, 1.0);
+        s = (s + p.vibrance * (1.0 - have)).max(0.0);
+    }
     for v in &mut c {
         *v = y + (*v - y) * s;
     }
@@ -1053,6 +1142,13 @@ mod tests {
             rotation: 1,
             straighten: 2.0,
             crop: [0.1, 0.1, 0.9, 0.8],
+            vibrance: 0.2,
+            vignette_amount: -0.3,
+            vignette_midpoint: 0.4,
+            vignette_feather: 0.6,
+            vignette_roundness: 0.2,
+            grain_amount: 0.3,
+            grain_size: 2.0,
             curves: Curves { rgb: crate::curve::Curve::from_points(&[[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]), ..Default::default() },
             masks: {
                 let mut m = [Mask::default(); MAX_MASKS];
@@ -1274,8 +1370,8 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_layout_is_1968_bytes() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 1968);
+    fn uniforms_layout_is_2016_bytes() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 2016);
         // Every vec4 member must sit on a 16-byte boundary for WGSL uniforms.
         let u = Uniforms::passthrough(&ImageColour::LINEAR_SRGB, View::fit([1.0, 1.0], [1.0, 1.0]), false);
         let base = &u as *const _ as usize;
@@ -1296,6 +1392,9 @@ mod tests {
             &u.masks as *const _ as usize,
             &u.curve_info as *const _ as usize,
             &u.curves as *const _ as usize,
+            &u.vig0 as *const _ as usize,
+            &u.vig1 as *const _ as usize,
+            &u.effects as *const _ as usize,
             &u.scale as *const _ as usize,
         ] {
             assert_eq!((field - base) % 16, 0);
@@ -1557,6 +1656,52 @@ mod tests {
         assert!((z - 1.0).abs() < 1e-6);
         assert_eq!(Zoom::Scale(0.3).step(-1, OUT, VIEWPORT), Zoom::Fit);
         assert_eq!(Zoom::Scale(8.0).step(1, OUT, VIEWPORT), Zoom::Scale(8.0));
+    }
+
+    #[test]
+    fn vibrance_moves_muted_colours_more_than_vivid_ones() {
+        let sat = |c: [f32; 3]| {
+            let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+            (mx - mn) / mx
+        };
+        let (muted, vivid) = ([0.30, 0.26, 0.24], [0.60, 0.10, 0.05]);
+        let up = AdjustParams { vibrance: 0.8, ..Default::default() };
+        let gain = |c: [f32; 3]| sat(apply(&up, c)) / sat(c);
+        assert!(gain(muted) > 1.5, "muted: x{}", gain(muted));
+        assert!(gain(vivid) < 1.15, "vivid: x{}", gain(vivid));
+        // Greys stay grey and brightness stays put.
+        let g = apply(&up, GREY);
+        assert!((g[0] - g[1]).abs() < 1e-6 && (g[1] - g[2]).abs() < 1e-6);
+        assert!((luma(apply(&up, muted)) - luma(muted)).abs() < 1e-5);
+        // Down: muted colours fade; with saturation also down it stops at grey
+        // rather than inverting.
+        let down = AdjustParams { vibrance: -1.0, ..Default::default() };
+        assert!(sat(apply(&down, muted)) < sat(muted) * 0.3);
+        let both = apply(&AdjustParams { vibrance: -1.0, saturation: -0.8, ..Default::default() }, muted);
+        assert!(both[0] >= both[1] - 1e-6 && both[1] >= both[2] - 1e-6, "channel order kept: {both:?}");
+        // Off is exactly the old saturation step.
+        let p = AdjustParams { saturation: 0.3, ..Default::default() };
+        assert_eq!(apply(&p, vivid), apply(&AdjustParams { vibrance: 0.0, ..p }, vivid));
+    }
+
+    #[test]
+    fn the_vignette_adds_to_the_exposure_by_position() {
+        let p = AdjustParams { vignette_amount: -1.0, exposure_ev: 0.5, ..Default::default() };
+        let frame = Frame::new(&p, &ImageColour::LINEAR_SRGB, 300, 200);
+        let centre = frame.locals(&p, [0.5, 0.5], [0.5, 0.5], GREY);
+        let corner = frame.locals(&p, [0.0, 0.0], [0.0, 0.0], GREY);
+        assert_eq!(centre.exposure_ev, 0.5);
+        assert!((corner.exposure_ev - (0.5 - crate::effects::VIGNETTE_MAX_EV)).abs() < 1e-4);
+        // It is measured in the *output* frame: with a crop, the crop's
+        // corner — a point well inside the source — is the dark one.
+        let cropped = AdjustParams { crop: [0.0, 0.0, 0.5, 0.5], ..p };
+        let frame = Frame::new(&cropped, &ImageColour::LINEAR_SRGB, 300, 200);
+        let src = [0.5, 0.5];
+        let out = frame.geom.output_uv(src);
+        assert!((out[0] - 1.0).abs() < 1e-5 && (out[1] - 1.0).abs() < 1e-5);
+        let at_crop_corner = apply_at(&cropped, &frame, src, GREY);
+        let unvignetted = apply(&AdjustParams { vignette_amount: 0.0, ..cropped }, GREY);
+        assert!(at_crop_corner[0] < unvignetted[0] * 0.25);
     }
 
     #[test]

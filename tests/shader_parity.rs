@@ -13,7 +13,7 @@ use raw_editor::gpu::ImageRenderer;
 use raw_editor::detail;
 use raw_editor::masks::{self, Mask, MaskAdjust, MaskRange, RangeRef};
 use raw_editor::pipeline::{ColourMode, 
-    AdjustParams, ImageColour, Uniforms, View, apply, apply_at, clip_view, srgb_encode,
+    AdjustParams, Frame, ImageColour, Uniforms, View, apply, apply_at, clip_view, srgb_encode,
 };
 
 const W: usize = 2;
@@ -326,9 +326,14 @@ fn assert_image_parity(img: &DevelopedImage, params: AdjustParams) {
     let detailed = detail::apply(img.width, img.height, &working, &params);
     let mut worst = 0i32;
     let (w, h) = (img.width, img.height);
+    let frame = Frame::new(&params, &img.colour, w, h);
     for (i, px) in detailed.chunks(3).enumerate() {
         let uv = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-        let c = apply_at(&params, uv, w as f32 / h as f32, [px[0], px[1], px[2]]);
+        let c = raw_editor::effects::apply_grain(
+            &params,
+            apply_at(&params, &frame, uv, [px[0], px[1], px[2]]),
+            [uv[0] * w as f32, uv[1] * h as f32],
+        );
         for ch in 0..3 {
             let want = (srgb_encode(c[ch]) * 255.0 + 0.5) as u8;
             let got = gpu[i][ch];
@@ -969,5 +974,81 @@ fn parity_point_curves() {
         let img = range_source();
         let (with, without) = (raw_editor::export::render_cpu(&img, &p), raw_editor::export::render_cpu(&img, &AdjustParams::default()));
         assert!(with.data.iter().zip(&without.data).filter(|(a, b)| a.abs_diff(**b) > 600).count() > with.data.len() / 20);
+    }
+}
+
+// --- Vignette, grain, vibrance ----------------------------------------------
+
+#[test]
+fn parity_vignette() {
+    let img = mask_source();
+    for (amount, midpoint, feather, roundness) in
+        [(-1.0, 0.5, 0.5, 0.0), (0.8, 0.3, 1.0, 1.0), (-0.6, 0.7, 0.2, -1.0), (-1.0, 0.5, 0.0, 0.5)]
+    {
+        let p = AdjustParams {
+            vignette_amount: amount,
+            vignette_midpoint: midpoint,
+            vignette_feather: feather,
+            vignette_roundness: roundness,
+            tone_curve: 0.8,
+            ..Default::default()
+        };
+        assert_image_parity(&img, p);
+        // It follows the crop and the rotation: the output frame's corners,
+        // not the source's.
+        for rotation in [0u8, 1] {
+            assert_geometry_parity(&img, AdjustParams { rotation, crop: [0.25, 0.125, 1.0, 0.875], ..p }, 3);
+        }
+        // With a mask as well: both add to the exposure.
+        let m = Mask { adjust: MaskAdjust { exposure_ev: 0.7, ..Default::default() }, ..Mask::radial([0.4, 0.5], 0.3) };
+        let mut q = p;
+        q.masks[0] = m;
+        assert_geometry_parity(&img, q, 3);
+    }
+    // And it is darker in the corner than in the middle.
+    let p = AdjustParams { vignette_amount: -1.0, ..Default::default() };
+    let flat = DevelopedImage::linear_srgb(48, 32, vec![0.4; 48 * 32 * 3]);
+    let r = raw_editor::export::render_cpu(&flat, &p);
+    assert!(r.data[0] * 2 < r.data[(16 * 48 + 24) * 3], "corner {} vs centre {}", r.data[0], r.data[(16 * 48 + 24) * 3]);
+}
+
+#[test]
+fn parity_grain() {
+    for (amount, size) in [(1.0, 1.0), (0.5, 1.5), (0.8, 3.0), (0.3, 6.0)] {
+        let p = AdjustParams { grain_amount: amount, grain_size: size, tone_curve: 0.5, ..Default::default() };
+        assert_image_parity(&mask_source(), p);
+        assert_image_parity(&range_source(), p);
+        // Rotated and cropped: the grain stays on the source's pixels.
+        assert_geometry_parity(&mask_source(), AdjustParams { rotation: 3, crop: [0.125, 0.25, 0.875, 1.0], ..p }, 3);
+    }
+    // It really is noise: a flat grey comes out uneven, by about the amount.
+    let flat = DevelopedImage::linear_srgb(48, 32, vec![0.2; 48 * 32 * 3]);
+    let r = raw_editor::export::render_cpu(&flat, &AdjustParams { grain_amount: 0.5, grain_size: 1.0, ..Default::default() });
+    let (lo, hi) = (r.data.iter().min().unwrap(), r.data.iter().max().unwrap());
+    assert!(hi - lo > 4000 && hi - lo < 12000, "spread {}", hi - lo);
+}
+
+/// Zoomed out, grain averages away: the fit view must not show it at full
+/// strength (it would look far grainier than the export viewed at that size).
+#[test]
+fn grain_fades_in_a_downscaled_view() {
+    let Some(ctx) = common::gpu() else { return };
+    let (w, h) = (64usize, 64usize);
+    let flat = DevelopedImage::linear_srgb(w, h, vec![0.2; w * h * 3]);
+    let p = AdjustParams { grain_amount: 1.0, grain_size: 1.0, ..Default::default() };
+    let spread = |px: &[[u8; 4]]| px.iter().map(|p| p[1]).max().unwrap() as i32 - px.iter().map(|p| p[1]).min().unwrap() as i32;
+    let full = spread(&render_image(&ctx.device, &ctx.queue, &flat, &p));
+    let quarter = spread(&render_image_sized(&ctx.device, &ctx.queue, &flat, &p, false, w / 4, h / 4));
+    assert!(full > 40, "grain at 100%: {full}");
+    assert!(quarter * 3 < full, "a quarter-size view should be much smoother: {quarter} vs {full}");
+}
+
+#[test]
+fn parity_vibrance() {
+    for vibrance in [0.8, -0.8, 1.0, -1.0] {
+        let p = AdjustParams { vibrance, ..Default::default() };
+        assert_image_parity(&range_source(), p);
+        assert_parity(AdjustParams { saturation: -0.5, exposure_ev: 0.4, ..p });
+        assert_image_parity(&mask_source(), AdjustParams { saturation: 0.4, tone_curve: 1.0, ..p });
     }
 }
