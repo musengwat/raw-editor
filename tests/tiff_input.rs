@@ -108,3 +108,22 @@ fn a_corrupt_tiff_is_an_error() {
     std::fs::write(&f, b"II*\0garbage").unwrap();
     assert!(metadata::develop_file(&f).is_err());
 }
+
+/// A TIFF bigger than the `image` crate's default 512 MB decode cap allows.
+/// That cap is split between the decoded pixels and the decoder's scratch,
+/// so in practice anything over ~256 MB of pixels was refused with "memory
+/// limit exceeded" — a 7000×7000 16-bit RGB file (294 MB) is one, as are big
+/// panoramas, HDR merges and 16-bit RGBA scans.
+#[test]
+fn a_tiff_over_the_default_decode_cap_opens() {
+    let dir = common::scratch_dir("tiff_big");
+    let (w, h) = (7000, 7000);
+    let src = Rendered { width: w, height: h, data: vec![20_000u16; w * h * 3] };
+    let tif = dir.join("big.tif");
+    export::write(&tif, &src, ExportFormat::Tiff16, 90, None).unwrap();
+    drop(src);
+
+    let img = metadata::develop_file(&tif).unwrap();
+    assert_eq!((img.width, img.height), (w, h));
+    let _ = std::fs::remove_file(&tif);
+}

@@ -124,9 +124,10 @@ pub fn srgb_to_linear(v: f32) -> f32 {
 /// scene-referred float TIFFs. An embedded ICC profile is not applied — see
 /// [`tiff_profile_note`].
 pub fn open_tiff(path: &Path) -> Result<DevelopedImage> {
-    let reader = image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?
         .with_guessed_format()?;
+    reader.limits(tiff_limits());
     let img = reader.decode().with_context(|| format!("decoding {}", path.display()))?;
     let float = matches!(img.color(), image::ColorType::Rgb32F | image::ColorType::Rgba32F);
     let rgb = img.into_rgb32f();
@@ -137,6 +138,19 @@ pub fn open_tiff(path: &Path) -> Result<DevelopedImage> {
     }
     let clip = if float { Vec::new() } else { clip_mask(&data) };
     Ok(DevelopedImage { width: w, height: h, data, clip, colour: ImageColour::LINEAR_SRGB, flat: None, local: None })
+}
+
+/// Decode limits for TIFFs. The `image` crate's default caps a decode at
+/// 512 MB, and for TIFFs it splits that between the pixels and the decoder's
+/// scratch space, so anything past ~256 MB of pixels (a 7000×7000 16-bit
+/// file, a big panorama or HDR merge, a 16-bit RGBA scan) was refused with
+/// "Memory limit exceeded". These are the user's own photos, so the cap is
+/// only a guard against a corrupt header asking for absurd amounts: 16 GB
+/// (≈8 GB of pixels, over a gigapixel of 16-bit RGB).
+fn tiff_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(16 << 30);
+    limits
 }
 
 /// A warning to show when a TIFF carries a colour profile the editor will not

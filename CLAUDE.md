@@ -403,6 +403,10 @@ wgpu, where it would abort the app; the GUI checks on load, export checks in
   `metadata::read` reads TIFF tags with little_exif (`read_tiff`) so
   orientation and camera/lens info survive. ICC profiles are not applied;
   `tiff_profile_note` produces the status-bar warning for non-sRGB ones.
+  `open_tiff` raises the decode cap (`tiff_limits`, 16 GB): `image`'s default
+  512 MB is split between pixels and decoder scratch, so files past ~256 MB
+  of pixels failed with "Memory limit exceeded"
+  (`a_tiff_over_the_default_decode_cap_opens`).
 - Clip flag for both: **all three** channels ≥ 0.995. Never "any channel" —
   these pixels are already balanced or finished, and a pure red would turn
   white. `tests/tiff_input.rs` covers it and checks that an unedited 16-bit
